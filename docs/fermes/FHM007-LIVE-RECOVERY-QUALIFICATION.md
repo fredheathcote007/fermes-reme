@@ -52,3 +52,9 @@ No production rollback is required because these changes have not been deployed.
 - Failure-path unit test awaits a synthetic model call that raises, then verifies the internally owned async client closes; externally injected models remain borrowed.
 - Independent Cursor review: no P0 for the Stage 1 AgentScope/OpenAI path. P1 acceptance concern remains: a genuinely no-tool automatic-memory turn may acknowledge the spool without writing a note. This is compatible with the approved legitimate no-op policy but is not proof every explicit retention request will be stored.
 - Keep the draft PR unmerged and production unchanged. FHM-007 is still OPEN P1 pending retention-intent/no-op contract, cryptographic provenance, FHM-006 checkpoint, crash replay and workspace security gates.
+
+## 2026-10-27 — Full Python matrix follow-up
+
+- Commit 10ed292 CI exposed test-fixture drift in the image-memory suite: AgentScope now receives a trusted injected session_id, which older expected-call assertions omitted. Fixed the affected assertions; local image test suite 68/68 PASS.
+- Python quality also found W0212 in the newly added private injection-contract test. The test documents its deliberate protected-access exception. Other pre-commit hooks passed on 10ed292.
+- Require fresh complete GitHub CI on the follow-up commit. Keep PR draft-only and FHM-007 OPEN P1.

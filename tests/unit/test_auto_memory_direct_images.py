@@ -196,7 +196,11 @@ async def test_sources_interleave_unchanged_through_native_formatters(setup, mon
     assert [inputs.content[index].model_dump() for index in (1, 3)] == [
         message.content[index].model_dump() for index in (1, 3)
     ]
-    assert options == {"system_prompt": step.prompt_format("system_prompt"), "job_tools": ["daily_write"]}
+    assert options == {
+        "system_prompt": step.prompt_format("system_prompt"),
+        "job_tools": ["daily_write"],
+        "injected_job_kwargs": {"session_id": _SESSION},
+    }
     assert "auto_memory_images" not in response.metadata
     assert path.read_bytes() == _saved_line(message)
     assert message.model_dump() == original
@@ -273,6 +277,7 @@ async def test_effective_image_limit_is_checked_without_modifying_configs(setup,
         assert wrapper.reply.call_args.kwargs == {
             "system_prompt": step.prompt_format("system_prompt"),
             "job_tools": ["daily_write"],
+            "injected_job_kwargs": {"session_id": _SESSION},
             **extra,
         }
     assert (component, extra) == snapshots

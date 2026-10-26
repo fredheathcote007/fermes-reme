@@ -1,5 +1,8 @@
 """Tests for shared agent wrapper behavior."""
 
+# These tests intentionally exercise the private injection contract.
+# pylint: disable=protected-access
+
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
