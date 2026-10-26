@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from agentscope.message import Msg
 
+from reme.application import Application
 from reme.components.runtime_context import RuntimeContext
 from reme.steps.evolve.auto_memory import AutoMemoryStep
 
@@ -80,6 +81,74 @@ async def test_completed_request_survives_restart_without_repeating_agent(tmp_pa
     await replay.execute()
     assert replay.context.response == first.context.response
     assert replay.context["changes"] == first.context["changes"]
+
+
+@pytest.mark.asyncio
+async def test_application_run_job_replays_real_receipt_without_repeating_side_effect(tmp_path, monkeypatch):
+    calls = []
+
+    async def synthetic_execute(step):
+        calls.append(step.context.get("request_id"))
+        step.context.response.answer = "synthetic receipt"
+        step.context.response.metadata = {"side_effect": "once"}
+        step.context["changes"] = [{"change": "modified", "path": "daily/note.md"}]
+
+    monkeypatch.setattr(AutoMemoryStep, "_execute", synthetic_execute)
+    app = Application(
+        workspace_dir=str(tmp_path),
+        enable_logo=False,
+        log_to_console=False,
+        log_to_file=False,
+        service={"backend": "cli"},
+        components={
+            "tokenizer": {"default": {"backend": "regex"}},
+            "file_graph": {"default": {"backend": "local"}},
+            "keyword_index": {"default": {"backend": "bm25", "tokenizer": "default"}},
+            "file_store": {
+                "default": {
+                    "backend": "local",
+                    "embedding_store": "",
+                    "keyword_index": "default",
+                    "file_graph": "default",
+                },
+            },
+        },
+        jobs={
+            "auto_memory": {
+                "backend": "base",
+                "steps": [{"backend": "auto_memory_step"}],
+            },
+        },
+    )
+
+    async with app:
+        first = await app.run_job(
+            "auto_memory",
+            request_id="application-receipt-1",
+            session_id="session-1",
+            messages=[{"id": "m1", "content": "fact"}],
+            date="2026-10-21",
+        )
+        replay = await app.run_job(
+            "auto_memory",
+            request_id="application-receipt-1",
+            session_id="session-1",
+            messages=[{"id": "m1", "content": "fact"}],
+            date="2026-10-21",
+        )
+        conflict = await app.run_job(
+            "auto_memory",
+            request_id="application-receipt-1",
+            session_id="session-1",
+            messages=[{"id": "m2", "content": "different fact"}],
+            date="2026-10-21",
+        )
+
+    assert calls == ["application-receipt-1"]
+    assert replay == first
+    assert replay.metadata == {"side_effect": "once"}
+    assert conflict.success is False
+    assert "different input" in conflict.answer
 
 
 @pytest.mark.asyncio

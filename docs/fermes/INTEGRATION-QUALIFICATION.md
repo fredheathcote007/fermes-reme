@@ -18,9 +18,12 @@ endpoint, or changes to the Hermes checkout.
 |---|---|---|
 | Provider contract | Focused unit suite imports the Hermes `MemoryProvider` when the Hermes checkout is on `PYTHONPATH`; registration callback accepts and registers a fresh `ReMeMemoryProvider`. | PASS |
 | Profile isolation | `hermes_home` is used for provider configuration and the pending-write spool; scoped session IDs include profile and session identity. | PASS in focused tests |
+| Same-profile writer ownership | A profile-local OS advisory lock is held for the provider lifetime; a second provider in the same process or another process fails closed. The lock file is not used as a stale marker. | PASS in focused tests; Windows-specific CI evidence UNKNOWN until rerun |
 | Embedded lifecycle | Fake `reme.Application` tests cover start, health, jobs, close, and bounded failure cleanup. | PASS in the recorded host suite; rerun this second pass in the disposable qualification environment. |
 | Recall timeout | Backend lock, startup, health, and search share the configured recall deadline. | PASS in focused tests |
-| Accepted-write semantics | Completed turns are JSONL-spooled and `fsync`ed before enqueue. The spool UUID is forwarded as ReMe's existing `auto_memory(request_id)`. Successful responses remove one record atomically; false/malformed responses, backend errors, shutdown timeout, or process loss retain it. | PASS in focused regression coverage; at-least-once and not multi-process safe |
+| Accepted-write semantics | Completed turns are JSONL-spooled and `fsync`ed before enqueue. The spool UUID is forwarded as ReMe's existing `auto_memory(request_id)`. Successful responses remove one record atomically; false/malformed responses, backend errors, shutdown timeout, or process loss retain it. | PASS in focused regression coverage; shared-profile writes are fail-closed |
+| ReMe receipt idempotency | Model-free tests now exercise the actual `Application.run_job` path and an actual embedded provider path with synthetic `_execute` instrumentation. They assert same ID/input side effects once, cached replay, different-input rejection, and stable retry ID after a successful backend response followed by failed spool acknowledgement. | UNKNOWN in this sandbox: the supplied Python 3.14 environment hangs in the existing `write_file_safe` thread helper before the receipt assertions; rerun in CI/host venv |
+| Queue poisoning and disk failure | Malformed/poison records do not hide a later valid record or get silently discarded; append failure does not enqueue or acknowledge a turn. | PASS in focused tests |
 | Restart recovery | A failed first backend leaves one record; a fresh provider using the same profile replays and clears it. | PASS |
 | Full Hermes Plugin Doctor | `/tmp/fhm007/reme-plugin-doctor-host.log` records real Hermes Plugin Doctor manifest, import, discovery, and registration success. | PASS in host evidence |
 | Real Hermes loader | `/tmp/fhm007/real-hermes-loader-smoke.log` records `load_memory_provider` returning `ReMeMemoryProvider`, `available=True`, in a disposable profile. | PASS in host evidence |
@@ -31,15 +34,21 @@ endpoint, or changes to the Hermes checkout.
 
 The spool is profile-local under `$HERMES_HOME/reme/pending-writes.jsonl`, is
 not indexed as ReMe memory, and is included in Hermes profile backup paths by
-being inside the profile. Stage 1 provides at-least-once delivery after a
-successful local `fsync`; a crash after ReMe accepts a write but before the
-spool record is removed can replay the same turn. The stable spool UUID is
-passed to ReMe's existing `auto_memory` receipt/idempotency implementation,
-which fingerprints the request and replays its stored response for the same
-ID/input. A reuse with different input is rejected. This does not claim
-exactly-once effects beyond that existing ReMe behavior or multi-process
-safety. If the spool cannot be written, `sync_turn` logs an error and does not
-report the turn as accepted by the provider.
+being inside the profile. One provider process owns a profile's spool through
+an OS advisory lock at `$HERMES_HOME/reme/.writer.lock`; the file may remain
+after shutdown, but only the OS lock controls ownership. A second provider
+fails closed for both recall and capture, and callers can inspect
+`unavailable_reason()`. This is an explicit single-writer invariant for one
+Hermes profile; distinct profiles/workspaces remain required.
+
+Stage 1 provides at-least-once delivery after a successful local `fsync`; a
+crash after ReMe accepts a write but before the spool record is removed can
+replay the same turn. The stable spool UUID is passed to ReMe's existing
+`auto_memory` receipt/idempotency implementation, which fingerprints the
+request and replays its stored response for the same ID/input. A reuse with
+different input is rejected. This does not claim exactly-once effects for
+arbitrary backend side effects. If the spool cannot be written, `sync_turn`
+logs an error and does not report the turn as accepted by the provider.
 
 The background writer is bounded by Hermes/provider shutdown timeouts. A failed
 record is retained and scheduled for delayed retry without preventing later
@@ -51,8 +60,9 @@ dedicated Stage 1 config; the upstream `default` config remains unchanged.
 Independent review should rerun the focused suite in the disposable
 environment, then seed isolated workspaces and verify fresh-session retrieval
 and no cross-profile leak through real BM25 without a live model. The reviewer
-should also test crash windows, same-ID update semantics, FHM-006 checkpoint
-compatibility, and prompt-injection/poisoning gates before deployment or merge.
+should also test Windows lock behavior, crash windows, same-ID update
+semantics, FHM-006 checkpoint compatibility, and prompt-injection/poisoning
+gates before deployment or merge.
 No Hermes installation, default `~/.hermes`, Qwen/LM Studio worktree, or Hermes
 PR #19 was modified.
 
@@ -83,13 +93,18 @@ open an HTTP listener.
 
 ## Unresolved acceptance blockers
 
-- Fresh-session retrieval and cross-profile isolation have not both been
-  demonstrated against the real provider with seeded workspaces.
-- Crash-window replay has deterministic unit coverage, but no claim is made
-  that arbitrary backend side effects are exactly once; shared-profile
-  multi-process spool operation is not qualified.
-- FHM-006 pre-compression checkpoint v2 compatibility and the prompt-injection/
-  memory-poisoning gate remain unverified.
+- Real conversational auto-memory capture through an approved local-model
+  endpoint is **UNKNOWN / OUTSTANDING**. No live model or cloud credential was
+  used by this pass.
+- Fresh-session retrieval and cross-profile isolation are **PASS** in the
+  recorded seeded BM25/provider evidence, while arbitrary backend side effects
+  beyond ReMe's receipt remain **UNKNOWN**.
+- Same-profile ownership is **PASS** in bounded focused tests. ReMe receipt
+  replay/crash-window assertions are **UNKNOWN** until the model-free tests can
+  complete in a host/CI environment; Windows-specific lock CI is also
+  **UNKNOWN** until rerun.
+- FHM-006 pre-compression checkpoint v2 compatibility and the
+  prompt-injection/memory-poisoning gate remain **OPEN / UNKNOWN**.
 - No production deployment, active Hermes profile change, merge, or release
   approval is authorized by this qualification draft.
 
@@ -103,3 +118,11 @@ open an HTTP listener.
 - Actual Hermes loader plus ReMe provider initialize/prefetch/shutdown/restart: both alpha and beta recalled their own persisted evidence after restart, with no cross-token recall. Logs: `/tmp/fhm007/real-provider-alpha.log` and `/tmp/fhm007/real-provider-beta.log`.
 - ReMe Stage1 config resolved successfully to CLI service, no Dream/proactive cron, and loopback-only model defaults; no live inference call was made. LM Studio on Dad-PC is currently bound to `127.0.0.1:1234`, not remotely accessible from Project Coordinator.
 - **Still unproven:** real conversational auto-memory capture with a local model; forced mid-write crash replay against the actual ReMe engine; simultaneous multi-process writers, shared-workspace authorisation, prompt-injection controls, FHM-006 checkpoint v2, and skill-learning promotion. Do not merge or deploy.
+
+## Reliability qualification update — 2026-10-26 (supervisor host verification)
+
+- **65/65 tests PASS** in authorised Project Coordinator host Python 3.14 environment using real maintained Hermes source on PYTHONPATH: `tests/unit/test_hermes_agent_integration.py` plus `tests/unit/test_auto_memory_idempotency.py`. Log: `/tmp/fhm007/reliability-final-combined-host.log`.
+- The real `Application.run_job` synthetic receipt replay test now uses the necessary file graph/keyword index fixture and PASSes. Previous sandbox timeouts must not be counted as runtime failures; real host proof does not use a live LLM. Duplicate request with same ID and content reuses the response; conflicting payload rejects. This does not establish exactly-once side effects if a process dies midway through an uncommitted ReMe auto-memory execution.
+- Exclusive per-profile writer lock added via OS lock (`fcntl.flock` on Linux, `msvcrt.locking` on Windows) plus process-local ownership guard. Linux competing-process smoke: second process fails while lock held, then succeeds after release; log `/tmp/fhm007/multiprocess-lock-host.log`. Windows branch still requires its latest CI run.
+- Journal tests now cover lock contention, poisoned/invalid record retention while processing valid entries, and disk-append failure without accepting a turn. ReMe remains file-backed/BM25-only Stage 1, Dream disabled.
+- New independent Cursor source review at `/tmp/fhm007/cursor-reliability-final-review.log`: draft-PR suitable, production NO GO. Residual scope: same *ReMe workspace* shared across different Hermes homes remains forbidden; Windows lock needs CI; arbitrary mid-operation LLM crash idempotency not proven; FHM-006 fail-closed compaction, provenance/poisoning and real LLM-backed conversational learning remain open.

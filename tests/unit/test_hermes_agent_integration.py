@@ -12,6 +12,7 @@ import contextvars
 import http.server
 import importlib
 import json
+import os
 import threading
 import time
 
@@ -54,6 +55,7 @@ HTTP_BACKEND_MODULE = importlib.import_module("hermes_agent.http_backend")
 CLIENT_MODULE = importlib.import_module("hermes_agent.client")
 
 ReMeMemoryProvider = PLUGIN_MODULE.ReMeMemoryProvider
+ProfileWriterLock = PLUGIN_MODULE._ProfileWriterLock
 ReMeBackendError = BACKEND_MODULE.ReMeBackendError
 ReMeConfig = CONFIG_MODULE.ReMeConfig
 ReMeConfigError = CONFIG_MODULE.ReMeConfigError
@@ -471,6 +473,78 @@ def test_session_scope_distinguishes_profiles_and_ambiguous_names():
     )
 
 
+def test_profile_writer_lock_is_exclusive_and_releases_without_stale_marker(tmp_path):
+    path = tmp_path / "reme" / ".writer.lock"
+    first = ProfileWriterLock(path)
+    second = ProfileWriterLock(path)
+
+    first.acquire()
+    assert path.is_file()
+    with pytest.raises(OSError, match="already owned|temporarily unavailable|resource busy"):
+        second.acquire()
+
+    first.release()
+    second.acquire()
+    second.release()
+    assert path.is_file()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork for cross-process lock probe")
+def test_profile_writer_lock_rejects_other_process(tmp_path):
+    path = tmp_path / "reme" / ".writer.lock"
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child assertions are reported by the parent exit status
+        try:
+            os.close(ready_read)
+            os.close(release_write)
+            lock = ProfileWriterLock(path)
+            lock.acquire()
+            os.write(ready_write, b"1")
+            os.read(release_read, 1)
+            lock.release()
+            os._exit(0)
+        except Exception:
+            os.write(ready_write, b"0")
+            os._exit(1)
+
+    os.close(ready_write)
+    os.close(release_read)
+    try:
+        assert os.read(ready_read, 1) == b"1"
+        contender = ProfileWriterLock(path)
+        with pytest.raises(OSError):
+            contender.acquire()
+        os.write(release_write, b"1")
+    finally:
+        os.close(ready_read)
+        os.close(release_write)
+        _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
+def test_same_profile_provider_fails_closed_when_writer_is_owned(monkeypatch, tmp_path):
+    backend = _FakeBackend()
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    owner = ReMeMemoryProvider()
+    blocked = ReMeMemoryProvider()
+    owner.initialize("owner", hermes_home=tmp_path, agent_identity="profile")
+
+    blocked.initialize("blocked", hermes_home=tmp_path, agent_identity="profile")
+    blocked.sync_turn("must not", "be appended")
+
+    assert blocked._backend is None
+    assert blocked._accept_writes is False
+    assert blocked.prefetch("query") == ""
+    assert "writer lock unavailable" in blocked.unavailable_reason()
+    assert not (tmp_path / "reme" / "pending-writes.jsonl").exists()
+
+    owner.shutdown()
+    blocked.shutdown()
+
+
 def test_reinitialize_closes_previous_backend(monkeypatch, tmp_path):
     backends = [_FakeBackend(), _FakeBackend()]
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
@@ -874,6 +948,54 @@ def test_retried_spool_record_reuses_record_id_after_ack_failure(monkeypatch, tm
     provider.shutdown()
 
 
+def test_embedded_reme_receipt_covers_success_before_spool_ack_crash_window(monkeypatch, tmp_path):
+    from reme.steps.evolve.auto_memory import AutoMemoryStep
+
+    calls = []
+    stage_config = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = ReMeConfig(
+        mode="embedded",
+        workspace_dir=str(tmp_path / "workspace"),
+        reme_config=str(stage_config),
+        request_timeout=5,
+        recall_timeout=1,
+        health_timeout=1,
+        health_retry_seconds=0.01,
+        shutdown_timeout=5,
+    )
+
+    async def synthetic_execute(step):
+        calls.append(step.context.get("request_id"))
+        step.context.response.answer = "synthetic receipt"
+        step.context["changes"] = []
+
+    monkeypatch.setattr(AutoMemoryStep, "_execute", synthetic_execute)
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
+    profile = tmp_path / "profile"
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=profile, agent_identity="profile")
+    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
+    provider.sync_turn("crash-window user", "assistant")
+
+    deadline = time.monotonic() + 5
+    while len(calls) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(calls) == 1
+    pending = profile / "reme" / "pending-writes.jsonl"
+    assert pending.read_text(encoding="utf-8").strip()
+    provider.shutdown()
+
+    replay = ReMeMemoryProvider()
+    replay.initialize("new-session", hermes_home=profile, agent_identity="profile")
+    deadline = time.monotonic() + 5
+    while pending.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    replay.shutdown()
+
+    assert len(calls) == 1
+    assert pending.read_text(encoding="utf-8") == ""
+
+
 def test_failed_first_record_does_not_stall_later_record(monkeypatch, tmp_path):
     backend = _FakeBackend()
     calls = 0
@@ -922,6 +1044,39 @@ def test_false_or_malformed_auto_memory_ack_keeps_spool_record(monkeypatch, tmp_
     pending = config_path(tmp_path).parent / "pending-writes.jsonl"
     assert pending.read_text(encoding="utf-8").strip()
     provider.shutdown()
+
+
+def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._pending_path.parent.mkdir()
+    valid = {"id": "valid", "payload": {"session_id": "s", "messages": []}}
+    provider._pending_path.write_text(
+        "not-json\n" '{"id": "poison", "payload": "not-an-object"}\n' + json.dumps(valid) + "\n",
+        encoding="utf-8",
+    )
+
+    assert provider._read_pending_writes() == [valid]
+    assert provider._remove_pending_write("valid") is True
+    remaining = provider._pending_path.read_text(encoding="utf-8")
+    assert "not-json" in remaining
+    assert '"poison"' in remaining
+    assert '"valid"' not in remaining
+
+
+def test_disk_append_failure_does_not_acknowledge_or_queue_turn(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._accept_writes = True
+
+    def fail(_payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(provider, "_append_pending_write", fail)
+    provider.sync_turn("user", "assistant", session_id="session")
+
+    assert provider._write_queue.empty()
+    assert not provider._pending_path.exists()
 
 
 def test_spool_rejects_symlink_and_sets_private_permissions(tmp_path):

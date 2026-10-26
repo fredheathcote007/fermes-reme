@@ -18,6 +18,16 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX
+    msvcrt = None
+
 from agent.memory_provider import MemoryProvider, RecallStatus
 
 from .backend import ReMeBackend, ReMeBackendError, spawn_profile_thread
@@ -30,6 +40,9 @@ _NON_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _SDK_INSTALL_HINT = 'Embedded ReMe mode requires the SDK. Install it with: pip install "reme-ai[core]"'
 _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
+_PROFILE_LOCK_FILENAME = ".writer.lock"
+_HELD_PROFILE_LOCKS: set[str] = set()
+_HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -39,6 +52,63 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+class _ProfileWriterLock:
+    """Own one Hermes profile's ReMe spool for the lifetime of a provider.
+
+    The lock file is intentionally retained after release.  Ownership is the
+    OS lock, not the presence or age of this file, so a killed process cannot
+    leave a stale marker that blocks future recovery.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fd: int | None = None
+        self._key = os.path.normcase(str(path.resolve(strict=False)))
+
+    def acquire(self) -> None:
+        with _HELD_PROFILE_LOCKS_LOCK:
+            if self._key in _HELD_PROFILE_LOCKS:
+                raise OSError("profile writer is already owned by this process")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.parent.is_symlink() or self.path.is_symlink():
+                raise OSError(f"Refusing unsafe profile writer lock path: {self.path}")
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(self.path, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif msvcrt is not None:
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b"\0")
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:  # pragma: no cover - no supported platform has neither
+                    raise OSError("no supported OS file-lock implementation")
+            except Exception:
+                os.close(fd)
+                raise
+            self._fd = fd
+            _HELD_PROFILE_LOCKS.add(self._key)
+
+    def release(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+            with _HELD_PROFILE_LOCKS_LOCK:
+                _HELD_PROFILE_LOCKS.discard(self._key)
 
 
 def _slug(value: str, fallback: str, *, limit: int) -> str:
@@ -93,6 +163,8 @@ class ReMeMemoryProvider(MemoryProvider):
         self._pending_lock = threading.Lock()
         self._retry_timers: set[threading.Timer] = set()
         self._pending_path: Path | None = None
+        self._profile_lock: _ProfileWriterLock | None = None
+        self._profile_lock_required = False
         self._backend_lock = threading.RLock()
         self._shutdown_started = False
         self._deferred_backend_close = False
@@ -130,6 +202,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 raise RuntimeError(
                     "Cannot reinitialize ReMe while its previous writer is still running",
                 )
+        self._profile_lock_required = False
         hermes_home = str(kwargs.get("hermes_home") or "") or None
         if hermes_home is None:
             self._disable_without_profile(session_id, kwargs.get("agent_identity"))
@@ -140,11 +213,13 @@ class ReMeMemoryProvider(MemoryProvider):
         except ReMeConfigError as exc:
             with self._backend_lock:
                 self._close_backend_locked()
+            self._release_profile_lock()
             self._config = None
             self._backend_label = "invalid configuration"
             self._session_id = str(session_id or "")
             self._profile_id = str(kwargs.get("agent_identity") or "default")
             self._accept_writes = False
+            self._profile_lock_required = True
             self._pending_path = profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
             self._recall_status = None
             self._unavailable_reason = str(exc)
@@ -153,8 +228,26 @@ class ReMeMemoryProvider(MemoryProvider):
 
         with self._backend_lock:
             self._close_backend_locked()
+        self._release_profile_lock()
         self._config = config
         self._pending_path = profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
+        self._profile_lock_required = True
+        try:
+            profile_lock = _ProfileWriterLock(profile_home / _PENDING_QUEUE_DIRECTORY / _PROFILE_LOCK_FILENAME)
+            profile_lock.acquire()
+        except OSError as exc:
+            self._config = None
+            self._backend_label = f"profile writer unavailable: {profile_home}"
+            self._session_id = str(session_id or "")
+            self._profile_id = str(kwargs.get("agent_identity") or "default")
+            self._write_enabled = False
+            self._accept_writes = False
+            self._backend_available = False
+            self._recall_status = None
+            self._unavailable_reason = f"profile writer lock unavailable: {exc}"
+            logger.warning("ReMe provider is unavailable for %s: %s", profile_home, self._unavailable_reason)
+            return
+        self._profile_lock = profile_lock
         self._unavailable_reason = ""
         self._backend_label = config.endpoint if config.mode == "http" else f"embedded:{config.workspace_dir}"
         self._recall_timeout = config.recall_timeout
@@ -402,8 +495,9 @@ class ReMeMemoryProvider(MemoryProvider):
         }
         if not self._enqueue_write(payload):
             logger.warning(
-                "ReMe did not record session %s because the provider is shutting down",
+                "ReMe did not record session %s because the provider is unavailable: %s",
                 payload["session_id"],
+                self._unavailable_reason or "shutting down",
             )
 
     def on_session_switch(
@@ -451,6 +545,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     timeout=max(0.0, deadline - time.monotonic()),
                 )
                 self._deferred_backend_close = False
+                self._release_profile_lock()
             finally:
                 self._backend_lock.release()
         else:
@@ -459,6 +554,11 @@ class ReMeMemoryProvider(MemoryProvider):
             )
         self._backend_available = False
         self._next_health_probe = 0.0
+
+    def _release_profile_lock(self) -> None:
+        profile_lock, self._profile_lock = self._profile_lock, None
+        if profile_lock is not None:
+            profile_lock.release()
 
     def _atexit_shutdown(self) -> None:
         try:
@@ -782,6 +882,8 @@ class ReMeMemoryProvider(MemoryProvider):
                 return True
             if self._config is None or (self._shutdown_started and not allow_shutdown):
                 return False
+            if self._profile_lock_required and self._profile_lock is None:
+                return False
             now = time.monotonic()
             if not force and now < self._next_health_probe:
                 return False
@@ -839,6 +941,7 @@ class ReMeMemoryProvider(MemoryProvider):
         if self._deferred_backend_close:
             self._close_backend_locked()
             self._deferred_backend_close = False
+            self._release_profile_lock()
 
     def _close_backend_locked(self, *, timeout: float | None = None) -> None:
         backend, self._backend = self._backend, None

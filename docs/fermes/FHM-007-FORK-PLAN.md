@@ -65,7 +65,10 @@ minimal, reviewed changes. Do not alter live Hermes profiles or settings.
   transports as ReMe's existing `auto_memory(request_id=...)` field. Failed
   records are retried with backoff while later accepted records continue; this
   is at-least-once transport with ReMe receipt/idempotency semantics, not a
-  second idempotency engine and not a multi-process guarantee.
+  second idempotency engine. A profile-local OS advisory lock now enforces an
+  explicit single-writer invariant; a competing same-profile provider fails
+  closed for recall and capture, and the lock is automatically released when
+  its process dies.
 - Added `reme/config/fermes-hermes-stage1.yaml`, a dedicated embedded profile
   with local file/BM25 search, no Dream or proactive jobs, CLI/no-listener
   service configuration, and an explicit loopback model default.
@@ -113,11 +116,23 @@ is authorized by this work.
 
 ## Next action
 
-Rerun the focused suite after this pass, then complete the remaining acceptance
-work: fresh-session and cross-profile seeded BM25 qualification, crash-window
-receipt replay, FHM-006 checkpoint compatibility, prompt-injection review, and
-independent review. Keep issue #7 OPEN P1; do not deploy or merge until those
-checks pass.
+Rerun the focused suite after this pass, including the model-free real
+`Application.run_job` and embedded receipt tests. The bounded reliability
+gates are currently intended to be recorded as:
+
+- **PASS:** same-profile writer ownership, fail-closed contention behavior,
+  malformed/poison queue handling, and disk-append failure handling. The
+  receipt/replay tests are present but execution is **UNKNOWN** in the supplied
+  sandbox because its existing `write_file_safe` thread helper does not
+  complete.
+- **UNKNOWN:** Windows-specific lock CI and real conversational auto-memory
+  capture through an approved local model. The local-model e2e remains
+  explicitly outstanding; do not use cloud credentials or change LM Studio
+  bind/firewall settings.
+- **OPEN / UNKNOWN:** FHM-006 pre-compression checkpoint v2, prompt-injection
+  and memory-poisoning controls, and independent review.
+
+Keep issue #7 OPEN P1; do not deploy or merge until those checks pass.
 
 ## Supervisor host acceptance update
 
