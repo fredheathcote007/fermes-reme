@@ -272,17 +272,23 @@ async def test_agentscope_tool_summary_is_current_turn_redacted_and_id_paired(tm
     """Tool evidence excludes prior context and tool arguments/results."""
 
     class FakeMessage:
+        """Synthetic AgentScope final reply without tool execution in this message."""
+
         usage = None
 
         @staticmethod
         def model_dump():
+            """Provide serialisable final assistant text."""
             return {"content": [{"type": "text", "text": "done"}]}
 
         @staticmethod
         def get_text_content():
+            """Return the final reply body."""
             return "done"
 
     class FakeAgent:
+        """Simulate a reply with an old and a current tool execution turn."""
+
         def __init__(self):
             self.state = SimpleNamespace(
                 session_id="session-1",
@@ -303,9 +309,11 @@ async def test_agentscope_tool_summary_is_current_turn_redacted_and_id_paired(tm
             )
 
         async def observe(self, _inputs):
+            """Append the current input to the context boundary."""
             self.state.context.append({"content": [{"type": "text", "text": "current user"}]})
 
         async def reply(self):
+            """Emit a new tool call/result while keeping prior context intact."""
             self.state.context.extend(
                 [
                     {

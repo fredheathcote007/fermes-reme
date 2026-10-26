@@ -405,7 +405,10 @@ class AutoMemoryStep(BaseStep):
 
     @staticmethod
     def _all_requested_writes_failed(
-        reply_result: dict, durable_tools: list[str], *, require_execution: bool = False
+        reply_result: dict,
+        durable_tools: list[str],
+        *,
+        require_execution: bool = False,
     ) -> bool:
         """Reject durable execution unless every attempted call has one success.
 

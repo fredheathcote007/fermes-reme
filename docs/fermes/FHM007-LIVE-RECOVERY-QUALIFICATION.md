@@ -27,7 +27,8 @@ Status: Draft PR evidence; **NOT** production acceptance, deployment, or approva
 - Dream, scheduler, proposed FHM-006 pre-compression checkpoint, SQLite/vector additions, Hindsight, and autonomous skill promotion remain disabled/deferred.
 - Production acceptance still requires provenance/retention/poisoning and workspace ownership validation, FHM-006 fail-closed checkpoint contract, arbitrary crash/partial-write recovery, operational security of LAN API, and any additional independent reviewer findings.
 - The observed successful real-model shutdown had no event-loop-closed exception, but failure-path asynchronous cleanup is not independently proven.
-- Baseline source lint/Black checks in the local host tool versions already report failures on unchanged `661a5ed`. Do not classify them as new regressions or claim these checks passed; the authoritative new-commit GitHub workflows must be verified.
+- First full GitHub matrix for `1a5d54e` found 16 failures in older tests that mocked AgentScope replies without the new required `tool_execution` record. These test doubles have been updated to declare explicit no-tool or successful paired tool evidence without relaxing the production fail-closed gate. **180/180** affected and focused host tests PASS after correction (`/tmp/fhm007/ci-remediation-host-tests.log`).
+- The first Python quality check required trailing-comma/Black formatting and docstrings on new test fixture classes. Locally pinned `add-trailing-comma` and Black 26.5.1 with CI arguments now PASS. The baseline host `ruff` invocation remains non-authoritative (its failures also occur on `661a5ed`); full new GitHub quality and test matrix must pass before CI closure.
 - Keep ReMe PR #1 a **draft** and FHM-007 Issue #7 **OPEN P1**. No main merge or deployment without owner approval.
 
 ## Rollback

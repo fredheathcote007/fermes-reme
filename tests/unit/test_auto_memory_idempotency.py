@@ -343,7 +343,10 @@ async def test_rejects_invalid_request_id_before_running_agent(tmp_path, request
     ],
 )
 async def test_auto_memory_receipt_requires_current_turn_evidence(
-    tmp_path, monkeypatch, tool_execution, expected_success
+    tmp_path,
+    monkeypatch,
+    tool_execution,
+    expected_success,
 ):
     """Real job execution must not acknowledge an unverified AgentScope turn."""
     from pathlib import Path
@@ -352,9 +355,7 @@ async def test_auto_memory_receipt_requires_current_turn_evidence(
     from reme.config import resolve_app_config
 
     config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
-    config = resolve_app_config(
-        config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False
-    )
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False)
 
     async def simulated_reply(_self, _inputs, **_kwargs):
         result = {"result": "done", "last_message": {"content": [{"type": "text", "text": "done"}]}}
