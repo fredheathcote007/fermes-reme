@@ -68,6 +68,7 @@ class _ProfileWriterLock:
         self._key = os.path.normcase(str(path.resolve(strict=False)))
 
     def acquire(self) -> None:
+        """Acquire exclusive process and OS ownership of this profile journal."""
         with _HELD_PROFILE_LOCKS_LOCK:
             if self._key in _HELD_PROFILE_LOCKS:
                 raise OSError("profile writer is already owned by this process")
@@ -96,6 +97,7 @@ class _ProfileWriterLock:
             _HELD_PROFILE_LOCKS.add(self._key)
 
     def release(self) -> None:
+        """Release the operating-system lock and local ownership registration."""
         fd, self._fd = self._fd, None
         if fd is None:
             return
