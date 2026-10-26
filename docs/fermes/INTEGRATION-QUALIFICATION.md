@@ -12,6 +12,14 @@ embedded-first Stage 1. It keeps ReMe's file-backed store and BM25 path. It does
 not add SQLite, a new vector backend, Hindsight, Project Coordinator, a model
 endpoint, or changes to the Hermes checkout.
 
+## Current acceptance snapshot (supervisor verified 26 October 2026)
+
+- **67/67 focused host tests PASS** on commit candidate bdcd2c1, log `/tmp/fhm007/poisoning-full-host.log`; prior 66/66 baseline and GitHub 8/8 remain separately recorded. New code is a **source-level/structural hostile-memory recall** regression, not behavioural LLM resistance.
+- The injected note is **directly seeded in a test workspace**, not ingested through model extraction. Its raw frontmatter contains a session pointer and the BM25 response identifies the source file path; it does **not** prove the full session metadata is carried into the prompt, nor a cryptographic source hash.
+- The test calls Hermes fence and streaming-scrubber helpers against actual ReMe recall, not the complete top-level agent prompt assembly. Recalled hostile text is still visible **inside** the memory fence; output scrubbing removes fence blocks from displayed text, not from the model input.
+- The test skips without maintained Hermes source on PYTHONPATH (to preserve upstream test portability); the dedicated Fermes CI explicitly checks out Hermes. **Do not count such a skip as security PASS.**
+- FHM-006 v2 checkpoint receipt, cross-workspace ownership enforcement, real local-model poisoning/extraction and unapproved skill promotion are **OPEN**. The separate checkpoint document remains a **proposal**, not an active provider capability.
+
 ## Regression matrix
 
 | Area | Evidence in this fork | Result |
@@ -22,14 +30,14 @@ endpoint, or changes to the Hermes checkout.
 | Embedded lifecycle | Fake `reme.Application` tests cover start, health, jobs, close, and bounded failure cleanup. | PASS in the recorded host suite; rerun this second pass in the disposable qualification environment. |
 | Recall timeout | Backend lock, startup, health, and search share the configured recall deadline. | PASS in focused tests |
 | Accepted-write semantics | Completed turns are JSONL-spooled and `fsync`ed before enqueue. The spool UUID is forwarded as ReMe's existing `auto_memory(request_id)`. Successful responses remove one record atomically; false/malformed responses, backend errors, shutdown timeout, or process loss retain it. | PASS in focused regression coverage; shared-profile writes are fail-closed |
-| ReMe receipt idempotency | Model-free tests now exercise the actual `Application.run_job` path and an actual embedded provider path with synthetic `_execute` instrumentation. They assert same ID/input side effects once, cached replay, different-input rejection, and stable retry ID after a successful backend response followed by failed spool acknowledgement. | UNKNOWN in this sandbox: the supplied Python 3.14 environment hangs in the existing `write_file_safe` thread helper before the receipt assertions; rerun in CI/host venv |
+| ReMe receipt idempotency | Model-free tests exercise real `Application.run_job` with synthetic `_execute` instrumentation, receipt replay and conflicting input rejection. | PASS in authorised host focused tests and GitHub CI; this does not prove arbitrary partial LLM side effects are exactly once |
 | Queue poisoning and disk failure | Malformed/poison records do not hide a later valid record or get silently discarded; append failure does not enqueue or acknowledge a turn. | PASS in focused tests |
 | Restart recovery | A failed first backend leaves one record; a fresh provider using the same profile replays and clears it. | PASS |
 | Full Hermes Plugin Doctor | `/tmp/fhm007/reme-plugin-doctor-host.log` records real Hermes Plugin Doctor manifest, import, discovery, and registration success. | PASS in host evidence |
 | Real Hermes loader | `/tmp/fhm007/real-hermes-loader-smoke.log` records `load_memory_provider` returning `ReMeMemoryProvider`, `available=True`, in a disposable profile. | PASS in host evidence |
 | HTTP transport | Existing tests require a loopback fixture. The worker sandbox denies socket creation (`EPERM`). | UNVERIFIED here |
-| Real ReMe BM25 recall | `/tmp/fhm007/offline-bm25-probe.log` records a real embedded Application with seeded Markdown, BM25-only evidence for the expected copper reference, and clean close; no model/cloud was used. | PASS for seeded single-workspace smoke; fresh-session/cross-profile gate remains |
-| Untrusted memory/passive prefetch | `test_hostile_recalled_memory_is_passive_fenced_data_with_provenance` uses a real ReMe provider/BM25 path plus maintained Hermes `MemoryManager` and memory-context fencing against forged roles, tool directives, fake system notes, nested fences, and a false FHM-006 claim. | Source-level PASS when host Hermes source is available; not real-LLM behavioral proof |
+| Real ReMe BM25 recall | `/tmp/fhm007/offline-bm25-probe.log` confirms real embedded local recall. Separate alpha/beta profile/workspace and restart checks recorded in supervisor evidence. | PASS for seeded retrieval, fresh session and **separate-workspace** isolation; shared-workspace enforcement remains OPEN |
+| Untrusted memory/passive prefetch | The hostile-memory fixture exercises actual ReMe BM25 prefetch and maintained Hermes `MemoryManager` and fence/scrubber helpers; no tool is executed during passive recall. | PASS **structural boundary only** in host tests; FHM-006 checkpoint, semantic poisoning and real-model behaviour remain OPEN |
 | Auto-memory provenance | Synthetic capture checks `session_id`, `source_conversation`, transcript presence, and actual recall source path. Current auto-memory frontmatter has no `source_hash`. | PASS for available pointers; source-hash gap documented, not changed |
 | Corrupted/partial source | The same isolated security fixture includes invalid/truncated Markdown and verifies valid BM25 recall remains available. | PASS when the embedded host run completes; warning/log portability remains to be rerun |
 
@@ -102,10 +110,7 @@ open an HTTP listener.
 - Fresh-session retrieval and cross-profile isolation are **PASS** in the
   recorded seeded BM25/provider evidence, while arbitrary backend side effects
   beyond ReMe's receipt remain **UNKNOWN**.
-- Same-profile ownership is **PASS** in bounded focused tests. ReMe receipt
-  replay/crash-window assertions are **UNKNOWN** until the model-free tests can
-  complete in a host/CI environment; Windows-specific lock CI is also
-  **UNKNOWN** until rerun.
+- Same-profile writer ownership and synthetic ReMe receipt replay are **PASS** in authorised host and GitHub CI; arbitrary mid-file mutation crash consistency and same-workspace cross-profile prevention remain **OPEN**. Windows CI passed, but the Windows-specific lock deserves a direct behavioural test.
 - FHM-006 pre-compression checkpoint v2 compatibility and the
   prompt-injection/memory-poisoning gate remain **OPEN / UNKNOWN**.
 - This iteration adds source-level evidence for passive recall fencing, but not
