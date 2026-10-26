@@ -4,22 +4,22 @@ Verdict: safe as a narrowly scoped draft PR, not safe to merge or call qualifica
 
 The reproduced failure is fixed:
 
-- AgentScope now emits a redacted tool summary from the current context tail at [as_agent_wrapper.py:157](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/components/agent_wrapper/as_agent_wrapper.py:157).
-- All-failed `daily_write` attempts produce `success=False` and remain retryable at [auto_memory.py:694](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/steps/evolve/auto_memory.py:694).
-- Failed responses are not cached as receipts; receipt persistence remains gated by success at [auto_memory.py:553](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/steps/evolve/auto_memory.py:553).
-- Hermes correctly retains the spool when ReMe returns false at [integrations/hermes_agent/__init__.py:823](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/integrations/hermes_agent/__init__.py:823).
+- AgentScope now emits a redacted tool summary from the current context tail at `reme/components/agent_wrapper/as_agent_wrapper.py:157`.
+- All-failed `daily_write` attempts produce `success=False` and remain retryable at `reme/steps/evolve/auto_memory.py:694`.
+- Failed responses are not cached as receipts; receipt persistence remains gated by success at `reme/steps/evolve/auto_memory.py:553`.
+- Hermes correctly retains the spool when ReMe returns false at `integrations/hermes_agent/__init__.py:823`.
 
 P1 findings:
 
-1. Missing or incomplete tool results still permit false success. `_all_requested_writes_failed()` returns false when a durable call has no matching result, an unrecognized state, or only partial results; the caller then acknowledges a missing note as a successful no-op at [auto_memory.py:442](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/steps/evolve/auto_memory.py:442) and [auto_memory.py:706](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/steps/evolve/auto_memory.py:706).
+1. Missing or incomplete tool results still permit false success. `_all_requested_writes_failed()` returns false when a durable call has no matching result, an unrecognized state, or only partial results; the caller then acknowledges a missing note as a successful no-op at `reme/steps/evolve/auto_memory.py:442` and `reme/steps/evolve/auto_memory.py:706`.
 
-2. Calls/results are correlated only by tool name, not call ID. Duplicate `daily_write` calls or mixed success/error results can be misclassified because counts and states are aggregated by name at [auto_memory.py:427](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/steps/evolve/auto_memory.py:427). The wrapper also discards IDs at [as_agent_wrapper.py:178](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/components/agent_wrapper/as_agent_wrapper.py:178).
+2. Calls/results are correlated only by tool name, not call ID. Duplicate `daily_write` calls or mixed success/error results can be misclassified because counts and states are aggregated by name at `reme/steps/evolve/auto_memory.py:427`. The wrapper also discards IDs at `reme/components/agent_wrapper/as_agent_wrapper.py:178`.
 
-3. The wrapper summarizes only `agent.state.context[-1]`, not an explicitly captured current-turn slice at [as_agent_wrapper.py:389](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/components/agent_wrapper/as_agent_wrapper.py:389). This worked for the observed repeated-error case, but is unproven for multi-message turns, earlier failed calls followed by a final text message, or continuation replies.
+3. The wrapper summarizes only `agent.state.context[-1]`, not an explicitly captured current-turn slice at `reme/components/agent_wrapper/as_agent_wrapper.py:389`. This worked for the observed repeated-error case, but is unproven for multi-message turns, earlier failed calls followed by a final text message, or continuation replies.
 
 Accepted Stage 1 limitations:
 
-- Legitimate no-tool no-ops remain successful, intentionally at [auto_memory.py:414](/srv/project-coordinator/projects/fermes-reme-fhm007-20261026/reme/steps/evolve/auto_memory.py:414).
+- Legitimate no-tool no-ops remain successful, intentionally at `reme/steps/evolve/auto_memory.py:414`.
 - Other wrappers remain compatible because the new field is optional; non-AgentScope wrappers retain prior behavior.
 - The summary itself does not add tool arguments, outputs, or error text. Existing `last_message` persistence still contains normal AgentScope context metadata.
 
