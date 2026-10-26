@@ -267,3 +267,81 @@ def test_configs_define_original_jobs_without_daily_variants():
         {"backend": "auto_memory_cc_step"},
         {"backend": "auto_tag_step"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_agentscope_memory_create_injects_session_ownership(tmp_path, monkeypatch):
+    """The model may choose note content but cannot choose its owning session."""
+    monkeypatch.chdir(tmp_path)
+    wrapper = _RecordingWrapper(name="fake", backend="agentscope")
+    step = await _auto_memory_step(wrapper)
+
+    async def no_note(_day, _session_id):
+        return None
+
+    async def no_tools_reply(_inputs, **kwargs):
+        wrapper.calls.append(kwargs)
+        return {"last_message": {}, "result": "no-op", "tool_execution": []}
+
+    monkeypatch.setattr(step, "_list_session_note", no_note)
+    monkeypatch.setattr(wrapper, "reply", no_tools_reply)
+    await step(
+        session_id="owned-session",
+        messages=[
+            {
+                "name": "user",
+                "role": "user",
+                "content": "calibration",
+                "created_at": "2025-06-01T10:00:00",
+            },
+        ],
+    )
+    assert step.context.response.success
+    assert wrapper.calls[0]["injected_job_kwargs"]["session_id"] == "owned-session"
+
+
+@pytest.mark.asyncio
+async def test_agentscope_memory_update_does_not_ack_failed_edit(tmp_path, monkeypatch):
+    """Existing note does not justify a receipt when the update failed."""
+    monkeypatch.chdir(tmp_path)
+    wrapper = _RecordingWrapper(name="fake", backend="agentscope")
+    step = await _auto_memory_step(wrapper)
+    note_path = "daily/2025-06-01/existing-note.md"
+    note_file = tmp_path / note_path
+    note_file.parent.mkdir(parents=True)
+    note_file.write_text(
+        "---\nsession_id: sess-1\nname: note\ndescription: existing\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    async def existing_note(_day, _session_id):
+        return {"path": note_path, "session_id": "sess-1"}
+
+    async def failed_update(_inputs, **kwargs):
+        wrapper.calls.append(kwargs)
+        return {
+            "last_message": {},
+            "result": "done",
+            "tool_execution": [
+                {"type": "tool_call", "name": "edit", "call_id": "c1"},
+                {"type": "tool_result", "name": "edit", "call_id": "c1", "state": "error"},
+            ],
+        }
+
+    monkeypatch.setattr(step, "_list_session_note", existing_note)
+    monkeypatch.setattr(wrapper, "reply", failed_update)
+    await step(
+        session_id="sess-1",
+        messages=[
+            {
+                "name": "user",
+                "role": "user",
+                "content": "change",
+                "created_at": "2025-06-01T11:00:00",
+            },
+        ],
+    )
+    assert not step.context.response.success
+    assert "retry" in step.context.response.answer
+    assert wrapper.calls[0]["injected_job_kwargs"]["_allowed_paths"] == [note_path]
+    assert not list((tmp_path / "metadata" / "auto_memory_requests").rglob("*.json"))

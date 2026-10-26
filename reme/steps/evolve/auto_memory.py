@@ -473,6 +473,30 @@ class AutoMemoryStep(BaseStep):
             return True
         return any(state not in _SUCCESSFUL_TOOL_STATES for _name, state in results.values())
 
+    @staticmethod
+    def _requested_tool_call_observed(
+        reply_result: dict,
+        durable_tools: list[str],
+        *,
+        require_execution: bool = False,
+    ) -> bool:
+        """Return whether the current reply contains a call to a durable tool."""
+        execution = reply_result.get("tool_execution") if isinstance(reply_result, dict) else None
+        if isinstance(execution, list):
+            content = execution
+        elif require_execution:
+            return False
+        else:
+            last_message = reply_result.get("last_message") if isinstance(reply_result, dict) else None
+            content = last_message.get("content") if isinstance(last_message, dict) else None
+        if not isinstance(content, list):
+            return False
+        durable_tools = set(durable_tools)
+        return any(
+            isinstance(block, dict) and block.get("type") == "tool_call" and block.get("name") in durable_tools
+            for block in content
+        )
+
     def _format_history(self, messages: list[Msg]) -> str:
         """Render the conversation history injected into the prompt.
 
@@ -694,8 +718,16 @@ class AutoMemoryStep(BaseStep):
         # model supplies the date from the prompt.
         if reply_kwargs is None:
             reply_kwargs = self._reply_extra_kwargs(day)
+        is_agentscope = getattr(self.agent_wrapper, "backend", None) == "agentscope"
+        injected_job_kwargs = dict(reply_kwargs.get("injected_job_kwargs") or {})
+        if created and is_agentscope:
+            # The source session is application-owned. Keep any other wrapper
+            # constraints while hiding this value from the model's tool schema.
+            injected_job_kwargs["session_id"] = session_id
+            reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
         if not created:
-            reply_kwargs["injected_job_kwargs"] = {"_allowed_paths": [note_path]}
+            injected_job_kwargs["_allowed_paths"] = [note_path]
+            reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
         result = await self.agent_wrapper.reply(
             user_message,
             system_prompt=self.prompt_format("system_prompt"),
@@ -707,7 +739,6 @@ class AutoMemoryStep(BaseStep):
         # Reject incomplete/malformed durable execution before checking the
         # note on disk: a partial write must not acknowledge the whole turn.
         durable_tools = self.create_tools if created else self.update_tools
-        is_agentscope = getattr(self.agent_wrapper, "backend", None) == "agentscope"
         if self._all_requested_writes_failed(result, durable_tools, require_execution=is_agentscope):
             self.context.response.success = False
             self.context.response.answer = "Error: durable memory write failed; request remains eligible for retry"
@@ -735,6 +766,20 @@ class AutoMemoryStep(BaseStep):
                 self.logger.info(f"[{self.name}] post-create list failed session_id={session_id!r} answer={str(exc)!r}")
                 return
             if note is None:
+                if self._requested_tool_call_observed(result, durable_tools, require_execution=is_agentscope):
+                    self.context.response.success = False
+                    self.context.response.answer = (
+                        "Error: durable memory write did not create a note for the requested session; "
+                        "request remains eligible for retry"
+                    )
+                    self.context.response.metadata.update(
+                        {"date": day, "path": None, "created": False, "modified": False, "n_messages": len(messages)},
+                    )
+                    self.logger.warning(
+                        f"[{self.name}] durable tool succeeded without a note for session_id={session_id!r}; "
+                        "keeping request retryable",
+                    )
+                    return
                 self.context.response.success = True
                 self.context.response.answer = agent_reply_result_text(result)
                 self.context.response.metadata.update(

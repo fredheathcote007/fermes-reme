@@ -34,3 +34,21 @@ Status: Draft PR evidence; **NOT** production acceptance, deployment, or approva
 ## Rollback
 
 No production rollback is required because these changes have not been deployed. To abandon the draft changes, retain the protected upstream baseline `661a5ed` and do not promote the isolated branch. Never force-push away other workers' commits.
+
+## FHM-007 P2 follow-up checkpoint — 2026-10-26
+
+- AgentScope create operations now inject server-owned session_id. The model schema hides this parameter and conflicts fail rather than overriding ownership.
+- A successful daily_write without a note belonging to the requested session fails closed, preserving the queued turn and preventing a false receipt; a genuine no-tool no-op remains valid.
+- An existing-note failed edit has an explicit job-level negative regression test.
+- Internally owned OpenAI asynchronous clients are closed before shutdown; externally supplied clients are not closed by ReMe.
+- Combined host results: 102 focused adapter tests PASS, 33 LLM/component tests PASS, and four selected injection tests PASS. Optional Claude SDK-dependent test was not run locally.
+- Live model test on isolated Bubblewrap sandbox 5: two durable daily files; pending journal zero; new-session BM25 recalled FHM007-amber-kite-824 and teal; ACCEPTANCE True; exit 0. The model hit its six-iteration ceiling after writing; useful-memory acceptance still passed.
+- Still draft-only, NOT deployment or main merge approved. Pending full CI and independent review; source-hash provenance, FHM-006 checkpoint, arbitrary crash/replay and profile ownership controls remain separate acceptance gates.
+
+## Final Stage 1 patch assurance checkpoint (2026-10-26)
+
+- Final local CI-equivalent tests: 85 memory/provider tests PASS and 26 LLM lifecycle, wrapper and attribution tests PASS, both exit 0.
+- Session-ID schema hiding and rejection of a foreign model-supplied session ID is now regression-tested.
+- Failure-path unit test awaits a synthetic model call that raises, then verifies the internally owned async client closes; externally injected models remain borrowed.
+- Independent Cursor review: no P0 for the Stage 1 AgentScope/OpenAI path. P1 acceptance concern remains: a genuinely no-tool automatic-memory turn may acknowledge the spool without writing a note. This is compatible with the approved legitimate no-op policy but is not proof every explicit retention request will be stored.
+- Keep the draft PR unmerged and production unchanged. FHM-007 is still OPEN P1 pending retention-intent/no-op contract, cryptographic provenance, FHM-006 checkpoint, crash replay and workspace security gates.

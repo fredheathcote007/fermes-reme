@@ -351,3 +351,25 @@ async def test_agentscope_tool_summary_is_current_turn_redacted_and_id_paired(tm
         {"type": "tool_call", "name": "daily_write", "call_id": "new"},
         {"type": "tool_result", "name": "daily_write", "call_id": "new", "state": "success"},
     ]
+
+
+def test_session_id_is_server_owned_when_injected():
+    """A model cannot select a different memory-owning session."""
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "session_id": {"type": "string"}},
+        "required": ["name", "session_id"],
+    }
+    injection = {"session_id": "trusted-session"}
+    exposed = BaseAgentWrapper._strip_injected_parameters(schema, injection)
+    assert exposed["required"] == ["name"]
+    assert "session_id" not in exposed["properties"]
+    assert BaseAgentWrapper._merge_injected_job_kwargs({"name": "note"}, injection) == {
+        "name": "note",
+        "session_id": "trusted-session",
+    }
+    with pytest.raises(ValueError, match="session_id"):
+        BaseAgentWrapper._merge_injected_job_kwargs(
+            {"name": "note", "session_id": "foreign-session"},
+            injection,
+        )

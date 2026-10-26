@@ -339,6 +339,13 @@ async def test_rejects_invalid_request_id_before_running_agent(tmp_path, request
             ],
             False,
         ),
+        (
+            [
+                {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+            ],
+            False,
+        ),
         ([], True),
     ],
 )
