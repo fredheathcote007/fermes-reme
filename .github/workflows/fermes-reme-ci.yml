@@ -1,0 +1,60 @@
+# Fermes ReMe FHM-007: focused Hermes adapter checks on GitHub-hosted Ubuntu.
+# No Blacksmith runners, live model calls, publish credentials or deployments.
+name: Fermes ReMe Stage 1 CI
+
+on:
+  pull_request:
+    paths:
+      - "integrations/hermes_agent/**"
+      - "reme/config/fermes-hermes-stage1.yaml"
+      - "tests/unit/test_hermes_agent_integration.py"
+      - "docs/fermes/**"
+      - ".github/workflows/fermes-reme-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fermes-reme-stage1-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hermes-provider:
+    name: Embedded ReMe and Hermes provider tests
+    if: github.repository == 'fredheathcote007/fermes-reme'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - name: Checkout ReMe fork
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Checkout pinned maintained Hermes compatibility source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: fredheathcote007/hermes-agent
+          ref: 96517c3fd2f4224360c73a0a9294a479384e4a3c
+          path: hermes
+          persist-credentials: false
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.13.3"
+          enable-cache: true
+      - name: Install ReMe and focused test dependencies
+        run: uv pip install --system -e ".[core]" "agentscope[model-ollama]==2.0.10" pytest pytest-asyncio ruamel.yaml
+      - name: Run Hermes adapter contract and regression suite
+        env:
+          HERMES_HOME: ${{ runner.temp }}/fermes-hermes-profile
+          PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}
+        run: |
+          python -m compileall -q integrations/hermes_agent
+          python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_hermes_agent_integration.py

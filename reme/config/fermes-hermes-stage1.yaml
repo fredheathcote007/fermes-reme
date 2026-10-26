@@ -1,0 +1,157 @@
+# Fermes Hermes Stage 1: embedded, local-only qualification profile.
+# This file intentionally does not extend default.yaml: unattended Dream,
+# proactive jobs, vector retrieval, and hosted model defaults must not leak in.
+
+service:
+  backend: cli
+
+jobs:
+  index_update_loop:
+    backend: background
+    watch_dirs: [daily_dir, digest_dir]
+    watch_suffixes: [md]
+    steps:
+      - backend: init_changes_step
+        monitor_type: file_store
+        monitor_name: default
+        dispatch_steps: [update_index_step]
+      - backend: watch_changes_step
+        watch_mode: awatch
+        monitor_type: file_store
+        monitor_name: default
+        dispatch_steps:
+          - backend: update_index_step
+            persist: false
+
+  health_check:
+    backend: base
+    enable_serve: false
+    steps:
+      - backend: health_check_step
+
+  search:
+    backend: base
+    enable_serve: false
+    parameters:
+      type: object
+      properties:
+        query: {type: string}
+        limit: {type: integer, default: 5}
+      required: [query]
+    steps:
+      - backend: search_step
+        vector_weight: 0.0
+        candidate_multiplier: 5.0
+        expand_links: true
+        max_links_per_direction: 10
+
+  auto_memory:
+    backend: base
+    enable_serve: false
+    parameters:
+      type: object
+      properties:
+        request_id: {type: string}
+        messages: {type: array, items: {type: object}}
+        session_id: {type: string, default: ""}
+        memory_hint: {type: string}
+        include_images: {type: boolean, default: false}
+        date: {type: string, default: ""}
+      required: [messages]
+    steps:
+      - backend: auto_memory_step
+      - backend: auto_tag_step
+
+  daily_list:
+    backend: base
+    enable_serve: false
+    steps: [{backend: daily_list_step}]
+  daily_write:
+    backend: base
+    enable_serve: false
+    steps: [{backend: daily_write_step}]
+  read:
+    backend: base
+    enable_serve: false
+    steps: [{backend: read_step, with_neighbors: false}]
+  write:
+    backend: base
+    enable_serve: false
+    steps: [{backend: write_step}]
+  edit:
+    backend: base
+    enable_serve: false
+    steps: [{backend: edit_step}]
+  move:
+    backend: base
+    enable_serve: false
+    steps: [{backend: move_step}]
+  frontmatter_read:
+    backend: base
+    enable_serve: false
+    steps: [{backend: frontmatter_read_step}]
+  frontmatter_update:
+    backend: base
+    enable_serve: false
+    steps: [{backend: frontmatter_update_step}]
+  list_tags:
+    backend: base
+    enable_serve: false
+    steps: [{backend: list_tags_step}]
+
+components:
+  tokenizer:
+    default: {backend: regex}
+  as_llm:
+    default:
+      backend: openai
+      model: ${FERMES_STAGE1_LLM_MODEL:-local-placeholder}
+      stream: true
+      context_size: 32768
+      max_retries: 1
+      credential:
+        api_key: ${FERMES_STAGE1_LLM_API_KEY:-local-only}
+        base_url: ${FERMES_STAGE1_LLM_BASE_URL:-http://127.0.0.1:1234/v1}
+      parameters:
+        max_tokens: 4096
+        thinking_enable: false
+  agent_wrapper:
+    default:
+      backend: agentscope
+      as_llm: default
+      permission_mode: bypass
+      react_config: {max_iters: 10}
+      context_config:
+        trigger_ratio: 0.8
+        reserve_ratio: 0.1
+        tool_result_limit: 20000
+      model_config: {max_retries: 1}
+  file_graph:
+    default: {backend: local}
+  file_chunker:
+    markdown:
+      backend: markdown
+      supported_extensions: [md]
+      embed_toc: true
+      max_ast_sections: 100
+      include_frontmatter_in_metadata: false
+      include_frontmatter_keys_in_metadata: []
+    default:
+      backend: default
+      supported_extensions: [txt, log]
+  keyword_index:
+    default: {backend: bm25, tokenizer: default}
+  tag_index:
+    default:
+      backend: local
+      tag_key: memory_tags
+      max_tags_per_file: 3
+      max_tag_length: 64
+  file_store:
+    default:
+      backend: local
+      store_name: local
+      embedding_store: ""
+      keyword_index: default
+      file_graph: default
+      tag_index: default
