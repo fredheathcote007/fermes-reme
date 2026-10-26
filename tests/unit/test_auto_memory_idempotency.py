@@ -199,6 +199,35 @@ async def test_failed_request_can_retry_but_reusing_a_completed_id_for_other_inp
     assert "different input" in conflicting.context.response.answer
 
 
+def test_failed_durable_tool_calls_are_not_treated_as_a_noop():
+    failed_reply = {
+        "last_message": {
+            "content": [
+                {"type": "tool_call", "name": "daily_write", "input": "{}"},
+                {"type": "tool_result", "name": "daily_write", "state": "error"},
+                {"type": "text", "text": "I reached the maximum number of reasoning iterations."},
+            ],
+        },
+    }
+
+    assert AutoMemoryStep._all_requested_writes_failed(failed_reply, ["daily_write"])
+    assert not AutoMemoryStep._all_requested_writes_failed(
+        {"last_message": {"content": [{"type": "text", "text": "Nothing to remember."}]}},
+        ["daily_write"],
+    )
+    assert not AutoMemoryStep._all_requested_writes_failed(
+        {
+            "last_message": {
+                "content": [
+                    {"type": "tool_call", "name": "daily_write", "input": "{}"},
+                    {"type": "tool_result", "name": "daily_write", "state": "success"},
+                ],
+            },
+        },
+        ["daily_write"],
+    )
+
+
 @pytest.mark.asyncio
 async def test_receipts_obey_workspace_permissions(tmp_path):
     step = _step(tmp_path, _allowed_paths=["daily"])

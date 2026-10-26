@@ -153,6 +153,36 @@ class AsAgentWrapper(BaseAgentWrapper):
         """Normalize AgentScope's portable input/output usage."""
         return TokenUsage.from_provider(usage)
 
+    @staticmethod
+    def _tool_execution_summary(message: Any) -> list[dict[str, str]]:
+        """Return redacted tool names and result states from one AgentScope message."""
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            return []
+
+        summary = []
+        for block in content:
+            if isinstance(block, dict):
+                block_type = block.get("type")
+                name = block.get("name")
+                state = block.get("state")
+            else:
+                block_type = getattr(block, "type", None)
+                name = getattr(block, "name", None)
+                state = getattr(block, "state", None)
+            if hasattr(block_type, "value"):
+                block_type = block_type.value
+            if block_type == "tool_call" and name:
+                summary.append({"type": "tool_call", "name": str(name)})
+            elif block_type == "tool_result" and name:
+                if hasattr(state, "value"):
+                    state = state.value
+                summary.append({"type": "tool_result", "name": str(name), "state": str(state or "")})
+        return summary
+
     def __init__(self, as_llm: str = "default", session_retention_days: int = 10, **kwargs):
         super().__init__(**kwargs)
         self.as_llm = self.bind(as_llm, BaseAsLLM, optional=False)
@@ -356,6 +386,9 @@ class AsAgentWrapper(BaseAgentWrapper):
             "session_id": agent.state.session_id,
             "last_message": last_msg.model_dump(),
             "result": last_msg.get_text_content(),
+            "tool_execution": self._tool_execution_summary(
+                agent.state.context[-1] if agent.state.context else last_msg,
+            ),
         }
 
         if usage is None:

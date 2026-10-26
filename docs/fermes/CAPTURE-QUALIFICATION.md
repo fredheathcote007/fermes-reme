@@ -4,7 +4,38 @@ project_id: fermes-hermes
 date: 2026-10-26
 repository: fredheathcote007/fermes-reme
 branch: fermes/hermes-provider-stage1
-status: Synthetic model-boundary integration PASS; real model E2E still NOT QUALIFIED
+status: Synthetic model-boundary integration PASS; real model E2E FAILED / NOT QUALIFIED
+
+## Real local-model qualification update — 2026-10-26
+
+The approved Dad-PC LAN route was restored and verified independently:
+Project Coordinator reached `10.1.1.50:1234/v1/models` with HTTP 200, and a
+synthetic Qwen 3.5 4B chat completed with an exact response. A direct Qwen
+function call with the required fields also returned valid JSON arguments.
+
+The real ReMe → AgentScope → LM Studio capture then failed in the read-only
+model sandbox. The model emitted `{}` for `daily_write` repeatedly; every call
+failed validation because `name`, `description`, `session_id`, and `content`
+were missing. AgentScope reached its iteration cap, no daily note was written,
+but ReMe returned `success: true` with `changes: []`, persisted a success
+receipt, and the Hermes pending write was cleared. Fresh-session recall was
+empty. Evidence remains in `/tmp/fhm007/live-reme-capture.log` and the
+synthetic session/receipt files under `/tmp/fhm007/live-model-sandbox`; no
+private data was used.
+
+Root cause confirmed at the ReMe boundary: `AutoMemoryStep` interpreted “no
+note exists after the agent reply” as a successful no-op without inspecting
+failed AgentScope durable-tool results. The LM Studio adapter/schema mismatch
+that produced empty arguments is probable but not yet isolated; direct Qwen
+tool calling worked. Stage 1 now fails closed for replies whose attempted
+durable writes all return tool errors, so the stable Hermes request remains
+retryable. Legitimate replies with no durable tool call remain successful
+no-ops.
+
+Next test: rerun the deterministic invalid-argument regression and then repeat
+the approved local-model capture after independent review. A real-model
+learning or recall PASS must not be claimed until a daily note is actually
+written and recovered in a fresh session.
 
 ## Scope and evidence
 

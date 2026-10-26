@@ -7,6 +7,8 @@ on:
     paths:
       - "integrations/hermes_agent/**"
       - "reme/config/fermes-hermes-stage1.yaml"
+      - "reme/components/agent_wrapper/as_agent_wrapper.py"
+      - "reme/steps/evolve/auto_memory.py"
       - "tests/unit/test_hermes_agent_integration.py"
       - "tests/unit/test_auto_memory_idempotency.py"
       - "tests/unit/test_fermes_capture_integration.py"

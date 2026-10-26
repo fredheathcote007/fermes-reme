@@ -3,7 +3,32 @@
 project_id: fermes-hermes
 source_sha_at_start: 363e497ae96733271414ea4224e274e5de5e5253
 branch: fermes/hermes-provider-stage1
-status: draft review evidence; not deployed
+status: draft review evidence; real-model capture failed closed; not deployed
+
+## Real local-model qualification update — 2026-10-26
+
+The Dad-PC LAN listener restore is verified: the approved Project Coordinator
+route to `10.1.1.50:1234/v1/models` returned HTTP 200, synthetic Qwen 3.5 4B
+chat returned the exact expected response, and a direct one-function Qwen
+tool call returned valid JSON for all required arguments.
+
+The subsequent real ReMe capture was **not a PASS**. AgentScope received
+repeated `daily_write` calls with `{}`; all failed the required
+`name`/`description`/`session_id`/`content` validation, and the agent reached
+its iteration cap. ReMe nevertheless acknowledged the request with
+`success: true`, `changes: []`, wrote a success receipt, and cleared the
+Hermes pending spool. No daily memory was created and fresh-session recall was
+empty. The captured evidence is `/tmp/fhm007/live-reme-capture.log` plus the
+synthetic session and receipt files under `/tmp/fhm007/live-model-sandbox`.
+
+The confirmed source defect was ReMe's `AutoMemoryStep` treating a missing
+post-agent note as a successful no-op without checking failed durable tool
+results. The exact LM Studio/OpenAI-compatible schema or prompt cause of the
+empty arguments is still probable, not confirmed; direct Qwen tool calling
+worked. The minimal fix rejects all-failed durable tool replies and leaves the
+stable request ID eligible for retry, while preserving legitimate no-tool
+no-ops. Real-model learning remains **FAILED / NOT QUALIFIED**, and this does
+not qualify memory retention.
 
 ## Scope
 

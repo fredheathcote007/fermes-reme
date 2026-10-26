@@ -29,6 +29,8 @@ from ...utils.wikilink_handler import WikilinkHandler
 _SESSION_ID_KEY = "session_id"
 _SOURCE_CONVERSATION_KEY = "source_conversation"
 _MESSAGE_TIME_ALIASES = ("time_created", "timestamp", "createdAt", "timeCreated", "created_time")
+_SUCCESSFUL_TOOL_STATES = {"success", "succeeded", "ok"}
+_FAILED_TOOL_STATES = {"error", "failed", "failure"}
 
 
 def _checked_write_path(workspace: Path, relative: str, allowed_paths) -> Path:
@@ -402,6 +404,45 @@ class AutoMemoryStep(BaseStep):
         """
         return {}
 
+    @staticmethod
+    def _all_requested_writes_failed(reply_result: dict, durable_tools: list[str]) -> bool:
+        """Identify an agent reply whose attempted durable tools all failed.
+
+        AgentScope can return a final text message after exhausting its
+        iterations.  That text is not an acknowledgement that a file write
+        happened, so inspect the tool-result states instead of treating the
+        final text as proof of success.  A reply with no durable tool call is
+        intentionally not considered a failure: legitimate no-op sessions
+        remain successful.
+        """
+        execution = reply_result.get("tool_execution") if isinstance(reply_result, dict) else None
+        if isinstance(execution, list):
+            content = execution
+        else:
+            last_message = reply_result.get("last_message") if isinstance(reply_result, dict) else None
+            content = last_message.get("content") if isinstance(last_message, dict) else None
+        if not isinstance(content, list):
+            return False
+
+        durable_tools = set(durable_tools)
+        attempted: dict[str, int] = {}
+        states: dict[str, list[str]] = {}
+        for block in content:
+            if not isinstance(block, dict) or block.get("name") not in durable_tools:
+                continue
+            name = str(block["name"])
+            if block.get("type") == "tool_call":
+                attempted[name] = attempted.get(name, 0) + 1
+            elif block.get("type") == "tool_result":
+                state = str(block.get("state") or "").lower().rsplit(".", 1)[-1]
+                states.setdefault(name, []).append(state)
+
+        if not attempted:
+            return False
+        return all(len(states.get(name, [])) >= count for name, count in attempted.items()) and all(
+            state in _FAILED_TOOL_STATES for name in attempted for state in states.get(name, [])
+        )
+
     def _format_history(self, messages: list[Msg]) -> str:
         """Render the conversation history injected into the prompt.
 
@@ -645,6 +686,18 @@ class AutoMemoryStep(BaseStep):
                 self.logger.info(f"[{self.name}] post-create list failed session_id={session_id!r} answer={str(exc)!r}")
                 return
             if note is None:
+                if self._all_requested_writes_failed(result, self.create_tools):
+                    self.context.response.success = False
+                    self.context.response.answer = (
+                        "Error: durable memory write failed; request remains eligible for retry"
+                    )
+                    self.context.response.metadata.update(
+                        {"date": day, "path": None, "created": False, "modified": False, "n_messages": len(messages)},
+                    )
+                    self.logger.warning(
+                        f"[{self.name}] durable create failed session_id={session_id!r}; keeping request retryable",
+                    )
+                    return
                 self.context.response.success = True
                 self.context.response.answer = agent_reply_result_text(result)
                 self.context.response.metadata.update(
@@ -656,6 +709,22 @@ class AutoMemoryStep(BaseStep):
             if image_sources:
                 await self._ensure_session_frontmatter(note_path, session_id, image_sources)
         else:
+            if self._all_requested_writes_failed(result, self.update_tools):
+                self.context.response.success = False
+                self.context.response.answer = "Error: durable memory write failed; request remains eligible for retry"
+                self.context.response.metadata.update(
+                    {
+                        "date": day,
+                        "path": note_path,
+                        "created": created,
+                        "modified": False,
+                        "n_messages": len(messages),
+                    },
+                )
+                self.logger.warning(
+                    f"[{self.name}] durable update failed session_id={session_id!r}; keeping request retryable",
+                )
+                return
             try:
                 await self._ensure_session_frontmatter(note_path, session_id, image_sources)
                 note_path = await self._rename_from_frontmatter_name(note_path, day)
