@@ -27,6 +27,36 @@ session-level source metadata and a persisted transcript, correctly exercised
 `daily_write` and `frontmatter_update` tools, journal acknowledgement,
 shutdown, fresh-session BM25 retrieval and source-path presence.
 
+## Untrusted-memory and provenance regression — this iteration
+
+`test_hostile_recalled_memory_is_passive_fenced_data_with_provenance` seeds an
+isolated daily note and source transcript with forged `SYSTEM`/`USER` role
+labels, a fake `TOOL_CALL`, a fake MEMORY system note, a false FHM-006 success
+claim, and nested memory fences. It then uses the real embedded
+`ReMeMemoryProvider`, ReMe BM25 search, Hermes `MemoryManager.prefetch_all`,
+and Hermes `build_memory_context_block`/streaming scrubber. No security helper
+or ReMe search implementation is mocked. The test verifies passive prefetch
+has no `pwned.txt` side effect, recall retains the daily source path, the
+provider exposes no tool schemas in this path, and Hermes fences recalled data
+while stripping nested provider-supplied fences/system notes even when tags
+are split across streaming chunks.
+
+The synthetic capture assertions also confirm that current auto-memory files
+provide a session pointer and transcript, but do **not** provide a
+`source_hash`. That is a documented provenance gap; this iteration does not
+alter the ReMe metadata format. The corrupted/partial Markdown fixture checks
+that malformed source data does not suppress valid BM25 recall. These checks
+establish source-level/passive boundary behavior only; they do not prove
+behavioral resistance of a real LLM.
+
+The bounded sandbox rerun did not qualify this new test: the embedded ReMe
+startup timed out under the supplied Python 3.14 environment, after which the
+provider remained unavailable. The full requested focused command reached
+13 passing tests and then stopped at the pre-existing loopback HTTP fixture
+with `PermissionError: [Errno 1] Operation not permitted` when the sandbox
+denied socket creation. Host/CI rerun is therefore required before counting
+this regression as a PASS.
+
 Host qualification command (authorised development PC only):
 
 ```bash
@@ -63,12 +93,17 @@ profile isolation, receipt fault injection and real LM Studio qualification.
 - FHM-006 precompaction fail-closed checkpoint, memory-poisoning and provenance
   trust boundaries, mid-agent crash partial writes and cross-profile shared
   workspace protections remain separate acceptance gates.
+- The hostile-memory test is evidence for fencing and passive provider routing,
+  not semantic filtering or real-model prompt-injection resistance. Source
+  hashes remain absent from current auto-memory frontmatter.
 - Future SkillHone and SkillOpt-Sleep integration remains read-only against
   untrusted memories until promotion approval/evaluation controls exist.
 
 ## Exact next action
 
-Review CI for the commit containing this test; remediate genuine environment
-and portability failures. Then qualify real LM Studio inference using the
-existing approved model access route without changing production Hermes,
-before requesting owner approval for the next integration gate.
+Run the focused security/capture tests in the maintained host venv and review
+the resulting source-level evidence independently. Then decide the
+implementation/ownership details in `FHM006-CHECKPOINT-GAP.md`; only after
+that decision should an approved local-model route be used to qualify genuine
+capture. Do not change Hermes, enable checkpoint v2, merge, or deploy from
+this qualification.

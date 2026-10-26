@@ -29,6 +29,9 @@ endpoint, or changes to the Hermes checkout.
 | Real Hermes loader | `/tmp/fhm007/real-hermes-loader-smoke.log` records `load_memory_provider` returning `ReMeMemoryProvider`, `available=True`, in a disposable profile. | PASS in host evidence |
 | HTTP transport | Existing tests require a loopback fixture. The worker sandbox denies socket creation (`EPERM`). | UNVERIFIED here |
 | Real ReMe BM25 recall | `/tmp/fhm007/offline-bm25-probe.log` records a real embedded Application with seeded Markdown, BM25-only evidence for the expected copper reference, and clean close; no model/cloud was used. | PASS for seeded single-workspace smoke; fresh-session/cross-profile gate remains |
+| Untrusted memory/passive prefetch | `test_hostile_recalled_memory_is_passive_fenced_data_with_provenance` uses a real ReMe provider/BM25 path plus maintained Hermes `MemoryManager` and memory-context fencing against forged roles, tool directives, fake system notes, nested fences, and a false FHM-006 claim. | Source-level PASS when host Hermes source is available; not real-LLM behavioral proof |
+| Auto-memory provenance | Synthetic capture checks `session_id`, `source_conversation`, transcript presence, and actual recall source path. Current auto-memory frontmatter has no `source_hash`. | PASS for available pointers; source-hash gap documented, not changed |
+| Corrupted/partial source | The same isolated security fixture includes invalid/truncated Markdown and verifies valid BM25 recall remains available. | PASS when the embedded host run completes; warning/log portability remains to be rerun |
 
 ## Durability boundary
 
@@ -105,6 +108,11 @@ open an HTTP listener.
   **UNKNOWN** until rerun.
 - FHM-006 pre-compression checkpoint v2 compatibility and the
   prompt-injection/memory-poisoning gate remain **OPEN / UNKNOWN**.
+- This iteration adds source-level evidence for passive recall fencing, but not
+  semantic filtering, real-LLM resistance, or a trusted-memory promotion path.
+- Current auto-memory source provenance is a session pointer/path, not a
+  content hash. `FHM006-CHECKPOINT-GAP.md` is a proposed adapter design only;
+  it does not enable the v2 marker or alter the provider contract.
 - No production deployment, active Hermes profile change, merge, or release
   approval is authorized by this qualification draft.
 
@@ -126,3 +134,21 @@ open an HTTP listener.
 - Exclusive per-profile writer lock added via OS lock (`fcntl.flock` on Linux, `msvcrt.locking` on Windows) plus process-local ownership guard. Linux competing-process smoke: second process fails while lock held, then succeeds after release; log `/tmp/fhm007/multiprocess-lock-host.log`. Windows branch still requires its latest CI run.
 - Journal tests now cover lock contention, poisoned/invalid record retention while processing valid entries, and disk-append failure without accepting a turn. ReMe remains file-backed/BM25-only Stage 1, Dream disabled.
 - New independent Cursor source review at `/tmp/fhm007/cursor-reliability-final-review.log`: draft-PR suitable, production NO GO. Residual scope: same *ReMe workspace* shared across different Hermes homes remains forbidden; Windows lock needs CI; arbitrary mid-operation LLM crash idempotency not proven; FHM-006 fail-closed compaction, provenance/poisoning and real LLM-backed conversational learning remain open.
+
+## This iteration exact next action
+
+Run `tests/unit/test_fermes_capture_integration.py` and the maintained Hermes
+provider suite in `/tmp/fhm007/reme-fork-testvenv` with the stated `PYTHONPATH`
+and disposable `HERMES_HOME`, then obtain independent review of the new
+source-level security evidence. Treat the local Python 3.14 embedded-startup
+timeout as an environment qualification issue unless it reproduces in the
+host venv. Do not modify Hermes, enable FHM-006 v2, use a live model, merge,
+or deploy.
+
+Bounded sandbox result for this iteration: `compileall`, Black (120-column
+repository settings), Ruff, and `git diff --check` passed. The focused pytest
+command reached **13 passed** before the existing HTTP fixture failed on
+socket permission (`EPERM`); the new hostile-memory test separately reached
+the real Hermes import path but could not get past embedded ReMe startup
+timeout. These are unresolved qualification results, not claims of host
+security-test success.
