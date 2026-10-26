@@ -30,7 +30,6 @@ _SESSION_ID_KEY = "session_id"
 _SOURCE_CONVERSATION_KEY = "source_conversation"
 _MESSAGE_TIME_ALIASES = ("time_created", "timestamp", "createdAt", "timeCreated", "created_time")
 _SUCCESSFUL_TOOL_STATES = {"success", "succeeded", "ok"}
-_FAILED_TOOL_STATES = {"error", "failed", "failure"}
 
 
 def _checked_write_path(workspace: Path, relative: str, allowed_paths) -> Path:
@@ -405,19 +404,25 @@ class AutoMemoryStep(BaseStep):
         return {}
 
     @staticmethod
-    def _all_requested_writes_failed(reply_result: dict, durable_tools: list[str]) -> bool:
-        """Identify an agent reply whose attempted durable tools all failed.
+    def _all_requested_writes_failed(
+        reply_result: dict, durable_tools: list[str], *, require_execution: bool = False
+    ) -> bool:
+        """Reject durable execution unless every attempted call has one success.
 
         AgentScope can return a final text message after exhausting its
         iterations.  That text is not an acknowledgement that a file write
-        happened, so inspect the tool-result states instead of treating the
-        final text as proof of success.  A reply with no durable tool call is
-        intentionally not considered a failure: legitimate no-op sessions
-        remain successful.
+        happened.  Calls and results must be known, well-formed, uniquely
+        identified, and paired by AgentScope's call ID.  A reply with no tool
+        block is intentionally not considered a failure: legitimate no-op
+        sessions remain successful.
         """
         execution = reply_result.get("tool_execution") if isinstance(reply_result, dict) else None
         if isinstance(execution, list):
             content = execution
+        elif require_execution:
+            # AgentScope must provide an explicit current-turn record; final
+            # assistant text cannot prove a durable write or a genuine no-op.
+            return True
         else:
             last_message = reply_result.get("last_message") if isinstance(reply_result, dict) else None
             content = last_message.get("content") if isinstance(last_message, dict) else None
@@ -425,23 +430,45 @@ class AutoMemoryStep(BaseStep):
             return False
 
         durable_tools = set(durable_tools)
-        attempted: dict[str, int] = {}
-        states: dict[str, list[str]] = {}
+        calls: dict[str, str] = {}
+        results: dict[str, tuple[str, str]] = {}
+        saw_tool_block = False
+        invalid = False
         for block in content:
-            if not isinstance(block, dict) or block.get("name") not in durable_tools:
+            if not isinstance(block, dict) or block.get("type") not in {"tool_call", "tool_result"}:
                 continue
-            name = str(block["name"])
-            if block.get("type") == "tool_call":
-                attempted[name] = attempted.get(name, 0) + 1
-            elif block.get("type") == "tool_result":
+            saw_tool_block = True
+            name = block.get("name")
+            call_id = block.get("call_id", block.get("id"))
+            if not isinstance(name, str) or not name:
+                invalid = True
+                continue
+            if name not in durable_tools:
+                # Other tools may occur in the same turn. A missing result for
+                # a requested durable tool is still detected by call ID.
+                continue
+            if not isinstance(call_id, str) or not call_id:
+                invalid = True
+                continue
+            if block["type"] == "tool_call":
+                if call_id in calls:
+                    invalid = True
+                else:
+                    calls[call_id] = name
+            else:
                 state = str(block.get("state") or "").lower().rsplit(".", 1)[-1]
-                states.setdefault(name, []).append(state)
+                if call_id in results:
+                    invalid = True
+                else:
+                    results[call_id] = (name, state)
 
-        if not attempted:
+        if not saw_tool_block:
             return False
-        return all(len(states.get(name, [])) >= count for name, count in attempted.items()) and all(
-            state in _FAILED_TOOL_STATES for name in attempted for state in states.get(name, [])
-        )
+        if invalid or not calls or set(calls) != set(results):
+            return True
+        if any(calls[call_id] != name for call_id, (name, _state) in results.items()):
+            return True
+        return any(state not in _SUCCESSFUL_TOOL_STATES for _name, state in results.values())
 
     def _format_history(self, messages: list[Msg]) -> str:
         """Render the conversation history injected into the prompt.
@@ -674,6 +701,25 @@ class AutoMemoryStep(BaseStep):
         )
         self.logger.info(f"[{self.name}] agent done path={note_path} has_result={bool(result.get('result'))}")
 
+        # Reject incomplete/malformed durable execution before checking the
+        # note on disk: a partial write must not acknowledge the whole turn.
+        durable_tools = self.create_tools if created else self.update_tools
+        is_agentscope = getattr(self.agent_wrapper, "backend", None) == "agentscope"
+        if self._all_requested_writes_failed(result, durable_tools, require_execution=is_agentscope):
+            self.context.response.success = False
+            self.context.response.answer = "Error: durable memory write failed; request remains eligible for retry"
+            self.context.response.metadata.update(
+                {
+                    "date": day,
+                    "path": None if created else note_path,
+                    "created": False if created else created,
+                    "modified": False,
+                    "n_messages": len(messages),
+                },
+            )
+            self.logger.warning(f"[{self.name}] durable tool result unverified; keeping request retryable")
+            return
+
         if created:
             try:
                 note = await self._list_session_note(day, session_id)
@@ -686,18 +732,6 @@ class AutoMemoryStep(BaseStep):
                 self.logger.info(f"[{self.name}] post-create list failed session_id={session_id!r} answer={str(exc)!r}")
                 return
             if note is None:
-                if self._all_requested_writes_failed(result, self.create_tools):
-                    self.context.response.success = False
-                    self.context.response.answer = (
-                        "Error: durable memory write failed; request remains eligible for retry"
-                    )
-                    self.context.response.metadata.update(
-                        {"date": day, "path": None, "created": False, "modified": False, "n_messages": len(messages)},
-                    )
-                    self.logger.warning(
-                        f"[{self.name}] durable create failed session_id={session_id!r}; keeping request retryable",
-                    )
-                    return
                 self.context.response.success = True
                 self.context.response.answer = agent_reply_result_text(result)
                 self.context.response.metadata.update(
@@ -709,22 +743,6 @@ class AutoMemoryStep(BaseStep):
             if image_sources:
                 await self._ensure_session_frontmatter(note_path, session_id, image_sources)
         else:
-            if self._all_requested_writes_failed(result, self.update_tools):
-                self.context.response.success = False
-                self.context.response.answer = "Error: durable memory write failed; request remains eligible for retry"
-                self.context.response.metadata.update(
-                    {
-                        "date": day,
-                        "path": note_path,
-                        "created": created,
-                        "modified": False,
-                        "n_messages": len(messages),
-                    },
-                )
-                self.logger.warning(
-                    f"[{self.name}] durable update failed session_id={session_id!r}; keeping request retryable",
-                )
-                return
             try:
                 await self._ensure_session_frontmatter(note_path, session_id, image_sources)
                 note_path = await self._rename_from_frontmatter_name(note_path, day)

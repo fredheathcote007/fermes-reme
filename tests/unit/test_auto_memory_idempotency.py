@@ -219,13 +219,84 @@ def test_failed_durable_tool_calls_are_not_treated_as_a_noop():
         {
             "last_message": {
                 "content": [
-                    {"type": "tool_call", "name": "daily_write", "input": "{}"},
-                    {"type": "tool_result", "name": "daily_write", "state": "success"},
+                    {"type": "tool_call", "name": "daily_write", "id": "c1", "input": "{}"},
+                    {"type": "tool_result", "name": "daily_write", "id": "c1", "state": "success"},
                 ],
             },
         },
         ["daily_write"],
     )
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        [{"type": "tool_call", "name": "daily_write", "call_id": "c1"}],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "unknown", "state": "error"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "error"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "error"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "error"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "interrupted"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "not-a-state"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "other_tool", "call_id": "c1", "state": "error"},
+        ],
+    ],
+)
+def test_durable_tool_execution_fails_closed_for_invalid_pairing(execution):
+    assert AutoMemoryStep._all_requested_writes_failed({"tool_execution": execution}, ["daily_write"])
+
+
+def test_same_name_tool_calls_pair_by_call_id_and_mixed_results_fail_closed():
+    execution = [
+        {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+        {"type": "tool_call", "name": "daily_write", "call_id": "c2"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c2", "state": "error"},
+    ]
+    assert AutoMemoryStep._all_requested_writes_failed({"tool_execution": execution}, ["daily_write"])
+
+
+def test_current_turn_without_tools_does_not_reuse_previous_turn_execution():
+    assert not AutoMemoryStep._all_requested_writes_failed(
+        {
+            "tool_execution": [],
+            "last_message": {
+                "content": [
+                    {"type": "tool_call", "name": "daily_write", "call_id": "old"},
+                    {"type": "tool_result", "name": "daily_write", "call_id": "old", "state": "error"},
+                ],
+            },
+        },
+        ["daily_write"],
+    )
+
+
+def test_same_name_tool_calls_with_distinct_success_ids_are_not_failures():
+    execution = [
+        {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+        {"type": "tool_call", "name": "daily_write", "call_id": "c2"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c2", "state": "success"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+    ]
+    assert not AutoMemoryStep._all_requested_writes_failed({"tool_execution": execution}, ["daily_write"])
 
 
 @pytest.mark.asyncio
@@ -244,3 +315,63 @@ async def test_rejects_invalid_request_id_before_running_agent(tmp_path, request
     assert not step.context.response.success
     assert "request_id" in step.context.response.answer
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_execution", "expected_success"),
+    [
+        (None, False),
+        ([{"type": "tool_call", "name": "daily_write", "call_id": "c1"}], False),
+        (
+            [
+                {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "wrong", "state": "success"},
+            ],
+            False,
+        ),
+        (
+            [
+                {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+                {"type": "tool_call", "name": "daily_write", "call_id": "c2"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "c2", "state": "error"},
+            ],
+            False,
+        ),
+        ([], True),
+    ],
+)
+async def test_auto_memory_receipt_requires_current_turn_evidence(
+    tmp_path, monkeypatch, tool_execution, expected_success
+):
+    """Real job execution must not acknowledge an unverified AgentScope turn."""
+    from pathlib import Path
+
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(
+        config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False
+    )
+
+    async def simulated_reply(_self, _inputs, **_kwargs):
+        result = {"result": "done", "last_message": {"content": [{"type": "text", "text": "done"}]}}
+        if tool_execution is not None:
+            result["tool_execution"] = tool_execution
+        return result
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", simulated_reply)
+    app = Application(**config)
+    async with app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="current-turn-contract-test",
+            session_id="synthetic-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic calibration record."}],
+            date="2026-10-21",
+        )
+    assert response.success is expected_success
+    receipts = list((tmp_path / "workspace" / "metadata" / "auto_memory_requests").rglob("*.json"))
+    assert bool(receipts) is expected_success

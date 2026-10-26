@@ -325,6 +325,21 @@ def test_stage1_config_is_local_only_and_has_no_unattended_jobs(tmp_path):
     assert not any(job.get("backend") == "cron" for job in config["jobs"].values())
     assert not any("proactive" in name or "dream" in name for name in config["jobs"])
 
+    # AgentScope's FunctionTool is built from this schema. An omitted schema
+    # advertises {} to an OpenAI-compatible model and causes empty tool calls.
+    expected_required = {
+        "daily_write": {"name", "description", "session_id", "content"},
+        "read": {"path"},
+        "write": {"path", "name", "description", "content"},
+        "edit": {"path", "old", "new"},
+        "frontmatter_update": {"path", "metadata"},
+    }
+    for name, fields in expected_required.items():
+        spec = config["jobs"][name]["parameters"]
+        assert spec["type"] == "object"
+        assert set(spec["required"]) == fields
+        assert fields <= set(spec["properties"])
+
 
 def test_save_config_uses_dashboard_layout_and_private_permissions(tmp_path):
     saved = save_config({"mode": "http", "recall_limit": 7}, tmp_path)

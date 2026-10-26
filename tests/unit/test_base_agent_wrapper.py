@@ -265,3 +265,81 @@ async def test_agentscope_structured_output_uses_model_tool_choice_policy(tmp_pa
         "structured_model": {"type": "object"},
     }
     assert result["structured_output"] == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_agentscope_tool_summary_is_current_turn_redacted_and_id_paired(tmp_path, monkeypatch):
+    """Tool evidence excludes prior context and tool arguments/results."""
+
+    class FakeMessage:
+        usage = None
+
+        @staticmethod
+        def model_dump():
+            return {"content": [{"type": "text", "text": "done"}]}
+
+        @staticmethod
+        def get_text_content():
+            return "done"
+
+    class FakeAgent:
+        def __init__(self):
+            self.state = SimpleNamespace(
+                session_id="session-1",
+                context=[
+                    {
+                        "content": [
+                            {"type": "tool_call", "name": "daily_write", "id": "old", "input": "secret"},
+                            {
+                                "type": "tool_result",
+                                "name": "daily_write",
+                                "id": "old",
+                                "state": "error",
+                                "output": "old output",
+                            },
+                        ],
+                    },
+                ],
+            )
+
+        async def observe(self, _inputs):
+            self.state.context.append({"content": [{"type": "text", "text": "current user"}]})
+
+        async def reply(self):
+            self.state.context.extend(
+                [
+                    {
+                        "content": [
+                            {"type": "tool_call", "name": "daily_write", "id": "new", "input": "secret"},
+                            {
+                                "type": "tool_result",
+                                "name": "daily_write",
+                                "id": "new",
+                                "state": "success",
+                                "output": "private output",
+                            },
+                        ],
+                    },
+                    {"content": [{"type": "text", "text": "done"}]},
+                ],
+            )
+            return FakeMessage()
+
+    agent = FakeAgent()
+    wrapper = AsAgentWrapper(app_context=ApplicationContext(workspace_dir=str(tmp_path)), as_llm="")
+
+    async def build_agent(_inputs, **_kwargs):
+        return agent, _inputs
+
+    async def dump_state(_state):
+        return
+
+    monkeypatch.setattr(wrapper, "_build_agent", build_agent)
+    monkeypatch.setattr(wrapper, "_dump_state", dump_state)
+
+    result = await wrapper.reply("hello")
+
+    assert result["tool_execution"] == [
+        {"type": "tool_call", "name": "daily_write", "call_id": "new"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "new", "state": "success"},
+    ]
