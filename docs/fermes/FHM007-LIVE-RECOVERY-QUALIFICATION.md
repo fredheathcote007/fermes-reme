@@ -58,3 +58,11 @@ No production rollback is required because these changes have not been deployed.
 - Commit 10ed292 CI exposed test-fixture drift in the image-memory suite: AgentScope now receives a trusted injected session_id, which older expected-call assertions omitted. Fixed the affected assertions; local image test suite 68/68 PASS.
 - Python quality also found W0212 in the newly added private injection-contract test. The test documents its deliberate protected-access exception. Other pre-commit hooks passed on 10ed292.
 - Require fresh complete GitHub CI on the follow-up commit. Keep PR draft-only and FHM-007 OPEN P1.
+
+
+## 2026-10-27 — Automatic-tagging tool schema qualification
+
+- Captured two separate AgentScope runs in isolated real Qwen 3.5 4B test sandbox 6. The memory-write agent finished in two iterations with one successful `daily_write`; the auto-tagging agent hit the six-iteration ceiling, including a failed `frontmatter_read` because the Stage 1 profile omitted its parameter schema.
+- Stage 1 configuration now includes upstream ReMe-compatible parameter contracts for `frontmatter_read` (required `path`) and `list_tags` (optional pagination/sort fields), keeping `enable_serve: false` and existing local-only restrictions.
+- Re-run in disposable sandbox 7: `frontmatter_read`, `list_tags` and `frontmatter_update` succeeded; daily note includes a `memory_tags` field; real model-generated note and fresh-session BM25 retrieval PASS, journal cleared, exit 0. The tagger **still reached the six-iteration limit** after successful tagging; this is a remaining model finalisation/efficiency issue, not evidence of failed note persistence.
+- Focused host tests **111/111 PASS** after the schema correction. This checkpoint is not deployment/merge approval, and requires independent review and new PR CI before promotion.

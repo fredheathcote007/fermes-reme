@@ -333,12 +333,20 @@ def test_stage1_config_is_local_only_and_has_no_unattended_jobs(tmp_path):
         "write": {"path", "name", "description", "content"},
         "edit": {"path", "old", "new"},
         "frontmatter_update": {"path", "metadata"},
+        "frontmatter_read": {"path"},
     }
     for name, fields in expected_required.items():
         spec = config["jobs"][name]["parameters"]
         assert spec["type"] == "object"
         assert set(spec["required"]) == fields
         assert fields <= set(spec["properties"])
+    optional_tags = config["jobs"]["list_tags"]["parameters"]
+    assert optional_tags["type"] == "object"
+    assert {"page", "order_by", "order", "page_size"} <= set(optional_tags["properties"])
+    assert not optional_tags.get("required")
+    upstream = resolve_app_config(config="default", workspace_dir=str(tmp_path / "upstream"), log_config=False)
+    for tool_name in ("frontmatter_read", "list_tags"):
+        assert config["jobs"][tool_name]["parameters"] == upstream["jobs"][tool_name]["parameters"]
 
 
 def test_save_config_uses_dashboard_layout_and_private_permissions(tmp_path):

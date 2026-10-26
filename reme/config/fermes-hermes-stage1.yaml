@@ -174,6 +174,15 @@ jobs:
   frontmatter_read:
     backend: base
     enable_serve: false
+    description: "Read a file's frontmatter as a dict."
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+          description: "workspace-relative path"
+      required:
+        - path
     steps: [{backend: frontmatter_read_step}]
   frontmatter_update:
     backend: base
@@ -195,6 +204,32 @@ jobs:
   list_tags:
     backend: base
     enable_serve: false
+    description: >-
+      List active tags with file counts. Returns {total_tags, total_pages, page, range, items}; range is the inclusive
+      1-based item range and each item is [tag, file_count]. A page past the end returns empty items and range [0, 0].
+    parameters:
+      type: object
+      properties:
+        page:
+          type: integer
+          minimum: 1
+          default: 1
+          description: "1-based page; values past the end return an empty page"
+        order_by:
+          type: string
+          enum: [tag, file_count]
+          default: tag
+          description: "sort by tag or file count"
+        order:
+          type: string
+          enum: [asc, desc]
+          description: "defaults to asc for tag, desc for file_count"
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+          description: "items per page"
     steps: [{backend: list_tags_step}]
 
 components:
