@@ -27,9 +27,7 @@ from .http_backend import HttpReMeBackend
 
 logger = logging.getLogger(__name__)
 _NON_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
-_SDK_INSTALL_HINT = (
-    'Embedded ReMe mode requires the SDK. Install it with: pip install "reme-ai[core]"'
-)
+_SDK_INSTALL_HINT = 'Embedded ReMe mode requires the SDK. Install it with: pip install "reme-ai[core]"'
 _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
 
@@ -147,9 +145,7 @@ class ReMeMemoryProvider(MemoryProvider):
             self._session_id = str(session_id or "")
             self._profile_id = str(kwargs.get("agent_identity") or "default")
             self._accept_writes = False
-            self._pending_path = (
-                profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
-            )
+            self._pending_path = profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
             self._recall_status = None
             self._unavailable_reason = str(exc)
             logger.warning("ReMe provider configuration is invalid: %s", exc)
@@ -158,15 +154,9 @@ class ReMeMemoryProvider(MemoryProvider):
         with self._backend_lock:
             self._close_backend_locked()
         self._config = config
-        self._pending_path = (
-            profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
-        )
+        self._pending_path = profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
         self._unavailable_reason = ""
-        self._backend_label = (
-            config.endpoint
-            if config.mode == "http"
-            else f"embedded:{config.workspace_dir}"
-        )
+        self._backend_label = config.endpoint if config.mode == "http" else f"embedded:{config.workspace_dir}"
         self._recall_timeout = config.recall_timeout
         self._health_timeout = config.health_timeout
         self._health_retry_seconds = config.health_retry_seconds
@@ -310,11 +300,7 @@ class ReMeMemoryProvider(MemoryProvider):
             config = load_config()
         except ReMeConfigError:
             return []
-        return (
-            [config.workspace_dir]
-            if config.mode == "embedded" and config.workspace_dir
-            else []
-        )
+        return [config.workspace_dir] if config.mode == "embedded" and config.workspace_dir else []
 
     def recall_status(self) -> Optional[RecallStatus]:
         """Describe only the content injected by the latest prefetch call."""
@@ -354,9 +340,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     timeout=remaining,
                 )
             except ReMeBackendError as exc:
-                self._next_recall_attempt = (
-                    time.monotonic() + self._health_retry_seconds
-                )
+                self._next_recall_attempt = time.monotonic() + self._health_retry_seconds
                 logger.warning(
                     "ReMe retrieval failed at %s: %s",
                     self._backend_label,
@@ -384,11 +368,7 @@ class ReMeMemoryProvider(MemoryProvider):
         counts = metadata.get("counts")
         if isinstance(counts, dict):
             returned = counts.get("returned")
-            if (
-                isinstance(returned, int)
-                and not isinstance(returned, bool)
-                and returned >= 0
-            ):
+            if isinstance(returned, int) and not isinstance(returned, bool) and returned >= 0:
                 return returned
         results = metadata.get("results")
         return len(results) if isinstance(results, list) else 0
@@ -582,7 +562,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 with os.fdopen(fd, "a", encoding="utf-8") as handle:
                     fd = -1
                     handle.write(
-                        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
                     )
                     handle.flush()
                     os.fsync(handle.fileno())
@@ -605,7 +585,9 @@ class ReMeMemoryProvider(MemoryProvider):
                 lines = path.read_text(encoding="utf-8").splitlines()
             except OSError as exc:
                 logger.error(
-                    "ReMe could not read its durable write queue %s: %s", path, exc
+                    "ReMe could not read its durable write queue %s: %s",
+                    path,
+                    exc,
                 )
                 return []
         for line_number, line in enumerate(lines, start=1):
@@ -654,7 +636,8 @@ class ReMeMemoryProvider(MemoryProvider):
                 if not removed:
                     return True
                 fd, temp_name = tempfile.mkstemp(
-                    prefix=f".{path.name}.", dir=path.parent
+                    prefix=f".{path.name}.",
+                    dir=path.parent,
                 )
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -669,7 +652,9 @@ class ReMeMemoryProvider(MemoryProvider):
                         os.unlink(temp_name)
             except OSError as exc:
                 logger.error(
-                    "ReMe could not acknowledge durable write %s: %s", record_id, exc
+                    "ReMe could not acknowledge durable write %s: %s",
+                    record_id,
+                    exc,
                 )
                 return False
         return True
@@ -739,17 +724,16 @@ class ReMeMemoryProvider(MemoryProvider):
                     timeout=self._request_timeout,
                     request_id=request_id,
                 )
-                if (
-                    not isinstance(response, dict)
-                    or response.get("success") is not True
-                ):
+                if not isinstance(response, dict) or response.get("success") is not True:
                     raise ReMeBackendError(
                         str(
-                            response.get("answer")
-                            if isinstance(response, dict)
-                            else "auto_memory returned a non-object response"
+                            (
+                                response.get("answer")
+                                if isinstance(response, dict)
+                                else "auto_memory returned a non-object response"
+                            ),
                         )
-                        or "auto_memory did not report success"
+                        or "auto_memory did not report success",
                     )
                 return True
             except ReMeBackendError as exc:
@@ -811,7 +795,8 @@ class ReMeMemoryProvider(MemoryProvider):
                         backend_config = replace(
                             backend_config,
                             request_timeout=min(
-                                backend_config.request_timeout, remaining
+                                backend_config.request_timeout,
+                                remaining,
                             ),
                         )
                     self._backend = _backend_for(backend_config)
