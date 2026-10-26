@@ -8,6 +8,8 @@ on:
       - "integrations/hermes_agent/**"
       - "reme/config/fermes-hermes-stage1.yaml"
       - "tests/unit/test_hermes_agent_integration.py"
+      - "tests/unit/test_auto_memory_idempotency.py"
+      - "tests/unit/test_fermes_capture_integration.py"
       - "docs/fermes/**"
       - ".github/workflows/fermes-reme-ci.yml"
   workflow_dispatch:
@@ -57,4 +59,4 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}
         run: |
           python -m compileall -q integrations/hermes_agent
-          python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_hermes_agent_integration.py
+          python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_hermes_agent_integration.py tests/unit/test_auto_memory_idempotency.py tests/unit/test_fermes_capture_integration.py
