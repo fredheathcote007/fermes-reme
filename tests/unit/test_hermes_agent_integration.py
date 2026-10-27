@@ -13,6 +13,7 @@ import http.server
 import importlib
 import json
 import os
+import stat
 import threading
 import time
 
@@ -56,6 +57,7 @@ CLIENT_MODULE = importlib.import_module("hermes_agent.client")
 
 ReMeMemoryProvider = PLUGIN_MODULE.ReMeMemoryProvider
 ProfileWriterLock = PLUGIN_MODULE._ProfileWriterLock
+WorkspaceOwnerMarker = PLUGIN_MODULE._WorkspaceOwnerMarker
 ReMeBackendError = BACKEND_MODULE.ReMeBackendError
 ReMeConfig = CONFIG_MODULE.ReMeConfig
 ReMeConfigError = CONFIG_MODULE.ReMeConfigError
@@ -135,6 +137,42 @@ def test_config_defaults_to_http(tmp_path):
 
     assert config.mode == "http"
     assert config.endpoint == "http://127.0.0.1:2333"
+
+
+def test_embedded_config_defaults_to_stage1_and_rejects_default(tmp_path):
+    config = parse_config(
+        {"mode": "embedded", "workspace_dir": str(tmp_path / "workspace")},
+        hermes_home=tmp_path,
+    )
+
+    assert config.reme_config == "fermes-hermes-stage1"
+    with pytest.raises(ReMeConfigError, match="fermes-hermes-stage1"):
+        parse_config(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(tmp_path / "other"),
+                "reme_config": "default",
+            },
+            hermes_home=tmp_path,
+        )
+
+
+def test_embedded_workspace_rejects_traversal_and_symlink(tmp_path):
+    with pytest.raises(ReMeConfigError, match="traversal"):
+        parse_config(
+            {"mode": "embedded", "workspace_dir": str(tmp_path / "a" / ".." / "b")},
+            hermes_home=tmp_path,
+        )
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(ReMeConfigError, match="symlinks"):
+        parse_config(
+            {"mode": "embedded", "workspace_dir": str(link)},
+            hermes_home=tmp_path,
+        )
 
 
 def test_provider_schema_exposes_mode_specific_and_advanced_fields():
@@ -545,6 +583,167 @@ def test_profile_writer_lock_rejects_other_process(tmp_path):
         os.close(release_write)
         _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
+
+
+def test_workspace_owner_marker_is_private_durable_and_non_rewriting(tmp_path):
+    workspace = tmp_path / "workspace"
+    profile = tmp_path / "profile"
+    marker = WorkspaceOwnerMarker(workspace, profile)
+    marker.acquire()
+    marker.release()
+
+    owner_path = workspace / PLUGIN_MODULE._WORKSPACE_OWNER_FILENAME
+    before = owner_path.read_bytes()
+    before_stat = owner_path.stat()
+    assert stat.S_IMODE(before_stat.st_mode) == 0o600
+
+    time.sleep(0.01)
+    restarted = WorkspaceOwnerMarker(workspace, profile)
+    restarted.acquire()
+    assert owner_path.read_bytes() == before
+    assert owner_path.stat().st_mtime_ns == before_stat.st_mtime_ns
+    restarted.release()
+
+
+def test_workspace_owner_marker_rejects_mixed_owner_and_symlink(tmp_path):
+    workspace = tmp_path / "workspace"
+    first = WorkspaceOwnerMarker(workspace, tmp_path / "profile-one")
+    first.acquire()
+
+    with pytest.raises(OSError, match="another Hermes profile"):
+        WorkspaceOwnerMarker(workspace, tmp_path / "profile-two").acquire()
+
+    marker = workspace / PLUGIN_MODULE._WORKSPACE_OWNER_FILENAME
+    marker.unlink()
+    target = tmp_path / "outside"
+    target.write_text("marker-secret", encoding="utf-8")
+    marker.symlink_to(target)
+    with pytest.raises(OSError, match="regular file|created"):
+        WorkspaceOwnerMarker(workspace, tmp_path / "profile-one").acquire()
+    assert target.read_text(encoding="utf-8") == "marker-secret"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork for crash persistence probe")
+def test_workspace_owner_marker_survives_crash_and_blocks_other_profile(tmp_path):
+    workspace = tmp_path / "workspace"
+    ready_read, ready_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child result is reported by the parent
+        try:
+            os.close(ready_read)
+            WorkspaceOwnerMarker(workspace, tmp_path / "profile-one").acquire()
+            os.write(ready_write, b"1")
+            os._exit(0)
+        except Exception:
+            os.write(ready_write, b"0")
+            os._exit(1)
+
+    os.close(ready_write)
+    try:
+        assert os.read(ready_read, 1) == b"1"
+    finally:
+        os.close(ready_read)
+        _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+    WorkspaceOwnerMarker(workspace, tmp_path / "profile-one").acquire()
+    with pytest.raises(OSError, match="another Hermes profile"):
+        WorkspaceOwnerMarker(workspace, tmp_path / "profile-two").acquire()
+
+
+def test_embedded_provider_rejects_reused_workspace_across_profiles(monkeypatch, tmp_path, caplog):
+    workspace = tmp_path / "shared-workspace"
+    stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
+    backend = _FakeBackend()
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backend)
+
+    owner = ReMeMemoryProvider()
+    blocked = ReMeMemoryProvider()
+    owner.initialize("owner", hermes_home=tmp_path / "profile-one", agent_identity="one")
+    caplog.clear()
+    blocked.initialize("blocked", hermes_home=tmp_path / "profile-two", agent_identity="two")
+
+    assert owner._backend is not None
+    assert blocked._backend is None
+    assert blocked._accept_writes is False
+    assert blocked.prefetch("must not cross profiles") == ""
+    assert "marker-secret" not in caplog.text
+    owner.shutdown()
+    blocked.shutdown()
+
+
+def test_workspace_owner_failure_does_not_log_marker_contents(monkeypatch, tmp_path, caplog):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / PLUGIN_MODULE._WORKSPACE_OWNER_FILENAME).write_text(
+        json.dumps(
+            {
+                "format": 1,
+                "owner": "marker-secret-not-for-logs",
+                "workspace": str(workspace),
+            },
+        ),
+        encoding="utf-8",
+    )
+    stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: _FakeBackend())
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path / "profile")
+
+    assert provider._backend is None
+    assert "marker-secret-not-for-logs" not in caplog.text
+    provider.shutdown()
+
+
+def test_embedded_provider_same_profile_restart_reuses_owner_marker(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
+    backends = [_FakeBackend(), _FakeBackend()]
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backends.pop(0))
+
+    first = ReMeMemoryProvider()
+    first.initialize("first", hermes_home=tmp_path / "profile", agent_identity="profile")
+    first.shutdown()
+    second = ReMeMemoryProvider()
+    second.initialize("second", hermes_home=tmp_path / "profile", agent_identity="profile")
+
+    assert second._backend is not None
+    second.shutdown()
+
+
+def test_custom_embedded_config_requires_explicit_warning_opt_in(monkeypatch, tmp_path, caplog):
+    custom = tmp_path / "custom.yaml"
+    custom.write_text("service: {backend: http}\n", encoding="utf-8")
+    with pytest.raises(ReMeConfigError, match="allow_custom_config"):
+        parse_config(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(tmp_path / "workspace"),
+                "reme_config": str(custom),
+            },
+            hermes_home=tmp_path,
+        )
+
+    config = ReMeConfig(
+        mode="embedded",
+        workspace_dir=str(tmp_path / "workspace"),
+        reme_config=str(custom),
+        allow_custom_config=True,
+    )
+    backend = _FakeBackend()
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backend)
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path / "profile")
+    assert "custom ReMe configuration" in caplog.text
+    provider.shutdown()
 
 
 def test_same_profile_provider_fails_closed_when_writer_is_owned(monkeypatch, tmp_path):
@@ -1143,3 +1342,14 @@ def test_provider_registers_with_hermes_memory_provider_contract():
     assert len(registered) == 1
     assert isinstance(registered[0], ReMeMemoryProvider)
     assert registered[0].name == "reme"
+
+
+def test_existing_unowned_workspace_cannot_be_silently_claimed(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    legacy_note = workspace / "daily-note.md"
+    legacy_note.write_text("Pre-existing memory from unknown profile", encoding="utf-8")
+    with pytest.raises(OSError, match="explicit migration required"):
+        WorkspaceOwnerMarker(workspace, tmp_path / "new-profile").acquire()
+    assert legacy_note.read_text(encoding="utf-8") == "Pre-existing memory from unknown profile"
+    assert not (workspace / PLUGIN_MODULE._WORKSPACE_OWNER_FILENAME).exists()

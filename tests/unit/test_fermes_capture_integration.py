@@ -16,7 +16,7 @@ import yaml
 from agentscope.message import ToolCallBlock
 from agentscope.model import ChatResponse
 
-from .test_hermes_agent_integration import ReMeMemoryProvider, scoped_session_id
+from .test_hermes_agent_integration import ReMeMemoryProvider, WorkspaceOwnerMarker, scoped_session_id
 
 _MODEL = "offline-fhm007-synthetic"
 _MARKER = "copper-orbit-fhm007"
@@ -133,6 +133,7 @@ def test_hermes_provider_captures_with_agentscope_and_recalls_after_restart(tmp_
                     "mode": "embedded",
                     "workspace_dir": str(workspace),
                     "reme_config": str(reme_config),
+                    "allow_custom_config": True,
                     "request_timeout": 5,
                     "recall_timeout": 5,
                     "health_timeout": 2,
@@ -211,6 +212,7 @@ def test_failed_agent_tool_calls_keep_hermes_write_retryable(tmp_path, monkeypat
                 "mode": "embedded",
                 "workspace_dir": str(workspace),
                 "reme_config": str(reme_config),
+                "allow_custom_config": True,
                 "request_timeout": 5,
                 "recall_timeout": 5,
                 "health_timeout": 2,
@@ -272,6 +274,7 @@ def test_hostile_recalled_memory_is_passive_fenced_data_with_provenance(tmp_path
                 "mode": "embedded",
                 "workspace_dir": str(workspace),
                 "reme_config": str(reme_config),
+                "allow_custom_config": True,
                 "request_timeout": 20,
                 "recall_timeout": 10,
                 "health_timeout": 5,
@@ -283,6 +286,9 @@ def test_hostile_recalled_memory_is_passive_fenced_data_with_provenance(tmp_path
         encoding="utf-8",
     )
 
+    # This fixture represents memory created by the same profile before recall,
+    # not an attempt to adopt pre-existing data from an unknown profile.
+    WorkspaceOwnerMarker(workspace, hermes_home).acquire()
     note = workspace / "daily" / day / "hostile-source.md"
     note.parent.mkdir(parents=True)
     note.write_text(

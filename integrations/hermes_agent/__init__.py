@@ -10,6 +10,7 @@ import logging
 import os
 import queue
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -31,7 +32,13 @@ except ImportError:  # pragma: no cover - exercised on POSIX
 from agent.memory_provider import MemoryProvider, RecallStatus
 
 from .backend import ReMeBackend, ReMeBackendError, spawn_profile_thread
-from .config import ReMeConfig, ReMeConfigError, load_config, save_config
+from .config import (
+    ReMeConfig,
+    ReMeConfigError,
+    _validate_embedded_policy,
+    load_config,
+    save_config,
+)
 from .embedded_backend import EmbeddedReMeBackend
 from .http_backend import HttpReMeBackend
 
@@ -41,6 +48,7 @@ _SDK_INSTALL_HINT = 'Embedded ReMe mode requires the SDK. Install it with: pip i
 _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
 _PROFILE_LOCK_FILENAME = ".writer.lock"
+_WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
 _HELD_PROFILE_LOCKS: set[str] = set()
 _HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
@@ -113,6 +121,128 @@ class _ProfileWriterLock:
                 _HELD_PROFILE_LOCKS.discard(self._key)
 
 
+class _WorkspaceOwnerMarker:
+    """Durably bind an embedded workspace to one canonical Hermes profile.
+
+    The marker is intentionally not removed on shutdown.  It records the
+    workspace owner across crashes and restarts; the existing profile writer
+    lock still handles concurrent processes of the same profile.
+    """
+
+    def __init__(self, workspace: str | Path, profile_home: str | Path):
+        self.workspace = Path(workspace)
+        self.profile_home = str(Path(profile_home).expanduser().resolve(strict=False))
+        self.path = self.workspace / _WORKSPACE_OWNER_FILENAME
+        self._owned = False
+
+    @staticmethod
+    def _reject_symlink_components(path: Path) -> None:
+        if not path.is_absolute() or ".." in path.parts:
+            raise OSError("unsafe workspace path")
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                if current.is_symlink():
+                    raise OSError("unsafe workspace path")
+            except OSError as exc:
+                if str(exc) == "unsafe workspace path":
+                    raise
+                raise OSError("workspace path could not be inspected") from exc
+
+    def _prepare_workspace(self) -> None:
+        self._reject_symlink_components(self.workspace)
+        try:
+            self.workspace.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise OSError("workspace is not writable") from exc
+        self._reject_symlink_components(self.workspace)
+        try:
+            workspace_stat = self.workspace.stat()
+        except OSError as exc:
+            raise OSError("workspace could not be inspected") from exc
+        if not stat.S_ISDIR(workspace_stat.st_mode) or not self.workspace.name:
+            raise OSError("workspace must be a named directory")
+
+    def _read_existing(self) -> None:
+        try:
+            marker_stat = self.path.lstat()
+        except OSError as exc:
+            raise OSError("workspace owner marker could not be inspected") from exc
+        if stat.S_ISLNK(marker_stat.st_mode) or not stat.S_ISREG(marker_stat.st_mode):
+            raise OSError("workspace owner marker is not a regular file")
+        if marker_stat.st_mode & 0o077 or not marker_stat.st_mode & 0o400:
+            raise OSError("workspace owner marker is not private")
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.path, flags)
+        except OSError as exc:
+            raise OSError("workspace owner marker could not be opened") from exc
+        try:
+            current_stat = os.fstat(fd)
+            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISREG(current_stat.st_mode):
+                raise OSError("workspace owner marker is not a regular file")
+            raw = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        if len(raw) > 4096:
+            raise OSError("workspace owner marker is invalid")
+        try:
+            marker = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OSError("workspace owner marker is invalid") from exc
+        if not isinstance(marker, dict):
+            raise OSError("workspace owner marker is invalid")
+        if (
+            marker.get("format") != 1
+            or marker.get("owner") != self.profile_home
+            or marker.get("workspace") != str(self.workspace)
+        ):
+            raise OSError("workspace belongs to another Hermes profile")
+
+    def acquire(self) -> None:
+        """Create the owner marker atomically or validate its existing owner."""
+        self._prepare_workspace()
+        marker = {
+            "format": 1,
+            "owner": self.profile_home,
+            "workspace": str(self.workspace),
+        }
+        encoded = (json.dumps(marker, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
+        # Do not silently claim a workspace containing another identity's
+        # historical data. Existing workspaces require an explicit migration.
+        if not self.path.exists() and any(self.workspace.iterdir()):
+            raise OSError("existing workspace is unowned; explicit migration required")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except FileExistsError:
+            self._read_existing()
+            self._owned = True
+            return
+        except OSError as exc:
+            raise OSError("workspace owner marker could not be created") from exc
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, encoded)
+            os.fsync(fd)
+        except OSError as exc:
+            raise OSError("workspace owner marker could not be made durable") from exc
+        finally:
+            os.close(fd)
+        _fsync_directory(self.workspace)
+        self._owned = True
+
+    def release(self) -> None:
+        """Release this provider's in-memory reference without deleting ownership."""
+        self._owned = False
+
+
 def _slug(value: str, fallback: str, *, limit: int) -> str:
     value = _NON_FILENAME_CHARS.sub("-", str(value or "").strip()).strip("-._")
     return (value or fallback)[:limit]
@@ -166,6 +296,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._retry_timers: set[threading.Timer] = set()
         self._pending_path: Path | None = None
         self._profile_lock: _ProfileWriterLock | None = None
+        self._workspace_owner: _WorkspaceOwnerMarker | None = None
         self._profile_lock_required = False
         self._backend_lock = threading.RLock()
         self._shutdown_started = False
@@ -216,6 +347,7 @@ class ReMeMemoryProvider(MemoryProvider):
             with self._backend_lock:
                 self._close_backend_locked()
             self._release_profile_lock()
+            self._release_workspace_owner()
             self._config = None
             self._backend_label = "invalid configuration"
             self._session_id = str(session_id or "")
@@ -231,6 +363,30 @@ class ReMeMemoryProvider(MemoryProvider):
         with self._backend_lock:
             self._close_backend_locked()
         self._release_profile_lock()
+        self._release_workspace_owner()
+        try:
+            if config.mode == "embedded":
+                _validate_embedded_policy(
+                    config.reme_config,
+                    allow_custom=config.allow_custom_config,
+                )
+                if config.allow_custom_config:
+                    logger.warning(
+                        "Embedded Hermes custom ReMe configuration is explicitly enabled; "
+                        "local-only Stage 1 safeguards are bypassed",
+                    )
+        except ReMeConfigError as exc:
+            self._config = None
+            self._backend_label = "invalid embedded configuration"
+            self._session_id = str(session_id or "")
+            self._profile_id = str(kwargs.get("agent_identity") or "default")
+            self._write_enabled = False
+            self._accept_writes = False
+            self._backend_available = False
+            self._recall_status = None
+            self._unavailable_reason = str(exc)
+            logger.warning("ReMe embedded configuration is invalid: %s", exc)
+            return
         self._config = config
         self._pending_path = profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
         self._profile_lock_required = True
@@ -250,6 +406,24 @@ class ReMeMemoryProvider(MemoryProvider):
             logger.warning("ReMe provider is unavailable for %s: %s", profile_home, self._unavailable_reason)
             return
         self._profile_lock = profile_lock
+        if config.mode == "embedded":
+            try:
+                workspace_owner = _WorkspaceOwnerMarker(config.workspace_dir, profile_home)
+                workspace_owner.acquire()
+            except OSError as exc:
+                self._release_profile_lock()
+                self._config = None
+                self._backend_label = "embedded workspace unavailable"
+                self._session_id = str(session_id or "")
+                self._profile_id = str(kwargs.get("agent_identity") or "default")
+                self._write_enabled = False
+                self._accept_writes = False
+                self._backend_available = False
+                self._recall_status = None
+                self._unavailable_reason = "embedded workspace ownership is unavailable"
+                logger.warning("ReMe embedded workspace ownership is unavailable: %s", exc)
+                return
+            self._workspace_owner = workspace_owner
         self._unavailable_reason = ""
         self._backend_label = config.endpoint if config.mode == "http" else f"embedded:{config.workspace_dir}"
         self._recall_timeout = config.recall_timeout
@@ -548,6 +722,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 )
                 self._deferred_backend_close = False
                 self._release_profile_lock()
+                self._release_workspace_owner()
             finally:
                 self._backend_lock.release()
         else:
@@ -561,6 +736,11 @@ class ReMeMemoryProvider(MemoryProvider):
         profile_lock, self._profile_lock = self._profile_lock, None
         if profile_lock is not None:
             profile_lock.release()
+
+    def _release_workspace_owner(self) -> None:
+        owner, self._workspace_owner = self._workspace_owner, None
+        if owner is not None:
+            owner.release()
 
     def _atexit_shutdown(self) -> None:
         try:
@@ -608,6 +788,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._session_id = str(session_id or "")
         self._profile_id = str(profile_id or "default")
         self._pending_path = None
+        self._release_workspace_owner()
         self._accept_writes = False
         self._backend_available = False
         self._recall_status = None
@@ -944,6 +1125,7 @@ class ReMeMemoryProvider(MemoryProvider):
             self._close_backend_locked()
             self._deferred_backend_close = False
             self._release_profile_lock()
+            self._release_workspace_owner()
 
     def _close_backend_locked(self, *, timeout: float | None = None) -> None:
         backend, self._backend = self._backend, None
