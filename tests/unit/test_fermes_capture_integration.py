@@ -227,7 +227,7 @@ def test_sigkill_after_note_before_receipt_replays_same_request_id(tmp_path, mon
             pytest.fail("required Hermes source unavailable: SIGKILL crash tests must not skip in Stage 1 CI")
         pytest.skip(
             "optional dependency: real Hermes agent.memory_provider source is required for SIGKILL crash coverage; "
-            "dedicated Fermes Stage 1 CI supplies and preflights it"
+            "dedicated Fermes Stage 1 CI supplies and preflights it",
         )
     from agentscope.model import OpenAIChatModel
 
