@@ -104,6 +104,22 @@ def _write_test_config(tmp_path: Path) -> Path:
     return path
 
 
+def _has_real_hermes_memory_provider_source() -> bool:
+    """Return whether the external Hermes provider has a real source file."""
+    for entry in sys.path:
+        root = Path.cwd() if not entry else Path(entry)
+        for source_path in (
+            root / "agent" / "memory_provider.py",
+            root / "agent" / "memory_provider" / "__init__.py",
+        ):
+            try:
+                if source_path.is_file() and source_path.read_text(encoding="utf-8").strip():
+                    return True
+            except (OSError, UnicodeError):
+                continue
+    return False
+
+
 def _crash_window_child() -> str:
     """Return the bounded child program used to kill the process at the receipt boundary."""
     return r"""
@@ -206,6 +222,13 @@ raise SystemExit("crash-window failpoint was not reached")
 )
 def test_sigkill_after_note_before_receipt_replays_same_request_id(tmp_path, monkeypatch, failpoint):
     """Bounded SIGKILL before/after note commit never duplicates the semantic marker."""
+    if not _has_real_hermes_memory_provider_source():
+        if os.environ.get("FHM007_REQUIRE_REAL_HERMES") == "1":
+            pytest.fail("required Hermes source unavailable: SIGKILL crash tests must not skip in Stage 1 CI")
+        pytest.skip(
+            "optional dependency: real Hermes agent.memory_provider source is required for SIGKILL crash coverage; "
+            "dedicated Fermes Stage 1 CI supplies and preflights it"
+        )
     from agentscope.model import OpenAIChatModel
 
     day = datetime.now(UTC).date().isoformat()
@@ -248,7 +271,7 @@ def test_sigkill_after_note_before_receipt_replays_same_request_id(tmp_path, mon
             "FHM_FAILPOINT": failpoint,
         },
     )
-    child = subprocess.Popen(
+    with subprocess.Popen(
         [sys.executable, "-c", _crash_window_child()],
         cwd=Path.cwd(),
         env=env,
@@ -256,84 +279,88 @@ def test_sigkill_after_note_before_receipt_replays_same_request_id(tmp_path, mon
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-    )
-    try:
-        child.wait(timeout=55)
-    except subprocess.TimeoutExpired:
-        child.kill()
+    ) as child:
+        try:
+            child.wait(timeout=55)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            stdout, stderr = child.communicate(timeout=3)
+            pytest.fail(f"crash child exceeded bounded timeout\nstdout={stdout[-2000:]}\nstderr={stderr[-4000:]}")
         stdout, stderr = child.communicate(timeout=3)
-        pytest.fail(f"crash child exceeded bounded timeout\nstdout={stdout[-2000:]}\nstderr={stderr[-4000:]}")
-    stdout, stderr = child.communicate(timeout=3)
 
-    assert child.returncode == -signal.SIGKILL, (
-        f"child did not reproduce SIGKILL boundary: returncode={child.returncode}\n"
-        f"stdout={stdout[-2000:]}\nstderr={stderr[-4000:]}"
-    )
-    pending = hermes_home / "reme" / "pending-writes.jsonl"
-    assert pending.is_file() and pending.read_text(encoding="utf-8").strip()
-    pending_record = json.loads(pending.read_text(encoding="utf-8").splitlines()[0])
-    request_id = pending_record["id"]
-    receipt_dir = workspace / "metadata" / "auto_memory_requests"
-    if failpoint == "after_receipt_before_ack":
-        assert list(receipt_dir.rglob("*.json"))
-    else:
-        assert not list(receipt_dir.rglob("*.json"))
-    note = workspace / "daily" / day / "crash-window-fact.md"
-    if failpoint == "before_note":
-        assert not note.exists()
-    else:
-        assert note.is_file() and note.read_text(encoding="utf-8").count(_MARKER) == 1
-
-    # Replay the durable Hermes record in fresh provider/Application state.
-    # Only inference remains synthetic; file IO, provenance, receipt, and
-    # journal replay are real.
-    replay_model = _DeterministicModel(day, note_name="crash-window-fact")
-
-    async def replay_call(_self, model_name, messages, tools=None, tool_choice=None, **kwargs):
-        del tool_choice, kwargs
+        assert child.returncode == -signal.SIGKILL, (
+            f"child did not reproduce SIGKILL boundary: returncode={child.returncode}\n"
+            f"stdout={stdout[-2000:]}\nstderr={stderr[-4000:]}"
+        )
+        pending = hermes_home / "reme" / "pending-writes.jsonl"
+        assert pending.is_file() and pending.read_text(encoding="utf-8").strip()
+        pending_record = json.loads(pending.read_text(encoding="utf-8").splitlines()[0])
+        request_id = pending_record["id"]
+        receipt_dir = workspace / "metadata" / "auto_memory_requests"
+        if failpoint == "after_receipt_before_ack":
+            assert list(receipt_dir.rglob("*.json"))
+        else:
+            assert not list(receipt_dir.rglob("*.json"))
+        note = workspace / "daily" / day / "crash-window-fact.md"
         if failpoint == "before_note":
-            return await replay_model.call(model_name, messages, tools=tools)
-        names = replay_model._tool_names(tools)
-        replay_model.requests.append({"model": model_name, "tools": names})
-        return ChatResponse(content=[], is_last=True)
+            assert not note.exists()
+        else:
+            assert note.is_file() and note.read_text(encoding="utf-8").count(_MARKER) == 1
 
-    monkeypatch.setattr(OpenAIChatModel, "_call_api", replay_call)
-    restarted = ReMeMemoryProvider()
-    try:
-        restarted.initialize("restarted-session", hermes_home=hermes_home, agent_identity="offline-profile")
-        assert restarted._backend_available, restarted.unavailable_reason()
-        deadline = time.monotonic() + 55
-        while time.monotonic() < deadline:
-            if pending.is_file() and pending.read_text(encoding="utf-8") == "" and list(receipt_dir.rglob("*.json")):
-                break
-            time.sleep(0.02)
-        assert pending.read_text(encoding="utf-8") == ""
-    finally:
-        restarted.shutdown()
+        # Replay the durable Hermes record in fresh provider/Application state.
+        # Only inference remains synthetic; file IO, provenance, receipt, and
+        # journal replay are real.
+        replay_model = _DeterministicModel(day, note_name="crash-window-fact")
 
-    notes = []
-    for candidate in (workspace / "daily").glob("**/*.md"):
-        saved = frontmatter.loads(candidate.read_text(encoding="utf-8"))
-        if saved.metadata.get("session_id") == scoped_session_id("offline-profile", "crash-window-session"):
-            notes.append(candidate)
-    assert len(notes) == 1
-    assert notes[0].name == "crash-window-fact.md"
-    assert notes[0].read_text(encoding="utf-8").count(_MARKER) == 1
-    scoped = scoped_session_id("offline-profile", "crash-window-session")
-    transcript = workspace / "session" / "dialog" / f"{scoped}.jsonl"
-    assert len([line for line in transcript.read_text(encoding="utf-8").splitlines() if line.strip()]) == 2
+        async def replay_call(_self, model_name, messages, tools=None, tool_choice=None, **kwargs):
+            del tool_choice, kwargs
+            if failpoint == "before_note":
+                return await replay_model.call(model_name, messages, tools=tools)
+            names = replay_model._tool_names(tools)
+            replay_model.requests.append({"model": model_name, "tools": names})
+            return ChatResponse(content=[], is_last=True)
 
-    receipts = list(receipt_dir.rglob("*.json"))
-    assert len(receipts) == 1
-    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
-    assert receipts[0].name == f"{hashlib.sha256(request_id.encode()).hexdigest()}.json"
-    assert receipt["fingerprint"]
-    assert receipt["response"]["success"] is True
-    assert receipt["response"]["metadata"]["path"] == f"daily/{day}/crash-window-fact.md"
-    if failpoint == "before_note":
-        assert replay_model.requests
-    else:
-        assert replay_model.requests == []
+        monkeypatch.setattr(OpenAIChatModel, "_call_api", replay_call)
+        restarted = ReMeMemoryProvider()
+        try:
+            restarted.initialize("restarted-session", hermes_home=hermes_home, agent_identity="offline-profile")
+            assert restarted._backend_available, restarted.unavailable_reason()
+            deadline = time.monotonic() + 55
+            while time.monotonic() < deadline:
+                if (
+                    pending.is_file()
+                    and pending.read_text(encoding="utf-8") == ""
+                    and list(receipt_dir.rglob("*.json"))
+                ):
+                    break
+                time.sleep(0.02)
+            assert pending.read_text(encoding="utf-8") == ""
+        finally:
+            restarted.shutdown()
+
+        notes = []
+        for candidate in (workspace / "daily").glob("**/*.md"):
+            saved = frontmatter.loads(candidate.read_text(encoding="utf-8"))
+            if saved.metadata.get("session_id") == scoped_session_id("offline-profile", "crash-window-session"):
+                notes.append(candidate)
+        assert len(notes) == 1
+        assert notes[0].name == "crash-window-fact.md"
+        assert notes[0].read_text(encoding="utf-8").count(_MARKER) == 1
+        scoped = scoped_session_id("offline-profile", "crash-window-session")
+        transcript = workspace / "session" / "dialog" / f"{scoped}.jsonl"
+        assert len([line for line in transcript.read_text(encoding="utf-8").splitlines() if line.strip()]) == 2
+
+        receipts = list(receipt_dir.rglob("*.json"))
+        assert len(receipts) == 1
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        assert receipts[0].name == f"{hashlib.sha256(request_id.encode()).hexdigest()}.json"
+        assert receipt["fingerprint"]
+        assert receipt["response"]["success"] is True
+        assert receipt["response"]["metadata"]["path"] == f"daily/{day}/crash-window-fact.md"
+        if failpoint == "before_note":
+            assert replay_model.requests
+        else:
+            assert not replay_model.requests
 
 
 def test_hermes_provider_captures_with_agentscope_and_recalls_after_restart(tmp_path, monkeypatch):

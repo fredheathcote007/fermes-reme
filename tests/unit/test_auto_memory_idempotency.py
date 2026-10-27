@@ -221,7 +221,7 @@ async def test_protected_auto_memory_rejects_missing_identity_before_legacy_mode
 
     assert not step.context.response.success
     assert diagnostic in step.context.response.answer
-    assert calls == []
+    assert not calls
     assert not list(tmp_path.rglob("*.md"))
     assert not list(tmp_path.rglob("*.json"))
 
@@ -229,9 +229,6 @@ async def test_protected_auto_memory_rejects_missing_identity_before_legacy_mode
 @pytest.mark.asyncio
 async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_path, monkeypatch):
     """Protected replay is receipt-free only with matching marker/body evidence."""
-    from pathlib import Path
-
-    from reme.application import Application
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -593,8 +590,6 @@ async def test_auto_memory_receipt_requires_current_turn_evidence(
     memory_hint,
 ):
     """Real job execution must not acknowledge an unverified AgentScope turn."""
-    from pathlib import Path
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -626,8 +621,6 @@ async def test_auto_memory_receipt_requires_current_turn_evidence(
 @pytest.mark.asyncio
 async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, monkeypatch):
     """A forged note after an apparently successful tool result remains retryable."""
-    from pathlib import Path
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -676,10 +669,6 @@ async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, mon
 @pytest.mark.asyncio
 async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeypatch):
     """A cached success cannot acknowledge a deleted or altered durable note."""
-    from pathlib import Path
-
-    import frontmatter
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -735,8 +724,6 @@ async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeyp
 @pytest.mark.asyncio
 async def test_auto_memory_repair_cannot_claim_foreign_session_note(tmp_path, monkeypatch):
     """Internal frontmatter repair must honour the same ownership boundary as tools."""
-    from pathlib import Path
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 

@@ -16,6 +16,7 @@ on:
       - "tests/unit/test_hermes_agent_integration.py"
       - "tests/unit/test_auto_memory_idempotency.py"
       - "tests/unit/test_fermes_capture_integration.py"
+      - "tests/unit/test_atomic_file_write.py"
       - "tests/unit/test_as_llm_lazy.py"
       - "tests/unit/test_base_agent_wrapper.py"
       - "tests/unit/test_injected_job_kwargs.py"
@@ -62,11 +63,39 @@ jobs:
           enable-cache: true
       - name: Install ReMe and focused test dependencies
         run: uv pip install --system -e ".[core]" "agentscope[model-ollama]==2.0.10" pytest pytest-asyncio ruamel.yaml
+      - name: Verify maintained Hermes source for crash coverage
+        env:
+          HERMES_SOURCE_ROOT: ${{ github.workspace }}/hermes
+          PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import inspect
+          import os
+          from pathlib import Path
+
+          import agent.memory_provider as memory_provider
+
+          source_root = Path(os.environ["HERMES_SOURCE_ROOT"]).resolve()
+          module_file = getattr(memory_provider, "__file__", None)
+          if not module_file:
+              raise SystemExit("Hermes preflight failed: agent.memory_provider has no source file")
+          source_path = Path(module_file).resolve()
+          if not source_path.is_file() or not source_path.is_relative_to(source_root):
+              raise SystemExit(f"Hermes preflight failed: unexpected module source {source_path}")
+          try:
+              source = inspect.getsource(memory_provider)
+          except (OSError, TypeError) as exc:
+              raise SystemExit(f"Hermes preflight failed: source is not inspectable: {exc}") from exc
+          if not source.strip():
+              raise SystemExit(f"Hermes preflight failed: empty source file {source_path}")
+          print(f"Hermes source verified: {source_path}")
+          PY
       - name: Run Hermes adapter contract and regression suite
         env:
           HERMES_HOME: ${{ runner.temp }}/fermes-hermes-profile
           PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}
+          FHM007_REQUIRE_REAL_HERMES: "1"
         run: |
           python -m compileall -q integrations/hermes_agent
-          python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_hermes_agent_integration.py tests/unit/test_auto_memory_idempotency.py tests/unit/test_fermes_capture_integration.py tests/unit/test_provenance.py
+          python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_hermes_agent_integration.py tests/unit/test_auto_memory_idempotency.py tests/unit/test_fermes_capture_integration.py tests/unit/test_atomic_file_write.py tests/unit/test_provenance.py
           python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_as_llm_lazy.py tests/unit/test_base_agent_wrapper.py tests/unit/test_injected_job_kwargs.py::test_agentscope_memory_create_injects_session_ownership tests/unit/test_injected_job_kwargs.py::test_agentscope_memory_update_does_not_ack_failed_edit

@@ -1,5 +1,10 @@
 """auto_memory — record conversation facts into a daily note via an agent."""
 
+# This security-sensitive step intentionally keeps its provenance and crash-recovery
+# paths together; splitting it solely to satisfy a module-size threshold would make
+# the fail-closed state transitions harder to audit.
+# pylint: disable=too-many-lines
+
 import base64
 import binascii
 import datetime
@@ -362,6 +367,21 @@ class AutoMemoryStep(BaseStep):
         canonical_body = cls._canonical_stored_body(body)
         return hashlib.sha256(canonical_body.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _valid_marker_source_hash(marker: dict) -> bool:
+        """Check the marker's source hash before any nested values are read."""
+        source_hash = marker.get("source_hash")
+        if not isinstance(source_hash, dict):
+            return False
+        if source_hash.get("algorithm") != "sha256":
+            return False
+        if source_hash.get("format") != "hex":
+            return False
+        value = source_hash.get("value")
+        if not isinstance(value, str):
+            return False
+        return len(value) == 64 and all(char in "0123456789abcdef" for char in value.lower())
+
     def _validate_existing_marker(
         self,
         post: frontmatter.Post,
@@ -380,23 +400,19 @@ class AutoMemoryStep(BaseStep):
             "note_path": relative,
         }
         marker_keys = {*required, "source_hash", "request_id", "fingerprint", "body_sha256", "created"}
-        if (
-            not isinstance(marker, dict)
-            or set(marker) != marker_keys
-            or any(marker.get(key) != value for key, value in required.items())
-            or not isinstance(marker.get("source_hash"), dict)
-            or marker["source_hash"].get("algorithm") != "sha256"
-            or marker["source_hash"].get("format") != "hex"
-            or not isinstance(marker["source_hash"].get("value"), str)
-            or len(marker["source_hash"]["value"]) != 64
-            or any(char not in "0123456789abcdef" for char in marker["source_hash"]["value"].lower())
-            or not isinstance(marker.get("request_id"), str)
-            or not isinstance(marker.get("fingerprint"), str)
-            or not isinstance(marker.get("body_sha256"), str)
-            or not isinstance(marker.get("created"), bool)
-            or marker.get("body_sha256") != self._body_digest(post.content)
-            or (source_hash is not None and marker.get("source_hash") != source_hash)
-        ):
+        if not isinstance(marker, dict):
+            raise ValueError("protected note marker is missing or contradictory")
+        if set(marker) != marker_keys or any(marker.get(key) != value for key, value in required.items()):
+            raise ValueError("protected note marker is missing or contradictory")
+        if not self._valid_marker_source_hash(marker):
+            raise ValueError("protected note marker is missing or contradictory")
+        if not all(isinstance(marker.get(key), str) for key in ("request_id", "fingerprint", "body_sha256")):
+            raise ValueError("protected note marker is missing or contradictory")
+        if not isinstance(marker.get("created"), bool):
+            raise ValueError("protected note marker is missing or contradictory")
+        if marker.get("body_sha256") != self._body_digest(post.content):
+            raise ValueError("protected note marker is missing or contradictory")
+        if source_hash is not None and marker.get("source_hash") != source_hash:
             raise ValueError("protected note marker is missing or contradictory")
         return marker
 
@@ -1254,7 +1270,9 @@ class AutoMemoryStep(BaseStep):
             content=[images[part] if part in images else TextBlock(text=part) for part in parts if part],
         )
 
-    async def execute(self):
+    # These returns reject malformed or unverifiable receipts before any write;
+    # keeping the state machine linear makes the security boundary auditable.
+    async def execute(self):  # pylint: disable=too-many-return-statements
         """Replay completed request IDs without repeating the memory agent."""
         assert self.context is not None
         request_id = self.context.get("request_id")
@@ -1333,9 +1351,10 @@ class AutoMemoryStep(BaseStep):
                     self.context.response.success = False
                     self.context.response.answer = "Error: request_id was already used for different input"
                     return
+                response: Response | None = None
                 if record is not None:
                     response = Response.model_validate(record["response"])
-                if record is not None and response.success:
+                if response is not None and response.success:
                     note_path = response.metadata.get("path")
                     if self._provenance_enabled() and isinstance(note_path, str) and note_path:
                         if not verify_note_provenance(
@@ -1362,7 +1381,7 @@ class AutoMemoryStep(BaseStep):
                     self.context.response.metadata.update(response.metadata)
                     self.context["changes"] = record["changes"]
                     return
-                if record is not None:
+                if response is not None:
                     self.context.response.answer = response.answer
                     self.context.response.success = response.success
                     self.context.response.metadata.update(response.metadata)
