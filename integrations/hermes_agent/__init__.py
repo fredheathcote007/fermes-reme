@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -49,17 +50,135 @@ _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
 _PROFILE_LOCK_FILENAME = ".writer.lock"
 _WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
+_WORKSPACE_OWNER_TEMP_PREFIX = f".{_WORKSPACE_OWNER_FILENAME}."
 _HELD_PROFILE_LOCKS: set[str] = set()
 _HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
 
 def _fsync_directory(path: Path) -> None:
     """Flush a directory entry after creating or replacing the profile spool."""
+    if os.name == "nt":
+        # Windows does not expose a portable fsync-able directory handle.
+        # The file itself is flushed before publication; never substitute an
+        # unsafe rename when directory metadata cannot be flushed.
+        return
+    fsync = getattr(os, "fsync", None)
+    if fsync is None:
+        raise OSError("directory fsync is unsupported")
     fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        fsync(fd)
     finally:
         os.close(fd)
+
+
+def _is_windows_platform() -> bool:
+    """Return the platform family used for filesystem mode interpretation."""
+    return sys.platform == "win32"
+
+
+def _safe_staging_mode(mode: int) -> bool:
+    """Accept only private marker modes, including Windows' reduced mode semantics."""
+    mode_bits = stat.S_IMODE(mode)
+    if not _is_windows_platform():
+        return mode_bits == 0o600
+    # Windows may report the mkstemp file as normal/read-only (0666/0444),
+    # while 0600 is also produced by Python builds that expose POSIX modes.
+    return mode_bits in {0o444, 0o600, 0o666}
+
+
+def _set_private_file_mode(path: Path, fd: int) -> None:
+    """Apply the strongest portable private-file mode for the current platform."""
+    if _is_windows_platform():
+        chmod = getattr(os, "chmod", None)
+        if chmod is None:
+            raise OSError("private file mode is unsupported on Windows")
+        try:
+            # Python 3.11's Windows chmod does not implement follow_symlinks.
+            # The descriptor is retained from mkstemp/exclusive creation while
+            # the path-based operation is guarded by identity and reparse checks.
+            before = _verify_private_file_identity(path, fd, require_single_link=True)
+            chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            _verify_private_file_identity(path, fd, expected_stat=before)
+        except (NotImplementedError, OSError, TypeError) as exc:
+            raise OSError("private file mode is unsupported on Windows") from exc
+        return
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        raise OSError("private file mode is unsupported")
+    try:
+        fchmod(fd, 0o600)
+    except (NotImplementedError, OSError) as exc:
+        raise OSError("private file mode could not be applied") from exc
+
+
+def _fsync_file(fd: int) -> None:
+    """Flush an open file or fail closed when file durability is unavailable."""
+    fsync = getattr(os, "fsync", None)
+    if fsync is None:
+        raise OSError("file fsync is unsupported")
+    fsync(fd)
+
+
+def _is_reparse_point(path: Path, file_stat: os.stat_result) -> bool:
+    """Detect Windows reparse points even on Python versions without is_junction."""
+    if not _is_windows_platform():
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(file_stat, "st_file_attributes", 0) & reparse_flag:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is None:
+        return False
+    try:
+        return bool(is_junction())
+    except OSError:
+        return True
+
+
+def _is_unsafe_link(path: Path, file_stat: os.stat_result) -> bool:
+    """Return whether a path entry is a symlink or Windows reparse point."""
+    return stat.S_ISLNK(file_stat.st_mode) or _is_reparse_point(path, file_stat)
+
+
+def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    """Return whether two stat results identify the same device and inode."""
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _owned_by_current_user(file_stat: os.stat_result, current_uid: int | None) -> bool:
+    """Return whether a stat result belongs to the current user when supported."""
+    return current_uid is None or file_stat.st_uid == current_uid
+
+
+def _verify_private_file_identity(
+    path: Path,
+    fd: int,
+    *,
+    expected_stat: os.stat_result | None = None,
+    require_single_link: bool = False,
+) -> os.stat_result:
+    """Verify that a path and open descriptor still name the same private file."""
+    path_stat = path.lstat()
+    fd_stat = os.fstat(fd)
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    if _is_unsafe_link(path, path_stat) or _is_unsafe_link(path, fd_stat):
+        raise OSError("private file target is ambiguous")
+    if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(fd_stat.st_mode):
+        raise OSError("private file target is ambiguous")
+    if not _same_file_identity(path_stat, fd_stat):
+        raise OSError("private file target is ambiguous")
+    if expected_stat is not None and not _same_file_identity(path_stat, expected_stat):
+        raise OSError("private file target is ambiguous")
+    if expected_stat is not None and not _same_file_identity(fd_stat, expected_stat):
+        raise OSError("private file target is ambiguous")
+    if require_single_link and path_stat.st_nlink != 1:
+        raise OSError("private file target is ambiguous")
+    if not _owned_by_current_user(path_stat, current_uid) or not _owned_by_current_user(fd_stat, current_uid):
+        raise OSError("private file target is ambiguous")
+    if not _safe_staging_mode(path_stat.st_mode) or not _safe_staging_mode(fd_stat.st_mode):
+        raise OSError("private file target is ambiguous")
+    return path_stat
 
 
 class _ProfileWriterLock:
@@ -88,7 +207,7 @@ class _ProfileWriterLock:
                 flags |= os.O_NOFOLLOW
             fd = os.open(self.path, flags, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                _set_private_file_mode(self.path, fd)
                 if fcntl is not None:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 elif msvcrt is not None:
@@ -121,6 +240,10 @@ class _ProfileWriterLock:
                 _HELD_PROFILE_LOCKS.discard(self._key)
 
 
+class _WorkspaceOwnerConflict(OSError):
+    """The workspace marker belongs to a different Hermes profile."""
+
+
 class _WorkspaceOwnerMarker:
     """Durably bind an embedded workspace to one canonical Hermes profile.
 
@@ -143,8 +266,11 @@ class _WorkspaceOwnerMarker:
         for part in path.parts[1:]:
             current /= part
             try:
-                if current.is_symlink():
+                current_stat = current.lstat()
+                if _is_unsafe_link(current, current_stat):
                     raise OSError("unsafe workspace path")
+            except FileNotFoundError:
+                continue
             except OSError as exc:
                 if str(exc) == "unsafe workspace path":
                     raise
@@ -171,7 +297,7 @@ class _WorkspaceOwnerMarker:
             raise OSError("workspace owner marker could not be inspected") from exc
         if stat.S_ISLNK(marker_stat.st_mode) or not stat.S_ISREG(marker_stat.st_mode):
             raise OSError("workspace owner marker is not a regular file")
-        if marker_stat.st_mode & 0o077 or not marker_stat.st_mode & 0o400:
+        if _is_unsafe_link(self.path, marker_stat) or not _safe_staging_mode(marker_stat.st_mode):
             raise OSError("workspace owner marker is not private")
 
         flags = os.O_RDONLY
@@ -183,8 +309,14 @@ class _WorkspaceOwnerMarker:
             raise OSError("workspace owner marker could not be opened") from exc
         try:
             current_stat = os.fstat(fd)
-            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISREG(current_stat.st_mode):
-                raise OSError("workspace owner marker is not a regular file")
+            if (
+                _is_unsafe_link(self.path, current_stat)
+                or not stat.S_ISREG(current_stat.st_mode)
+                or not _safe_staging_mode(current_stat.st_mode)
+                or current_stat.st_dev != marker_stat.st_dev
+                or current_stat.st_ino != marker_stat.st_ino
+            ):
+                raise OSError("workspace owner marker is ambiguous")
             raw = os.read(fd, 4097)
         finally:
             os.close(fd)
@@ -201,7 +333,7 @@ class _WorkspaceOwnerMarker:
             or marker.get("owner") != self.profile_home
             or marker.get("workspace") != str(self.workspace)
         ):
-            raise OSError("workspace belongs to another Hermes profile")
+            raise _WorkspaceOwnerConflict("workspace belongs to another Hermes profile")
 
     def acquire(self) -> None:
         """Create the owner marker atomically or validate its existing owner."""
@@ -214,29 +346,130 @@ class _WorkspaceOwnerMarker:
         encoded = (json.dumps(marker, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
         # Do not silently claim a workspace containing another identity's
         # historical data. Existing workspaces require an explicit migration.
-        if not self.path.exists() and any(self.workspace.iterdir()):
-            raise OSError("existing workspace is unowned; explicit migration required")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(self.path, flags, 0o600)
-        except FileExistsError:
-            self._read_existing()
-            self._owned = True
-            return
+            self.path.lstat()
+        except FileNotFoundError:
+            marker_exists = False
         except OSError as exc:
-            raise OSError("workspace owner marker could not be created") from exc
+            raise OSError("workspace owner marker could not be inspected") from exc
+        else:
+            marker_exists = True
+        if not marker_exists:
+            self._remove_safe_staging_files(encoded)
+            if any(self.workspace.iterdir()):
+                raise OSError("existing workspace is unowned; explicit migration required")
+
+        # Publishing the final name with O_EXCL before writing it leaves a
+        # corrupt marker behind if the process dies during the write. A
+        # private, durable temporary file plus a hard link publishes the
+        # completed bytes atomically and cannot overwrite a competing marker.
+        temp_name: str | None = None
         try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, encoded)
-            os.fsync(fd)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=_WORKSPACE_OWNER_TEMP_PREFIX,
+                dir=self.workspace,
+            )
+            try:
+                _set_private_file_mode(Path(temp_name), fd)
+                with os.fdopen(fd, "wb") as handle:
+                    fd = -1
+                    handle.write(encoded)
+                    handle.flush()
+                    _fsync_file(handle.fileno())
+                    temp_path = Path(temp_name)
+                    before_link = _verify_private_file_identity(
+                        temp_path,
+                        handle.fileno(),
+                        require_single_link=True,
+                    )
+                    try:
+                        if _is_windows_platform():
+                            # Windows Python 3.11 exposes CreateHardLink through
+                            # os.link but rejects the follow_symlinks keyword.
+                            os.link(temp_path, self.path)
+                        else:
+                            os.link(temp_path, self.path, follow_symlinks=False)
+                    except FileExistsError:
+                        self._read_existing()
+                        self._owned = True
+                        return
+                    _verify_private_file_identity(temp_path, handle.fileno(), expected_stat=before_link)
+                    _verify_private_file_identity(self.path, handle.fileno(), expected_stat=before_link)
+                    _fsync_directory(self.workspace)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        except _WorkspaceOwnerConflict:
+            raise
         except OSError as exc:
+            if str(exc).startswith("workspace owner marker"):
+                raise
             raise OSError("workspace owner marker could not be made durable") from exc
         finally:
-            os.close(fd)
-        _fsync_directory(self.workspace)
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
         self._owned = True
+
+    def _remove_safe_staging_files(self, encoded: bytes) -> None:
+        """Remove only verified leftovers from an interrupted marker publish."""
+        staging_paths: list[Path] = []
+        try:
+            entries = tuple(self.workspace.iterdir())
+        except OSError as exc:
+            raise OSError("workspace contents could not be inspected") from exc
+        current_uid = os.getuid() if hasattr(os, "getuid") else None
+        for entry in entries:
+            if not entry.name.startswith(_WORKSPACE_OWNER_TEMP_PREFIX):
+                raise OSError("existing workspace is unowned; explicit migration required")
+            try:
+                entry_stat = entry.lstat()
+            except OSError as exc:
+                raise OSError("workspace owner staging file could not be inspected") from exc
+            # Keep every fail-closed identity check explicit; these checks jointly prove that
+            # the staging file is safe to remove after an interrupted marker publish.
+            if (  # pylint: disable=too-many-boolean-expressions
+                _is_unsafe_link(entry, entry_stat)
+                or not stat.S_ISREG(entry_stat.st_mode)
+                or not _safe_staging_mode(entry_stat.st_mode)
+                or entry_stat.st_nlink != 1
+                or (current_uid is not None and entry_stat.st_uid != current_uid)
+            ):
+                raise OSError("workspace owner staging file is ambiguous")
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(entry, flags)
+            except OSError as exc:
+                raise OSError("workspace owner staging file could not be opened") from exc
+            try:
+                opened_stat = os.fstat(fd)
+                if (
+                    _is_unsafe_link(entry, opened_stat)
+                    or not stat.S_ISREG(opened_stat.st_mode)
+                    or opened_stat.st_dev != entry_stat.st_dev
+                    or opened_stat.st_ino != entry_stat.st_ino
+                    or opened_stat.st_size != len(encoded)
+                ):
+                    raise OSError("workspace owner staging file is ambiguous")
+                if os.read(fd, len(encoded) + 1) != encoded:
+                    raise OSError("workspace owner staging file is ambiguous")
+            finally:
+                os.close(fd)
+            staging_paths.append(entry)
+        for entry in staging_paths:
+            try:
+                entry.unlink()
+            except OSError as exc:
+                raise OSError("workspace owner staging file could not be removed") from exc
+        if staging_paths:
+            try:
+                _fsync_directory(self.workspace)
+            except OSError as exc:
+                raise OSError("workspace owner staging cleanup could not be made durable") from exc
 
     def release(self) -> None:
         """Release this provider's in-memory reference without deleting ownership."""
@@ -720,9 +953,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 self._close_backend_locked(
                     timeout=max(0.0, deadline - time.monotonic()),
                 )
-                self._deferred_backend_close = False
-                self._release_profile_lock()
-                self._release_workspace_owner()
+                self._finish_deferred_backend_close_locked()
             finally:
                 self._backend_lock.release()
         else:
@@ -741,6 +972,19 @@ class ReMeMemoryProvider(MemoryProvider):
         owner, self._workspace_owner = self._workspace_owner, None
         if owner is not None:
             owner.release()
+
+    def _release_profile_resources_if_writer_stopped(self) -> bool:
+        """Release ownership only after the writer completed journal handling."""
+        with self._write_thread_lock:
+            # The writer clears this slot only after its backend call, durable
+            # journal acknowledgement, queue bookkeeping, and task_done all
+            # finish. In particular, do not release from the writer's own
+            # _record_payload finally block before _remove_pending_write.
+            if self._write_thread is not None:
+                return False
+            self._release_profile_lock()
+            self._release_workspace_owner()
+            return True
 
     def _atexit_shutdown(self) -> None:
         try:
@@ -781,15 +1025,21 @@ class ReMeMemoryProvider(MemoryProvider):
 
     def _disable_without_profile(self, session_id: str, profile_id: Any) -> None:
         """Fail closed when Hermes does not provide its profile home."""
+        with self._write_thread_lock:
+            if self._write_thread is not None and self._write_thread.is_alive():
+                raise RuntimeError(
+                    "Cannot disable ReMe while its previous writer is still running",
+                )
+            self._accept_writes = False
         with self._backend_lock:
             self._close_backend_locked()
+        self._release_profile_lock()
         self._config = None
         self._backend_label = "missing Hermes profile"
         self._session_id = str(session_id or "")
         self._profile_id = str(profile_id or "default")
         self._pending_path = None
         self._release_workspace_owner()
-        self._accept_writes = False
         self._backend_available = False
         self._recall_status = None
         self._unavailable_reason = "hermes_home is required for profile-scoped ReMe state"
@@ -841,14 +1091,14 @@ class ReMeMemoryProvider(MemoryProvider):
                 flags |= os.O_NOFOLLOW
             fd = os.open(path, flags, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                _set_private_file_mode(path, fd)
                 with os.fdopen(fd, "a", encoding="utf-8") as handle:
                     fd = -1
                     handle.write(
                         json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
                     )
                     handle.flush()
-                    os.fsync(handle.fileno())
+                    _fsync_file(handle.fileno())
             finally:
                 if fd >= 0:
                     os.close(fd)
@@ -926,7 +1176,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     with os.fdopen(fd, "w", encoding="utf-8") as handle:
                         handle.writelines(kept)
                         handle.flush()
-                        os.fsync(handle.fileno())
+                        _fsync_file(handle.fileno())
                     os.chmod(temp_name, 0o600)
                     os.replace(temp_name, path)
                     _fsync_directory(path.parent)
@@ -978,6 +1228,8 @@ class ReMeMemoryProvider(MemoryProvider):
             with self._write_thread_lock:
                 if self._write_thread is current:
                     self._write_thread = None
+            if self._shutdown_started:
+                self._release_profile_resources_if_writer_stopped()
 
     def _record_payload(
         self,
@@ -1123,9 +1375,12 @@ class ReMeMemoryProvider(MemoryProvider):
     def _close_backend_if_shutdown_locked(self) -> None:
         if self._deferred_backend_close:
             self._close_backend_locked()
-            self._deferred_backend_close = False
-            self._release_profile_lock()
-            self._release_workspace_owner()
+            self._finish_deferred_backend_close_locked()
+
+    def _finish_deferred_backend_close_locked(self) -> None:
+        """Finish shutdown ownership release after backend close completes."""
+        self._deferred_backend_close = False
+        self._release_profile_resources_if_writer_stopped()
 
     def _close_backend_locked(self, *, timeout: float | None = None) -> None:
         backend, self._backend = self._backend, None
