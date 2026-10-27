@@ -57,6 +57,8 @@ _MESSAGE_TIME_ALIASES = ("time_created", "timestamp", "createdAt", "timeCreated"
 _SUCCESSFUL_TOOL_STATES = {"success", "succeeded", "ok"}
 _OPTION_B_MARKER = "_reme_commit"
 _OPTION_B_VERSION = 1
+_OPTION_B_COMMIT_OUTCOME = "commit"
+_OPTION_B_NOOP_OUTCOME = "noop"
 _OPTION_B_RESERVED_METADATA = frozenset(
     {
         "name",
@@ -289,24 +291,45 @@ class AutoMemoryStep(BaseStep):
             return before_bytes is not None
         return after_path != before_path or before_bytes != after_bytes
 
-    def _find_session_note(self, notes: list[dict], session_id: str) -> dict | None:
+    def _find_session_note(
+        self,
+        notes: list[dict],
+        session_id: str,
+        *,
+        fail_closed: bool = False,
+    ) -> dict | None:
         source = self._session_link(session_id)
+        if not fail_closed:
+            for note in notes:
+                note_session = str(note.get(_SESSION_ID_KEY, "")).strip()
+                note_source = str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip()
+                if note_session == session_id and (not note_source or note_source == source):
+                    return note
+            for note in notes:
+                if str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip() == source:
+                    return note
+            return None
+
+        conflicting: dict | None = None
         for note in notes:
             note_session = str(note.get(_SESSION_ID_KEY, "")).strip()
             note_source = str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip()
             if note_session == session_id and (not note_source or note_source == source):
                 return note
-        for note in notes:
-            if str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip() == source:
-                return note
-        return None
+            # Keep an identity contradiction attached to the update path so
+            # the protected flow can fail closed before invoking the model or
+            # treating the note as a new create target. Unrelated notes remain
+            # eligible for the historical create flow.
+            if conflicting is None and (note_session == session_id or note_source == source):
+                conflicting = note
+        return conflicting
 
     async def _list_session_note(self, day: str, session_id: str) -> dict | None:
         list_response = await self.run_job("daily_list", date=day)
         if not list_response.success:
             raise RuntimeError(f"daily_list failed: {list_response.answer}")
         notes = list_response.metadata.get("notes") or []
-        return self._find_session_note(notes, session_id)
+        return self._find_session_note(notes, session_id, fail_closed=self._option_b_enabled())
 
     def _provenance_enabled(self) -> bool:
         """Limit trusted transcript provenance to the Fermes AgentScope step."""
@@ -328,6 +351,18 @@ class AutoMemoryStep(BaseStep):
         if not isinstance(scope, str) or not scope.strip() or len(scope) > 128:
             raise ValueError("protected memory commit requires a configured agent_scope")
         return scope
+
+    @staticmethod
+    def _option_b_note_owned_by_session(metadata: object, trusted: dict) -> bool:
+        """Require exact session ownership without binding prior notes to a new hash."""
+        if not note_owned_by_session(metadata, trusted) or not isinstance(metadata, dict):
+            return False
+        if metadata.get(_SESSION_ID_KEY) != trusted.get(_SESSION_ID_KEY):
+            return False
+        for key in (_SOURCE_CONVERSATION_KEY,):
+            if key in metadata and metadata.get(key) != trusted.get(key):
+                return False
+        return True
 
     def _owned_note_target(self, relative: str) -> Path:
         """Resolve a protected Markdown target and reject symlink components."""
@@ -470,6 +505,8 @@ class AutoMemoryStep(BaseStep):
         """Validate a receipt against the exact marker and note it claims to complete."""
         if not isinstance(record, dict) or record.get("version") != _OPTION_B_VERSION:
             raise RuntimeError("protected receipt is malformed")
+        if record.get("outcome", _OPTION_B_COMMIT_OUTCOME) != _OPTION_B_COMMIT_OUTCOME:
+            raise RuntimeError("protected receipt is not a commit")
         if record.get("fingerprint") != fingerprint:
             raise RuntimeError("protected receipt fingerprint does not match its marker")
         response = Response.model_validate(record.get("response"))
@@ -481,16 +518,41 @@ class AutoMemoryStep(BaseStep):
         expected_changes = [{"change": "added" if marker["created"] else "modified", "path": note_path}]
         if record.get("note_sha256") != hashlib.sha256(note_raw).hexdigest():
             raise RuntimeError("protected receipt does not match the committed note bytes")
-        if (
-            response.metadata.get("commit") != marker
+        matches = (
+            response.metadata.get("outcome", _OPTION_B_COMMIT_OUTCOME) != _OPTION_B_COMMIT_OUTCOME
+            or response.metadata.get("commit") != marker
             or response.metadata.get("path") != note_path
             or response.metadata.get("source_hash") != marker["source_hash"]
             or response.metadata.get("source_conversation") != self._session_link(session_id)
             or record.get("changes") != expected_changes
-        ):
+        )
+        if matches:
             raise RuntimeError("protected receipt response is not bound to its commit")
         if marker.get("request_id") != request_id:
             raise RuntimeError("protected receipt request does not match its marker")
+        return response
+
+    @staticmethod
+    def _validate_option_b_noop_receipt_record(record: dict, *, fingerprint: str) -> Response:
+        """Validate a durable no-op receipt without requiring commit evidence."""
+        if not isinstance(record, dict) or record.get("version") != _OPTION_B_VERSION:
+            raise RuntimeError("protected receipt is malformed")
+        if record.get("outcome") != _OPTION_B_NOOP_OUTCOME:
+            raise RuntimeError("protected receipt is not a no-op")
+        if record.get("fingerprint") != fingerprint:
+            raise RuntimeError("protected receipt fingerprint does not match its request")
+        if any(key in record for key in ("commit", "note_sha256")) or record.get("changes") != []:
+            raise RuntimeError("protected no-op receipt contains commit evidence")
+        response = Response.model_validate(record.get("response"))
+        metadata = response.metadata
+        if (
+            not response.success
+            or metadata.get("outcome") != _OPTION_B_NOOP_OUTCOME
+            or metadata.get("modified") is not False
+            or metadata.get("n_messages") != 0
+            or any(key in metadata for key in ("commit", "note_sha256", "path", "created"))
+        ):
+            raise RuntimeError("protected no-op receipt response is malformed")
         return response
 
     def _validate_superseded_option_b_revision(
@@ -576,6 +638,13 @@ class AutoMemoryStep(BaseStep):
                 agent_scope=self._option_b_scope(),
             )
             index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+            self.context["changes"] = [
+                {
+                    "change": "added" if committed_marker["created"] else "modified",
+                    "path": relative,
+                }
+            ]
+            await self._publish_option_b_index()
             self._option_b_response(
                 marker=committed_marker,
                 day=day,
@@ -598,6 +667,25 @@ class AutoMemoryStep(BaseStep):
             agent_scope=self._option_b_scope(),
         )
         return False
+
+    async def _publish_option_b_index(self) -> None:
+        """Publish protected note changes before reporting a successful commit.
+
+        The background watcher is best-effort and may not run before an embedded
+        provider is shut down. Protected commits therefore use the existing file
+        store update step synchronously. A failed publication is raised so no
+        receipt is written and a later retry can reconcile the note.
+        """
+        assert self.context is not None
+        changes = self.context.get("changes") or []
+        if not changes:
+            raise RuntimeError("protected memory commit has no index changes")
+        responses = await self.dispatch_steps(
+            [{"backend": "update_index_step", "persist": True}],
+            changes=changes,
+        )
+        if not responses or any(not response.success for response in responses):
+            raise RuntimeError("protected memory commit index publication failed")
 
     def _option_b_response(
         self,
@@ -700,6 +788,8 @@ class AutoMemoryStep(BaseStep):
                     existing = frontmatter.loads(current.decode("utf-8"))
                 except (UnicodeError, ValueError, TypeError) as exc:
                     raise RuntimeError("existing protected note is unreadable") from exc
+                if not self._option_b_note_owned_by_session(existing.metadata, provenance):
+                    raise RuntimeError("existing protected note belongs to a different source session")
                 existing_marker = existing.metadata.get(_OPTION_B_MARKER)
                 if existing_marker is not None and not isinstance(existing_marker, dict):
                     raise RuntimeError("protected note marker is malformed")
@@ -715,6 +805,13 @@ class AutoMemoryStep(BaseStep):
                     agent_scope=agent_scope,
                 )
                 index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+                self.context["changes"] = [
+                    {
+                        "change": "added" if marker["created"] else "modified",
+                        "path": note_path,
+                    }
+                ]
+                await self._publish_option_b_index()
                 self._option_b_response(
                     marker=marker,
                     day=day,
@@ -793,6 +890,8 @@ class AutoMemoryStep(BaseStep):
                     existing = frontmatter.loads(current.decode("utf-8"))
                 except (UnicodeError, ValueError, TypeError) as exc:
                     raise RuntimeError("existing protected note is unreadable") from exc
+                if not self._option_b_note_owned_by_session(existing.metadata, provenance):
+                    raise RuntimeError("existing protected note belongs to a different source session")
                 existing_marker = existing.metadata.get(_OPTION_B_MARKER)
                 if existing_marker is not None:
                     if not isinstance(existing_marker, dict):
@@ -846,6 +945,7 @@ class AutoMemoryStep(BaseStep):
             del committed
         self.context["changes"] = [{"change": "added" if created else "modified", "path": expected_path}]
         index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+        await self._publish_option_b_index()
         self.context.response.success = True
         self.context.response.answer = "Committed one durable memory revision"
         self.context.response.metadata.update(
@@ -874,6 +974,15 @@ class AutoMemoryStep(BaseStep):
             self.context.response.success = False
             self.context.response.answer = "Error: request_id was already used for different input"
             return
+        if record.get("outcome") == _OPTION_B_NOOP_OUTCOME:
+            response = self._validate_option_b_noop_receipt_record(record, fingerprint=fingerprint)
+            self.context.response.answer = response.answer
+            self.context.response.success = response.success
+            self.context.response.metadata.update(response.metadata)
+            self.context["changes"] = []
+            return
+        if record.get("outcome", _OPTION_B_COMMIT_OUTCOME) != _OPTION_B_COMMIT_OUTCOME:
+            raise RuntimeError("protected receipt has an unknown outcome")
         marker = record.get("commit")
         if not isinstance(marker, dict):
             raise TypeError("protected receipt does not contain a successful commit")
@@ -901,20 +1010,44 @@ class AutoMemoryStep(BaseStep):
             note_raw=raw,
         )
         expected_changes = [{"change": "added" if marker["created"] else "modified", "path": note_path}]
+        self.context["changes"] = expected_changes
+        await self._publish_option_b_index()
         self.context.response.answer = response.answer
         self.context.response.success = response.success
         self.context.response.metadata.update(response.metadata)
-        self.context["changes"] = expected_changes
 
     async def _write_option_b_receipt(self, path: Path, fingerprint: str) -> None:
         """Persist the successful protected response after index refresh."""
         assert self.context is not None
+        outcome = self.context.response.metadata.get("outcome", _OPTION_B_COMMIT_OUTCOME)
+        if outcome == _OPTION_B_NOOP_OUTCOME:
+            metadata = self.context.response.metadata
+            if (
+                not self.context.response.success
+                or metadata.get("modified") is not False
+                or metadata.get("n_messages") != 0
+                or any(key in metadata for key in ("commit", "note_sha256", "path", "created"))
+                or self.context.get("changes")
+            ):
+                raise TypeError("protected no-op has unexpected commit evidence")
+            record = {
+                "version": _OPTION_B_VERSION,
+                "outcome": _OPTION_B_NOOP_OUTCOME,
+                "fingerprint": fingerprint,
+                "response": self.context.response.model_dump(mode="json"),
+                "changes": [],
+            }
+            await write_file_durable(path, json.dumps(record, ensure_ascii=False, sort_keys=True))
+            return
+        if outcome != _OPTION_B_COMMIT_OUTCOME:
+            raise TypeError("protected success has an unknown outcome")
         commit = self.context.response.metadata.get("commit")
         note_sha256 = self.context.response.metadata.get("note_sha256")
         if not isinstance(commit, dict) or not isinstance(note_sha256, str):
             raise TypeError("protected success has no complete commit evidence")
         record = {
             "version": _OPTION_B_VERSION,
+            "outcome": _OPTION_B_COMMIT_OUTCOME,
             "fingerprint": fingerprint,
             "commit": commit,
             "note_sha256": note_sha256,
@@ -1478,7 +1611,16 @@ class AutoMemoryStep(BaseStep):
         if not messages:
             self.context.response.success = True
             self.context.response.answer = "Skipped: no messages"
-            self.context.response.metadata.update({"date": day, "modified": False, "n_messages": 0})
+            self.context.response.metadata.update(
+                {
+                    "date": day,
+                    "modified": False,
+                    "n_messages": 0,
+                    "outcome": _OPTION_B_NOOP_OUTCOME if option_b else None,
+                },
+            )
+            if not option_b:
+                self.context.response.metadata.pop("outcome", None)
             self.logger.info(f"[{self.name}] Skipped: no messages session_id={session_id!r} modified=False")
             return
 

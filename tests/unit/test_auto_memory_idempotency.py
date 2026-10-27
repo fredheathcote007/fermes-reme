@@ -197,6 +197,42 @@ async def test_concurrent_duplicate_waits_for_the_original_request(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_protected_empty_turn_has_idempotent_noop_receipt_without_commit_or_model_call(tmp_path):
+    """An empty protected turn is replayable without a transcript or fake commit."""
+
+    def make_step():
+        step = AutoMemoryStep(durable_commit=True, agent_scope="test-scope")
+        step.file_store = SimpleNamespace(workspace_path=tmp_path)
+        step.agent_wrapper = _SecurityTestWrapper(backend="agentscope")
+        step.context = RuntimeContext(
+            request_id="protected-empty-turn",
+            session_id="protected-empty-session",
+            messages=[],
+            date="2026-10-21",
+        )
+        return step
+
+    first = make_step()
+    await first.execute()
+    receipts = list(tmp_path.rglob("*.json"))
+    assert len(receipts) == 1
+    record = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert record["outcome"] == "noop"
+    assert record["changes"] == []
+    assert "commit" not in record
+    assert "note_sha256" not in record
+    assert first.context.response.metadata["outcome"] == "noop"
+    assert "commit" not in first.context.response.metadata
+    assert not list(tmp_path.rglob("dialog/*.jsonl"))
+
+    replay = make_step()
+    await replay.execute()
+    assert replay.context.response == first.context.response
+    assert replay.context["changes"] == []
+    assert not list(tmp_path.rglob("dialog/*.jsonl"))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("request_id", "step_kwargs", "diagnostic"),
     [
@@ -474,6 +510,198 @@ async def test_option_b_orphaned_marker_cannot_be_superseded_without_receipt(tmp
     assert not second.success
     assert len(calls) == 1
     assert note_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_option_b_rejects_unmarked_foreign_note_with_matching_source_before_model(tmp_path, monkeypatch):
+    """A source link cannot claim an unmarked note whose session owner differs."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/planted.md"
+    note_path.parent.mkdir(parents=True)
+    original = (
+        "---\nname: planted\n"
+        "session_id: foreign-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nForeign content.\n"
+    )
+    note_path.write_text(original, encoding="utf-8")
+    calls = []
+
+    async def unexpected_model_call(_self, _inputs, **_kwargs):
+        calls.append(1)
+        pytest.fail("foreign unmarked note must be rejected before the model call")
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", unexpected_model_call)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="foreign-unmarked-note",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert not response.success
+    assert "different source session" in response.answer or "protected note" in response.answer
+    assert not calls
+    assert note_path.read_text(encoding="utf-8") == original
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_updates_unmarked_note_with_matching_owner_and_source(tmp_path, monkeypatch):
+    """An unmarked legacy note remains updateable only for its exact owner."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/legacy.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(
+        "---\nname: legacy\ndescription: Legacy note\n"
+        "session_id: protected-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nLegacy content.\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/legacy.md",
+                    "name": "legacy",
+                    "description": "Updated legacy note",
+                    "content": "Updated content.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="matching-unmarked-note",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert response.success
+    assert calls == [1]
+    saved = frontmatter.loads(note_path.read_text(encoding="utf-8"))
+    # python-frontmatter canonicalizes the serialized body without a trailing newline.
+    assert saved.content == "Updated content."
+    assert saved.metadata["session_id"] == "protected-session"
+    assert "_reme_commit" in saved.metadata
+
+
+@pytest.mark.asyncio
+async def test_option_b_rejects_matching_owner_note_through_symlink_before_model(tmp_path, monkeypatch):
+    """Protected lookup cannot read or write a symlinked note target."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        "---\nname: linked\nsession_id: protected-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nOutside content.\n",
+        encoding="utf-8",
+    )
+    note_path = workspace / "daily/2026-10-21/linked.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.symlink_to(outside)
+    original = outside.read_bytes()
+    calls = []
+
+    async def unexpected_model_call(_self, _inputs, **_kwargs):
+        calls.append(1)
+        pytest.fail("symlinked note must be rejected before the model call")
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", unexpected_model_call)
+
+    async def find_linked_note(_self, _day, _session_id):
+        return {"path": "daily/2026-10-21/linked.md"}
+
+    monkeypatch.setattr(AutoMemoryStep, "_list_session_note", find_linked_note)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="symlinked-note",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert not response.success
+    assert not calls
+    assert outside.read_bytes() == original
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_rejects_model_path_mismatch_without_mutation(tmp_path, monkeypatch):
+    """The application-owned existing path remains bound across the proposal CAS."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/bound.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(
+        "---\nname: bound\ndescription: Bound note\n"
+        "session_id: protected-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nBound content.\n",
+        encoding="utf-8",
+    )
+    original = note_path.read_bytes()
+    calls = []
+
+    async def mismatched_proposal(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/other.md",
+                    "name": "bound",
+                    "description": "Bound note",
+                    "content": "Changed content.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", mismatched_proposal)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="mismatched-proposal-path",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert not response.success
+    assert calls == [1]
+    assert note_path.read_bytes() == original
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
 
 
 @pytest.mark.asyncio

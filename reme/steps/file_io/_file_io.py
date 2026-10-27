@@ -230,6 +230,13 @@ async def write_file_durable(file_path: Path, content: str | bytes, encoding: st
                     os.mkdir(part, 0o755, dir_fd=parent_fd)
                 except FileExistsError:
                     pass
+                else:
+                    # A newly created directory is not durable until its
+                    # containing directory is durable.  Sync this descriptor
+                    # before opening/traversing the child, so a later file
+                    # commit cannot claim durability for a directory entry
+                    # that was still only in the parent directory's cache.
+                    os.fsync(parent_fd)
                 next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
                 os.close(parent_fd)
                 parent_fd = next_fd

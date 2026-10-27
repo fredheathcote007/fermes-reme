@@ -73,6 +73,85 @@ async def test_durable_commit_fsyncs_file_and_parent_directory(tmp_path, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name != "posix", reason="durable protected commits require POSIX")
+async def test_durable_commit_syncs_each_new_parent_before_traversal(tmp_path, monkeypatch):
+    """Each successful mkdir syncs its containing directory before descent."""
+    events = []
+    mkdir = os.mkdir
+    fsync = os.fsync
+
+    def record_mkdir(path, mode=0o777, *, dir_fd=None):
+        result = mkdir(path, mode, dir_fd=dir_fd)
+        events.append(("mkdir", path, dir_fd))
+        return result
+
+    def record_fsync(fd):
+        events.append(("fsync", fd))
+        return fsync(fd)
+
+    monkeypatch.setattr(os, "mkdir", record_mkdir)
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    target = tmp_path / "new-parent" / "new-child" / "memory.md"
+    await write_file_durable(target, "durable memory")
+
+    mkdir_events = [(index, event) for index, event in enumerate(events) if event[0] == "mkdir"]
+    assert [event[1] for _, event in mkdir_events] == ["new-parent", "new-child"]
+    for index, (_, _, parent_fd) in mkdir_events:
+        assert events[index + 1] == ("fsync", parent_fd)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="durable protected commits require POSIX")
+async def test_durable_commit_does_not_resync_existing_parent(tmp_path, monkeypatch):
+    """An existing parent needs only the file and final rename-directory syncs."""
+    parent = tmp_path / "existing-parent"
+    parent.mkdir()
+    calls = []
+    fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (calls.append(fd), fsync(fd))[1])
+
+    await write_file_durable(parent / "memory.md", "durable memory")
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="durable protected commits require POSIX")
+@pytest.mark.parametrize("fault", ["mkdir", "fsync"])
+async def test_durable_commit_parent_creation_fault_never_acknowledges_file(tmp_path, monkeypatch, fault):
+    """Directory creation faults leave the protected target unpublished."""
+    target = tmp_path / "fault-parent" / "memory.md"
+    if fault == "mkdir":
+        mkdir = os.mkdir
+
+        def fail_mkdir(path, mode=0o777, *, dir_fd=None):
+            if path == "fault-parent":
+                raise OSError("controlled mkdir failure")
+            return mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "mkdir", fail_mkdir)
+        expected = "controlled mkdir failure"
+    else:
+        fsync = os.fsync
+        failed = False
+
+        def fail_fsync(fd):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("controlled directory fsync failure")
+            return fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fail_fsync)
+        expected = "controlled directory fsync failure"
+
+    with pytest.raises(OSError, match=expected):
+        await write_file_durable(target, "durable memory")
+    assert not target.exists()
+    assert not list(target.parent.glob(".reme-*.tmp"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="durable protected commits require POSIX")
 async def test_durable_commit_fault_preserves_old_note_and_cleans_temp(tmp_path, monkeypatch):
     """A rename fault cannot turn a partial protected write into success."""
     target = tmp_path / "memory.md"

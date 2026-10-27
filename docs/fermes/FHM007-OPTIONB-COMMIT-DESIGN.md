@@ -173,5 +173,31 @@ candidate is:
 * The independent Cursor review gave a conditional **GO** for a draft stacked
   PR only, log: `/tmp/fhm007/optionb-cursor-retry-short.log`.
 
-Fresh hosted CI and FHM-006 approval remain absent. This record claims no
-merge, deployment, or production-runtime sign-off.
+The preceding record is historical (the original 147-test candidate). It is
+superseded by the following validation; no merge, deployment, or production
+approval is implied.
+
+## Integrated candidate validation — 2026-10-27
+
+* **163/163 combined host regressions PASS** after ownership, durability,
+  empty-turn and retrieval changes:
+  `/srv/project-coordinator/tmp/fhm007-tests-20261027/merged/full-final.log`.
+* **3/3 SIGKILL crash windows PASS** on the combined candidate with real Hermes:
+  `/srv/project-coordinator/tmp/fhm007-tests-20261027/merged/sigkill-final.log`.
+* Black 120, Ruff F/I, pinned Pylint 10.00/10 and diff integrity PASS:
+  `/srv/project-coordinator/tmp/fhm007-tests-20261027/merged/pylint-r2.log`.
+* Three fresh, isolated live Qwen 3.5 4B runs PASS: each produced a durable
+  synthetic note and receipt, emptied the Hermes write queue, restarted the
+  provider and retrieved the correct synthetic codephrase and case colour
+  on the **first** BM25 lookup. The three `merged/live-proof*.log` files
+  are in the same test scratch directory. Explicit custom configuration
+  reached LAN LM Studio; these runs do not qualify the default profile.
+* The connected Cursor GitHub review of the older PR head `2f640f6`
+  identified unmarked foreign-note ownership, missing directory-entry
+  durability and an empty-turn receipt error. The integrated candidate
+  addresses all three, but requires **new exact-head GitHub review and CI**.
+
+This qualification is Linux/ext4 scoped. Broader supported-filesystem,
+concurrency, fault and deployment acceptance remains outstanding.
+FHM-006 pre-compression checkpoint v2 is separately unapproved and disabled.
+**No merge or deployment is authorised.**
