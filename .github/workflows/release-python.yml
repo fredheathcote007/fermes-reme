@@ -27,6 +27,7 @@ jobs:
       upload_artifacts: true
 
   publish-reme:
+    if: vars.FERMES_ENABLE_PUBLISHING == 'true' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10

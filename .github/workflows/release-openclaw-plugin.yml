@@ -41,7 +41,8 @@ jobs:
       validate_clawhub: true
 
   publish-clawhub:
-    if: ${{ inputs.publish_clawhub && github.ref == 'refs/heads/main' }}
+    if: >-
+      vars.FERMES_ENABLE_PUBLISHING == 'true' && inputs.publish_clawhub && github.ref == 'refs/heads/main'
     needs: release
     permissions:
       actions: read
