@@ -6,6 +6,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import signal
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -109,6 +113,219 @@ def _write_test_config(tmp_path: Path) -> Path:
     path = tmp_path / "stage1-synthetic.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return path
+
+
+def _crash_window_child() -> str:
+    """Return the bounded child program used to kill the process at the receipt boundary."""
+    return r"""
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+sys.path.insert(0, str(Path.cwd() / "integrations"))
+
+from agentscope.message import ToolCallBlock
+from agentscope.model import ChatResponse, OpenAIChatModel
+from reme.steps.evolve.auto_memory import AutoMemoryStep
+from hermes_agent import ReMeMemoryProvider
+
+
+day = os.environ["FHM_DAY"]
+workspace = Path(os.environ["FHM_WORKSPACE"])
+hermes_home = Path(os.environ["FHM_HERMES_HOME"])
+marker = os.environ["FHM_MARKER"]
+
+
+async def model_call(_self, _model_name, messages, tools=None, tool_choice=None, **kwargs):
+    del tool_choice, kwargs
+    names = {tool.get("function", {}).get("name") for tool in tools or []}
+    has_result = any(block.type == "tool_result" for message in messages for block in message.content)
+    if "daily_write" in names and not has_result:
+        name = "daily_write"
+        arguments = {
+            "name": "crash-window-fact",
+            "description": "One deterministic crash-window fact.",
+            "content": f"The semantic fact is {marker}.",
+            "date": day,
+        }
+    elif "frontmatter_update" in names and not has_result:
+        name = "frontmatter_update"
+        arguments = {"path": f"daily/{day}/crash-window-fact.md", "metadata": {"crash_replay": True}}
+    else:
+        return ChatResponse(content=[], is_last=True)
+    return ChatResponse(
+        content=[ToolCallBlock(id="crash-window-call", name=name, input=json.dumps(arguments))],
+        is_last=True,
+    )
+
+
+OpenAIChatModel._call_api = model_call
+original_execute = AutoMemoryStep._execute
+
+
+async def crash_after_durable_note(step):
+    result = await original_execute(step)
+    if step.context.response.success and step.context.response.metadata.get("path"):
+        os.kill(os.getpid(), signal.SIGKILL)
+    return result
+
+
+AutoMemoryStep._execute = crash_after_durable_note
+provider = ReMeMemoryProvider()
+provider.initialize("crash-window-session", hermes_home=hermes_home, agent_identity="offline-profile")
+provider.sync_turn(
+    f"Please retain exactly one semantic fact: {marker}.",
+    f"Acknowledged {marker}.",
+)
+note = workspace / "daily" / day / "crash-window-fact.md"
+deadline = time.monotonic() + 45
+while time.monotonic() < deadline:
+    if note.is_file():
+        # The failpoint must terminate the process before this loop can observe
+        # a receipt or an acknowledged Hermes journal record.
+        time.sleep(0.02)
+    else:
+        time.sleep(0.02)
+raise SystemExit("crash-window failpoint was not reached")
+"""
+
+
+def test_sigkill_after_note_before_receipt_replays_same_request_id(tmp_path, monkeypatch):
+    """Crash after durable note write, then replay the same Hermes journal record."""
+    from agentscope.model import OpenAIChatModel
+
+    day = datetime.now(UTC).date().isoformat()
+    config_path = _write_test_config(tmp_path)
+    hermes_home = tmp_path / "hermes-home"
+    workspace = tmp_path / "reme-workspace"
+    hermes_home.mkdir()
+    (hermes_home / "reme").mkdir()
+    (hermes_home / "reme/config.json").write_text(
+        json.dumps(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(workspace),
+                "reme_config": str(config_path),
+                "allow_custom_config": True,
+                # Startup is intentionally bounded but not the prior 5-second race.
+                "request_timeout": 20,
+                "recall_timeout": 5,
+                "health_timeout": 5,
+                "health_retry_seconds": 0.05,
+                "shutdown_timeout": 5,
+                "recall_limit": 5,
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    hermes_pythonpath = f"/srv/project-coordinator/projects/fermes-hermes-memory-v2-fhm007:{Path.cwd()}"
+    if env.get("PYTHONPATH"):
+        hermes_pythonpath += f":{env['PYTHONPATH']}"
+    env["PYTHONPATH"] = hermes_pythonpath
+    env.update(
+        {
+            "FHM_DAY": day,
+            "FHM_HERMES_HOME": str(hermes_home),
+            "FHM_WORKSPACE": str(workspace),
+            "FHM_MARKER": _MARKER,
+        },
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", _crash_window_child()],
+        cwd=Path.cwd(),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        child.wait(timeout=55)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        stdout, stderr = child.communicate(timeout=3)
+        pytest.fail(f"crash child exceeded bounded timeout\nstdout={stdout[-2000:]}\nstderr={stderr[-4000:]}")
+    stdout, stderr = child.communicate(timeout=3)
+
+    assert child.returncode == -signal.SIGKILL, (
+        f"child did not reproduce SIGKILL boundary: returncode={child.returncode}\n"
+        f"stdout={stdout[-2000:]}\nstderr={stderr[-4000:]}"
+    )
+    pending = hermes_home / "reme" / "pending-writes.jsonl"
+    assert pending.is_file() and pending.read_text(encoding="utf-8").strip()
+    pending_record = json.loads(pending.read_text(encoding="utf-8").splitlines()[0])
+    request_id = pending_record["id"]
+    receipt_dir = workspace / "metadata" / "auto_memory_requests"
+    assert not list(receipt_dir.rglob("*.json"))
+    note = workspace / "daily" / day / "crash-window-fact.md"
+    assert note.is_file() and note.read_text(encoding="utf-8").count(_MARKER) == 1
+
+    # Replay the durable Hermes record in fresh provider/Application state.
+    # Only inference remains synthetic; file IO, provenance, receipt, and
+    # journal replay are real.
+    replay_model = _DeterministicModel(day)
+
+    async def replay_call(_self, model_name, messages, tools=None, tool_choice=None, **kwargs):
+        del tool_choice, kwargs
+        names = replay_model._tool_names(tools)
+        replay_model.requests.append({"model": model_name, "tools": names})
+        has_result = any(block.type == "tool_result" for msg in messages for block in msg.content)
+        if "edit" in names and not has_result:
+            repeated = f"The semantic fact is {_MARKER}."
+            return ChatResponse(
+                content=[
+                    ToolCallBlock(
+                        id=f"replay-edit-{len(replay_model.requests)}",
+                        name="edit",
+                        input=json.dumps(
+                            {
+                                "path": f"daily/{day}/crash-window-fact.md",
+                                "old": repeated,
+                                "new": repeated + " " + repeated,
+                            },
+                        ),
+                    ),
+                ],
+                is_last=True,
+            )
+        return ChatResponse(content=[], is_last=True)
+
+    monkeypatch.setattr(OpenAIChatModel, "_call_api", replay_call)
+    restarted = ReMeMemoryProvider()
+    try:
+        restarted.initialize("restarted-session", hermes_home=hermes_home, agent_identity="offline-profile")
+        assert restarted._backend_available, restarted.unavailable_reason()
+        deadline = time.monotonic() + 55
+        while time.monotonic() < deadline:
+            if pending.is_file() and pending.read_text(encoding="utf-8") == "":
+                if list(receipt_dir.rglob("*.json")):
+                    break
+            time.sleep(0.02)
+        assert pending.read_text(encoding="utf-8") == ""
+    finally:
+        restarted.shutdown()
+
+    notes = []
+    for candidate in (workspace / "daily").glob("**/*.md"):
+        saved = frontmatter.loads(candidate.read_text(encoding="utf-8"))
+        if saved.metadata.get("session_id") == scoped_session_id("offline-profile", "crash-window-session"):
+            notes.append(candidate)
+    assert len(notes) == 1
+    assert notes[0].read_text(encoding="utf-8").count(_MARKER) == 1
+
+    receipts = list(receipt_dir.rglob("*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipts[0].name == f"{hashlib.sha256(request_id.encode()).hexdigest()}.json"
+    assert receipt["fingerprint"]
+    assert receipt["response"]["success"] is True
+    assert receipt["response"]["metadata"]["path"] == f"daily/{day}/crash-window-fact.md"
+    assert len(replay_model.requests) >= 1
 
 
 def test_hermes_provider_captures_with_agentscope_and_recalls_after_restart(tmp_path, monkeypatch):
