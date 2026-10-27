@@ -134,6 +134,123 @@ async def test_daily_write_does_not_overwrite_foreign_note(tmp_path, monkeypatch
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_daily_write_rejects_conflicting_existing_owner_fields(tmp_path, monkeypatch):
+    """A matching source link cannot override a conflicting session owner."""
+    monkeypatch.chdir(tmp_path)
+    _seed_source(tmp_path)
+    foreign = tmp_path / "daily/2026-10-27/note.md"
+    foreign.parent.mkdir(parents=True)
+    original = f"---\nsession_id: foreign\nsource_conversation: '[[session/dialog/{SESSION}.jsonl]]'\n---\nprotected\n"
+    foreign.write_text(original, encoding="utf-8")
+    store = await _store()
+    app_context = ApplicationContext(workspace_dir=str(tmp_path))
+    app_context.components[ComponentEnum.FILE_STORE] = {"default": store}
+
+    step = DailyWriteStep(app_context=app_context)
+    await step(
+        name="note",
+        description="updated",
+        session_id=SESSION,
+        content="model content",
+        date="2026-10-27",
+    )
+
+    assert step.context.response.success is False
+    assert "different source session" in step.context.response.answer
+    assert foreign.read_text(encoding="utf-8") == original
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_owner",
+    [
+        f"session_id: {SESSION}",
+        f"source_conversation: '[[session/dialog/{SESSION}.jsonl]]'",
+    ],
+)
+async def test_daily_write_accepts_matching_one_field_legacy_note(tmp_path, monkeypatch, legacy_owner):
+    """Historical notes with one matching owner field remain writable."""
+    monkeypatch.chdir(tmp_path)
+    _seed_source(tmp_path)
+    note = tmp_path / "daily/2026-10-27/note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(f"---\n{legacy_owner}\n---\nold content\n", encoding="utf-8")
+    store = await _store()
+    app_context = ApplicationContext(workspace_dir=str(tmp_path))
+    app_context.components[ComponentEnum.FILE_STORE] = {"default": store}
+
+    step = DailyWriteStep(app_context=app_context)
+    await step(
+        name="note",
+        description="updated",
+        session_id=SESSION,
+        content="new content",
+        date="2026-10-27",
+    )
+
+    assert step.context.response.success is True
+    assert frontmatter.loads(note.read_text(encoding="utf-8")).content.strip() == "new content"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_write_does_not_claim_unowned_note(tmp_path, monkeypatch):
+    """A note without either owner field is not implicitly claimed."""
+    monkeypatch.chdir(tmp_path)
+    _seed_source(tmp_path)
+    note = tmp_path / "daily/2026-10-27/note.md"
+    note.parent.mkdir(parents=True)
+    original = "---\nname: historical\n---\nprotected\n"
+    note.write_text(original, encoding="utf-8")
+    store = await _store()
+    app_context = ApplicationContext(workspace_dir=str(tmp_path))
+    app_context.components[ComponentEnum.FILE_STORE] = {"default": store}
+
+    step = DailyWriteStep(app_context=app_context)
+    await step(
+        name="note",
+        description="updated",
+        session_id=SESSION,
+        content="model content",
+        date="2026-10-27",
+    )
+
+    assert step.context.response.success is False
+    assert "different source session" in step.context.response.answer
+    assert note.read_text(encoding="utf-8") == original
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_write_rejects_malformed_existing_frontmatter(tmp_path, monkeypatch):
+    """Malformed frontmatter cannot be treated as an unowned writable note."""
+    monkeypatch.chdir(tmp_path)
+    _seed_source(tmp_path)
+    note = tmp_path / "daily/2026-10-27/note.md"
+    note.parent.mkdir(parents=True)
+    original = "---\nowner: [\n---\nprotected\n"
+    note.write_text(original, encoding="utf-8")
+    store = await _store()
+    app_context = ApplicationContext(workspace_dir=str(tmp_path))
+    app_context.components[ComponentEnum.FILE_STORE] = {"default": store}
+
+    step = DailyWriteStep(app_context=app_context)
+    await step(
+        name="note",
+        description="updated",
+        session_id=SESSION,
+        content="model content",
+        date="2026-10-27",
+    )
+
+    assert step.context.response.success is False
+    assert "cannot be verified" in step.context.response.answer
+    assert note.read_text(encoding="utf-8") == original
+    await store.close()
+
+
 def test_verify_detects_transcript_changes_and_note_metadata_spoof(tmp_path):
     from reme.steps.file_io._provenance import verify_note_provenance
 
