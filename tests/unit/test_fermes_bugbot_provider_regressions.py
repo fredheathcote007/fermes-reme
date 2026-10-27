@@ -52,16 +52,17 @@ except ImportError:
     sys.modules["agent"] = agent_module
     sys.modules["agent.memory_provider"] = memory_provider_module
 
-# These imports follow the optional Hermes dependency bootstrap above, so Pylint's top-level import
-# ordering rule does not describe the test's actual import contract.
+# These imports follow the optional Hermes dependency and repository plugin-path bootstrap above, so
+# their execution order is part of the test contract. Keep the E402 suppressions local to these two
+# imports; moving them before bootstrap would weaken the loading regression coverage.
 # pylint: disable=wrong-import-position
-from hermes_agent import (
+from hermes_agent import (  # noqa: E402
     _WORKSPACE_OWNER_TEMP_PREFIX,
     ReMeMemoryProvider,
     _ProfileWriterLock,
     _WorkspaceOwnerMarker,
 )
-from hermes_agent.config import ReMeConfig
+from hermes_agent.config import ReMeConfig  # noqa: E402
 
 # pylint: enable=wrong-import-position
 
