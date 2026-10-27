@@ -62,9 +62,12 @@ def _fsync_directory(path: Path) -> None:
         # The file itself is flushed before publication; never substitute an
         # unsafe rename when directory metadata cannot be flushed.
         return
+    fsync = getattr(os, "fsync", None)
+    if fsync is None:
+        raise OSError("directory fsync is unsupported")
     fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        fsync(fd)
     finally:
         os.close(fd)
 
@@ -75,13 +78,65 @@ def _is_windows_platform() -> bool:
 
 
 def _safe_staging_mode(mode: int) -> bool:
-    """Accept only private staging modes, including Windows' reduced mode semantics."""
+    """Accept only private marker modes, including Windows' reduced mode semantics."""
     mode_bits = stat.S_IMODE(mode)
     if not _is_windows_platform():
         return mode_bits == 0o600
     # Windows may report the mkstemp file as normal/read-only (0666/0444),
-    # while 0600 is also produced by Python builds that honor fchmod.
+    # while 0600 is also produced by Python builds that expose POSIX modes.
     return mode_bits in {0o444, 0o600, 0o666}
+
+
+def _set_private_file_mode(path: Path, fd: int) -> None:
+    """Apply the strongest portable private-file mode for the current platform."""
+    if _is_windows_platform():
+        chmod = getattr(os, "chmod", None)
+        if chmod is None:
+            raise OSError("private file mode is unsupported on Windows")
+        try:
+            # Windows chmod only controls its read-only attribute.  The file
+            # came from mkstemp or an exclusive open, so do not silently skip
+            # this operation when a compatible stdlib implementation is absent.
+            chmod(path, stat.S_IREAD | stat.S_IWRITE, follow_symlinks=False)
+        except (NotImplementedError, OSError, TypeError) as exc:
+            raise OSError("private file mode is unsupported on Windows") from exc
+        return
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        raise OSError("private file mode is unsupported")
+    try:
+        fchmod(fd, 0o600)
+    except (NotImplementedError, OSError) as exc:
+        raise OSError("private file mode could not be applied") from exc
+
+
+def _fsync_file(fd: int) -> None:
+    """Flush an open file or fail closed when file durability is unavailable."""
+    fsync = getattr(os, "fsync", None)
+    if fsync is None:
+        raise OSError("file fsync is unsupported")
+    fsync(fd)
+
+
+def _is_reparse_point(path: Path, file_stat: os.stat_result) -> bool:
+    """Detect Windows reparse points even on Python versions without is_junction."""
+    if not _is_windows_platform():
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(file_stat, "st_file_attributes", 0) & reparse_flag:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is None:
+        return False
+    try:
+        return bool(is_junction())
+    except OSError:
+        return True
+
+
+def _is_unsafe_link(path: Path, file_stat: os.stat_result) -> bool:
+    """Return whether a path entry is a symlink or Windows reparse point."""
+    return stat.S_ISLNK(file_stat.st_mode) or _is_reparse_point(path, file_stat)
 
 
 class _ProfileWriterLock:
@@ -110,7 +165,7 @@ class _ProfileWriterLock:
                 flags |= os.O_NOFOLLOW
             fd = os.open(self.path, flags, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                _set_private_file_mode(self.path, fd)
                 if fcntl is not None:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 elif msvcrt is not None:
@@ -169,8 +224,11 @@ class _WorkspaceOwnerMarker:
         for part in path.parts[1:]:
             current /= part
             try:
-                if current.is_symlink():
+                current_stat = current.lstat()
+                if _is_unsafe_link(current, current_stat):
                     raise OSError("unsafe workspace path")
+            except FileNotFoundError:
+                continue
             except OSError as exc:
                 if str(exc) == "unsafe workspace path":
                     raise
@@ -197,7 +255,7 @@ class _WorkspaceOwnerMarker:
             raise OSError("workspace owner marker could not be inspected") from exc
         if stat.S_ISLNK(marker_stat.st_mode) or not stat.S_ISREG(marker_stat.st_mode):
             raise OSError("workspace owner marker is not a regular file")
-        if marker_stat.st_mode & 0o077 or not marker_stat.st_mode & 0o400:
+        if _is_unsafe_link(self.path, marker_stat) or not _safe_staging_mode(marker_stat.st_mode):
             raise OSError("workspace owner marker is not private")
 
         flags = os.O_RDONLY
@@ -209,8 +267,14 @@ class _WorkspaceOwnerMarker:
             raise OSError("workspace owner marker could not be opened") from exc
         try:
             current_stat = os.fstat(fd)
-            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISREG(current_stat.st_mode):
-                raise OSError("workspace owner marker is not a regular file")
+            if (
+                _is_unsafe_link(self.path, current_stat)
+                or not stat.S_ISREG(current_stat.st_mode)
+                or not _safe_staging_mode(current_stat.st_mode)
+                or current_stat.st_dev != marker_stat.st_dev
+                or current_stat.st_ino != marker_stat.st_ino
+            ):
+                raise OSError("workspace owner marker is ambiguous")
             raw = os.read(fd, 4097)
         finally:
             os.close(fd)
@@ -264,17 +328,17 @@ class _WorkspaceOwnerMarker:
                 dir=self.workspace,
             )
             try:
-                os.fchmod(fd, 0o600)
+                _set_private_file_mode(Path(temp_name), fd)
                 with os.fdopen(fd, "wb") as handle:
                     fd = -1
                     handle.write(encoded)
                     handle.flush()
-                    os.fsync(handle.fileno())
+                    _fsync_file(handle.fileno())
             finally:
                 if fd >= 0:
                     os.close(fd)
             try:
-                os.link(temp_name, self.path)
+                os.link(temp_name, self.path, follow_symlinks=False)
             except FileExistsError:
                 self._read_existing()
                 self._owned = True
@@ -314,7 +378,7 @@ class _WorkspaceOwnerMarker:
             # Keep every fail-closed identity check explicit; these checks jointly prove that
             # the staging file is safe to remove after an interrupted marker publish.
             if (  # pylint: disable=too-many-boolean-expressions
-                stat.S_ISLNK(entry_stat.st_mode)
+                _is_unsafe_link(entry, entry_stat)
                 or not stat.S_ISREG(entry_stat.st_mode)
                 or not _safe_staging_mode(entry_stat.st_mode)
                 or entry_stat.st_nlink != 1
@@ -331,7 +395,9 @@ class _WorkspaceOwnerMarker:
             try:
                 opened_stat = os.fstat(fd)
                 if (
-                    opened_stat.st_dev != entry_stat.st_dev
+                    _is_unsafe_link(entry, opened_stat)
+                    or not stat.S_ISREG(opened_stat.st_mode)
+                    or opened_stat.st_dev != entry_stat.st_dev
                     or opened_stat.st_ino != entry_stat.st_ino
                     or opened_stat.st_size != len(encoded)
                 ):
@@ -972,14 +1038,14 @@ class ReMeMemoryProvider(MemoryProvider):
                 flags |= os.O_NOFOLLOW
             fd = os.open(path, flags, 0o600)
             try:
-                os.fchmod(fd, 0o600)
+                _set_private_file_mode(path, fd)
                 with os.fdopen(fd, "a", encoding="utf-8") as handle:
                     fd = -1
                     handle.write(
                         json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
                     )
                     handle.flush()
-                    os.fsync(handle.fileno())
+                    _fsync_file(handle.fileno())
             finally:
                 if fd >= 0:
                     os.close(fd)
@@ -1057,7 +1123,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     with os.fdopen(fd, "w", encoding="utf-8") as handle:
                         handle.writelines(kept)
                         handle.flush()
-                        os.fsync(handle.fileno())
+                        _fsync_file(handle.fileno())
                     os.chmod(temp_name, 0o600)
                     os.replace(temp_name, path)
                     _fsync_directory(path.parent)

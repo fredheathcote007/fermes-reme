@@ -56,6 +56,7 @@ except ImportError:
 # their execution order is part of the test contract. Keep the E402 suppressions local to these two
 # imports; moving them before bootstrap would weaken the loading regression coverage.
 # pylint: disable=wrong-import-position
+import hermes_agent  # noqa: E402
 from hermes_agent import (  # noqa: E402
     _WORKSPACE_OWNER_TEMP_PREFIX,
     ReMeMemoryProvider,
@@ -322,6 +323,57 @@ def test_owner_marker_failure_does_not_publish_partial_final_file(monkeypatch, t
     assert not list(workspace.iterdir())
 
 
+def test_owner_marker_windows_mode_path_without_fchmod(monkeypatch, tmp_path):
+    """Windows mode handling uses chmod and still flushes the marker before publication."""
+
+    class OsWithoutFchmod:
+        """Proxy only this module's os binding without mutating pytest's global os module."""
+
+        def __init__(self, real_os):
+            self._real_os = real_os
+            self.chmod_calls = []
+            self.fsync_calls = []
+
+        def __getattr__(self, name):
+            if name == "fchmod":
+                raise AttributeError(name)
+            return getattr(self._real_os, name)
+
+        def chmod(self, path, mode, *, follow_symlinks=True):
+            """Record the simulated Windows chmod call and apply it on POSIX."""
+            self.chmod_calls.append((path, mode, follow_symlinks))
+            # Linux is only simulating the Windows mode API here; its chmod
+            # implementation does not support follow_symlinks=False.
+            return self._real_os.chmod(path, mode)
+
+        def fsync(self, fd):
+            """Record and forward the marker file flush."""
+            self.fsync_calls.append(fd)
+            return self._real_os.fsync(fd)
+
+    compat_os = OsWithoutFchmod(os)
+    monkeypatch.setattr(hermes_agent, "os", compat_os)
+    monkeypatch.setattr(hermes_agent, "_is_windows_platform", lambda: True)
+
+    workspace = tmp_path / "workspace"
+    profile = tmp_path / "profile"
+    marker = _WorkspaceOwnerMarker(workspace, profile)
+    marker.acquire()
+
+    assert not hasattr(compat_os, "fchmod")
+    assert len(compat_os.chmod_calls) == 1
+    assert compat_os.chmod_calls[0][1:] == (0o600, False)
+    # One flush protects the marker bytes and one protects its POSIX directory entry
+    # in this deterministic Linux simulation. The native Windows path still flushes bytes.
+    assert len(compat_os.fsync_calls) >= 2
+    assert marker.path.is_file()
+
+    reopened = _WorkspaceOwnerMarker(workspace, profile)
+    reopened.acquire()
+    reopened.release()
+    marker.release()
+
+
 def test_owner_marker_recovers_verified_crash_staging_file(tmp_path):
     """A valid private marker staging file is safe to remove and republish."""
     workspace = tmp_path / "workspace"
@@ -352,6 +404,9 @@ def test_owner_marker_recovers_verified_crash_staging_file(tmp_path):
 
     assert not staging.exists()
     assert marker.path.is_file()
+    reopened = _WorkspaceOwnerMarker(workspace, profile)
+    reopened.acquire()
+    reopened.release()
     marker.release()
 
 
@@ -443,6 +498,9 @@ def test_owner_marker_native_windows_staging_recovery(tmp_path):
 
     assert not staging.exists()
     assert marker.path.is_file()
+    reopened = _WorkspaceOwnerMarker(workspace, profile)
+    reopened.acquire()
+    reopened.release()
     marker.release()
 
     corrupt_workspace = tmp_path / "corrupt-workspace"
