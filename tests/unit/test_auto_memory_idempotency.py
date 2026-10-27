@@ -13,9 +13,19 @@ import pytest
 from agentscope.message import Msg
 
 from reme.application import Application
+from reme.components.agent_wrapper.base_agent_wrapper import BaseAgentWrapper
 from reme.components.prompt_handler import PromptHandler
 from reme.components.runtime_context import RuntimeContext
 from reme.steps.evolve.auto_memory import AutoMemoryStep
+
+
+class _SecurityTestWrapper(BaseAgentWrapper):
+    async def reply(self, _inputs, **_kwargs):
+        pytest.fail("protected validation must happen before a model call")
+
+
+class _AutoMemorySubclass(AutoMemoryStep):
+    pass
 
 
 def _step(tmp_path, request_id="batch-1", **kwargs):
@@ -221,6 +231,71 @@ async def test_protected_auto_memory_rejects_missing_identity_before_legacy_mode
 
     assert not step.context.response.success
     assert diagnostic in step.context.response.answer
+    assert not calls
+    assert not list(tmp_path.rglob("*.md"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step_class", "backend"),
+    [(AutoMemoryStep, "not-agentscope"), (_AutoMemorySubclass, "agentscope")],
+)
+async def test_protected_auto_memory_rejects_unsupported_wrapper_or_subclass_before_execute(
+    tmp_path,
+    monkeypatch,
+    step_class,
+    backend,
+):
+    wrapper = _SecurityTestWrapper(backend=backend)
+    step = step_class(
+        agent_wrapper=wrapper,
+        durable_commit=True,
+        agent_scope="test-scope",
+    )
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.context = RuntimeContext(
+        request_id="unsupported-protected-request",
+        session_id="protected-session",
+        messages=[{"id": "m1", "content": "fact"}],
+        date="2026-10-21",
+    )
+    calls = []
+
+    async def unexpected_execute():
+        calls.append("execute")
+
+    monkeypatch.setattr(step, "_execute", unexpected_execute)
+    await step.execute()
+
+    assert not step.context.response.success
+    assert "exact AgentScope AutoMemoryStep" in step.context.response.answer
+    assert not calls
+    assert not list(tmp_path.rglob("*.md"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable_commit", [1, "true", "yes"])
+async def test_malformed_durable_commit_is_rejected_before_execute(tmp_path, monkeypatch, durable_commit):
+    step = AutoMemoryStep(durable_commit=durable_commit, agent_scope="test-scope")
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.context = RuntimeContext(
+        request_id="malformed-durable-request",
+        session_id="protected-session",
+        messages=[{"id": "m1", "content": "fact"}],
+        date="2026-10-21",
+    )
+    calls = []
+
+    async def unexpected_execute():
+        calls.append("execute")
+
+    monkeypatch.setattr(step, "_execute", unexpected_execute)
+    await step.execute()
+
+    assert not step.context.response.success
+    assert "durable_commit must be a boolean" in step.context.response.answer
     assert not calls
     assert not list(tmp_path.rglob("*.md"))
     assert not list(tmp_path.rglob("*.json"))

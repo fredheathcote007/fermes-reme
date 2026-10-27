@@ -1216,14 +1216,23 @@ def test_retried_spool_record_reuses_record_id_after_ack_failure(monkeypatch, tm
 
 
 def test_embedded_reme_receipt_covers_success_before_spool_ack_crash_window(monkeypatch, tmp_path):
+    import yaml
+
     from reme.steps.evolve.auto_memory import AutoMemoryStep
 
     calls = []
     stage_config = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    # This is deliberately a legacy receipt/ACK test. Use a disposable
+    # unprotected job config rather than silently downgrading protected Option B.
+    legacy_config = yaml.safe_load(stage_config.read_text(encoding="utf-8"))
+    legacy_config["jobs"]["auto_memory"]["steps"][0]["durable_commit"] = False
+    legacy_config_path = tmp_path / "legacy-memory-stage1.yaml"
+    legacy_config_path.write_text(yaml.safe_dump(legacy_config, sort_keys=False), encoding="utf-8")
     config = ReMeConfig(
         mode="embedded",
         workspace_dir=str(tmp_path / "workspace"),
-        reme_config=str(stage_config),
+        reme_config=str(legacy_config_path),
+        allow_custom_config=True,
         request_timeout=5,
         recall_timeout=1,
         health_timeout=1,

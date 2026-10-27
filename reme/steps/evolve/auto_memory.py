@@ -315,7 +315,7 @@ class AutoMemoryStep(BaseStep):
     def _option_b_enabled(self) -> bool:
         """Return whether this invocation is the explicitly opted-in protected flow."""
         return (
-            bool(self.kwargs.get("durable_commit"))
+            self.kwargs.get("durable_commit") is True
             and self._provenance_enabled()
             and isinstance(
                 self.context.get("request_id") if self.context is not None else None,
@@ -1276,7 +1276,12 @@ class AutoMemoryStep(BaseStep):
         """Replay completed request IDs without repeating the memory agent."""
         assert self.context is not None
         request_id = self.context.get("request_id")
-        protected_requested = bool(self.kwargs.get("durable_commit"))
+        durable_commit = self.kwargs.get("durable_commit", False)
+        if type(durable_commit) is not bool:
+            self.context.response.success = False
+            self.context.response.answer = "Error: durable_commit must be a boolean"
+            return
+        protected_requested = durable_commit is True
         if request_id is None:
             if protected_requested:
                 self.context.response.success = False
@@ -1293,6 +1298,12 @@ class AutoMemoryStep(BaseStep):
             except ValueError as exc:
                 self.context.response.success = False
                 self.context.response.answer = f"Error: {exc}"
+                return
+            if not self._option_b_enabled():
+                self.context.response.success = False
+                self.context.response.answer = (
+                    "Error: protected memory commit requires the exact AgentScope AutoMemoryStep implementation"
+                )
                 return
 
         payload = {
