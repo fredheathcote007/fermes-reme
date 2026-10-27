@@ -451,7 +451,7 @@ async def test_default_job_still_passes_memory_changes_to_auto_tag(setup, monkey
             {
                 "session_id": _SESSION,
                 "source_conversation": f"[[session/dialog/{_SESSION}.jsonl]]",
-            }
+            },
         )
         target.write_text(frontmatter.dumps(post), encoding="utf-8")
         return {

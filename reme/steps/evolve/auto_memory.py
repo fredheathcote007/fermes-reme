@@ -651,7 +651,7 @@ class AutoMemoryStep(BaseStep):
                 )
                 temporary.replace(path)
 
-    # pylint: disable=too-many-return-statements
+    # pylint: disable=too-many-return-statements,too-many-statements
     async def _execute(self):
         assert self.context is not None
         self.context["changes"] = []

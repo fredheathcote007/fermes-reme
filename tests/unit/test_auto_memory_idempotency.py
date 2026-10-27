@@ -452,7 +452,6 @@ async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeyp
 
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
-    from reme.steps.evolve.auto_memory import AutoMemoryStep
 
     workspace = tmp_path / "workspace"
     note_path = "daily/2026-10-21/existing.md"
@@ -510,7 +509,6 @@ async def test_auto_memory_repair_cannot_claim_foreign_session_note(tmp_path, mo
 
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
-    from reme.steps.evolve.auto_memory import AutoMemoryStep
 
     workspace = tmp_path / "workspace"
     note_path = "daily/2026-10-21/existing.md"

@@ -42,7 +42,7 @@ class DailyWriteStep(_FileIOStep):
             return None
         return name, description, session_id, content
 
-    def _metadata(self, session_id: str, provenance: dict) -> dict:
+    def _metadata(self, provenance: dict) -> dict:
         assert self.context is not None
         metadata_raw = self.context.get("metadata")
         metadata = {}
@@ -58,6 +58,7 @@ class DailyWriteStep(_FileIOStep):
         # ``write`` takes name/description as explicit parameters, not metadata.
         return metadata
 
+    # pylint: disable=too-many-return-statements
     async def execute(self):
         assert self.context is not None
         collected = self._collect_required()
@@ -116,7 +117,7 @@ class DailyWriteStep(_FileIOStep):
             name=name,
             description=description,
             content=content,
-            metadata=self._metadata(session_id, provenance),
+            metadata=self._metadata(provenance),
             _provenance_session_id=trusted_session,
         )
         write_response = write_responses[0]

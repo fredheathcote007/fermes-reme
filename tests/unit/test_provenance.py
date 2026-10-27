@@ -1,5 +1,8 @@
 """Focused tests for server-owned daily-note provenance."""
 
+# These tests intentionally exercise private trust-boundary contracts.
+# pylint: disable=missing-function-docstring,protected-access
+
 import hashlib
 from pathlib import Path
 

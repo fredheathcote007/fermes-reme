@@ -219,7 +219,7 @@ async def test_auto_memory_update_scopes_tools_to_exact_note_path(tmp_path, monk
     monkeypatch.setattr(step, "_list_session_note", existing_note)
     monkeypatch.setattr("reme.steps.evolve.auto_memory.refresh_day_index", no_index)
 
-    async def stamp_source(path, scope, image_sources):
+    async def stamp_source(_path, _scope, _image_sources):
         import frontmatter
         from reme.steps.file_io._provenance import trusted_provenance
 

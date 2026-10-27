@@ -91,8 +91,6 @@ def _read_exact_bytes(path: Path) -> bytes:
                 break
             chunks.append(chunk)
         return b"".join(chunks)
-    except ProvenanceError:
-        raise
     except OSError as exc:
         raise ProvenanceError("session transcript is not a readable regular file") from exc
     finally:
