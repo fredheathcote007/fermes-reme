@@ -1110,14 +1110,14 @@ def test_interrupted_inflight_write_keeps_spool_record(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process wait-status semantics")
-def test_sigkill_after_backend_accept_before_spool_ack_replays_record(monkeypatch, tmp_path):
+def test_sigkill_during_backend_execution_replays_record(monkeypatch, tmp_path):
     ready_read, ready_write = os.pipe()
     recovered = _FakeBackend()
 
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: recovered)
 
-    child_code = r'''
+    child_code = r"""
 import importlib.util
 import os
 import signal
@@ -1156,33 +1156,49 @@ provider.initialize("crashed-session", hermes_home=hermes_home, agent_identity="
 provider.sync_turn("crashed user", "assistant")
 time.sleep(3)
 os._exit(124)
-'''
+"""
 
     child = None
     try:
-        child = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                child_code,
-                str(Path(__file__).resolve()),
-                str(ready_write),
-                str(tmp_path),
-            ],
-            cwd=str(Path(__file__).resolve().parents[2]),
-            pass_fds=(ready_write,),
-        )
-    finally:
-        os.close(ready_write)
+        try:
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    child_code,
+                    str(Path(__file__).resolve()),
+                    str(ready_write),
+                    str(tmp_path),
+                ],
+                cwd=str(Path(__file__).resolve().parents[2]),
+                pass_fds=(ready_write,),
+            )
+        finally:
+            os.close(ready_write)
 
-    try:
         readable, _, _ = select.select([ready_read], [], [], 3)
         if not readable:
-            os.kill(child.pid, signal.SIGKILL)
+            child.kill()
         ready = os.read(ready_read, 1) if readable else b""
         _, status = os.waitpid(child.pid, 0)
         if not readable:
             pytest.fail("crash child did not reach the backend before its deadline")
+    except BaseException:
+        if child is not None:
+            try:
+                child_live = child.poll() is None
+            except BaseException:
+                child_live = True
+            if child_live:
+                try:
+                    child.kill()
+                except BaseException:
+                    pass
+            try:
+                child.wait()
+            except BaseException:
+                pass
+        raise
     finally:
         os.close(ready_read)
 
