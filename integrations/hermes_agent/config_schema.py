@@ -59,7 +59,10 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             label="ReMe configuration",
             kind=KIND_TEXT,
             default="fermes-hermes-stage1",
-            description="Embedded mode defaults to restricted local-only Fermes Stage 1. Custom configurations require explicit advanced opt-in.",
+            description=(
+                "Embedded mode defaults to restricted local-only Fermes Stage 1. "
+                "Custom configurations require explicit advanced opt-in."
+            ),
             group="Embedded",
         ),
         ProviderField(
