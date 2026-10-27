@@ -6,13 +6,28 @@ import json
 import socket
 import urllib.error
 import urllib.request
-
 from typing import Any
 from urllib.parse import urlsplit
 
 
 class ReMeServiceError(RuntimeError):
     """Raised when a ReMe action cannot be completed successfully."""
+
+
+def _failure_detail(result: dict[str, Any]) -> str:
+    """Return trusted detail from a failed response without exposing arbitrary fields."""
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        return error
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+
+    answer = result.get("answer")
+    if answer:
+        return str(answer)
+    return "ReMe action did not report success"
 
 
 def normalize_http_endpoint(endpoint: str) -> str:
@@ -76,9 +91,7 @@ class ReMeHttpClient:
         if not isinstance(result, dict):
             raise ReMeServiceError("ReMe returned a non-object response")
         if result.get("success") is not True:
-            raise ReMeServiceError(
-                str(result.get("answer") or "ReMe action did not report success"),
-            )
+            raise ReMeServiceError(_failure_detail(result))
         return result
 
     def health(self, *, timeout: float) -> dict[str, Any]:

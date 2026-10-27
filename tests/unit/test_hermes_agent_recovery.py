@@ -12,7 +12,6 @@ import subprocess
 import sys
 import threading
 import time
-
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -31,11 +30,24 @@ from .test_hermes_agent_integration import (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known gap: error-only ReMe envelopes lose their error detail at the transport boundary",
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ({"success": False, "error": "memory extraction exploded"}, "memory extraction exploded"),
+        (
+            {"success": False, "error": {"message": "memory extraction exploded"}},
+            "memory extraction exploded",
+        ),
+        ({"success": False, "error": {}}, "ReMe action did not report success"),
+        ({"success": False, "error": ""}, "ReMe action did not report success"),
+        (
+            {"success": False, "error": {"secret": "must not leak"}},
+            "ReMe action did not report success",
+        ),
+        ({"status": "error"}, "ReMe action did not report success"),
+    ],
 )
-def test_http_client_propagates_error_only_result_detail(monkeypatch):
+def test_http_client_propagates_error_only_result_detail(monkeypatch, response, message):
     class ErrorResponse:
         def __enter__(self):
             return self
@@ -45,12 +57,13 @@ def test_http_client_propagates_error_only_result_detail(monkeypatch):
 
         @staticmethod
         def read():
-            return json.dumps({"success": False, "error": "memory extraction exploded"}).encode()
+            return json.dumps(response).encode()
 
     monkeypatch.setattr(CLIENT_MODULE.urllib.request, "urlopen", lambda *args, **kwargs: ErrorResponse())
 
-    with pytest.raises(ReMeServiceError, match="memory extraction exploded"):
+    with pytest.raises(ReMeServiceError, match=message) as exc_info:
         ReMeHttpClient("http://127.0.0.1:2333", timeout=1).call("auto_memory")
+    assert "must not leak" not in str(exc_info.value)
 
 
 def test_interrupted_inflight_write_keeps_spool_record(monkeypatch, tmp_path):
