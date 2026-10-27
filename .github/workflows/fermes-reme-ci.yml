@@ -10,6 +10,9 @@ on:
       - "reme/components/agent_wrapper/as_agent_wrapper.py"
       - "reme/components/as_llm/**"
       - "reme/steps/evolve/auto_memory.py"
+      - "reme/steps/file_io/**"
+      - "tests/unit/test_provenance.py"
+      - "tests/unit/test_auto_memory_direct_images.py"
       - "tests/unit/test_hermes_agent_integration.py"
       - "tests/unit/test_auto_memory_idempotency.py"
       - "tests/unit/test_fermes_capture_integration.py"
@@ -65,5 +68,5 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}
         run: |
           python -m compileall -q integrations/hermes_agent
-          python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_hermes_agent_integration.py tests/unit/test_auto_memory_idempotency.py tests/unit/test_fermes_capture_integration.py
+          python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_hermes_agent_integration.py tests/unit/test_auto_memory_idempotency.py tests/unit/test_fermes_capture_integration.py tests/unit/test_provenance.py
           python -m pytest -p no:cacheprovider -q --maxfail=1 tests/unit/test_as_llm_lazy.py tests/unit/test_base_agent_wrapper.py tests/unit/test_injected_job_kwargs.py::test_agentscope_memory_create_injects_session_ownership tests/unit/test_injected_job_kwargs.py::test_agentscope_memory_update_does_not_ack_failed_edit

@@ -54,7 +54,10 @@ jobs:
         request_id: {type: string}
         messages: {type: array, items: {type: object}}
         session_id: {type: string, default: ""}
-        memory_hint: {type: string}
+        memory_hint:
+          type: string
+          description: >-
+            optional explicit retention hint; nonblank AgentScope hints require attributable durable evidence
         include_images: {type: boolean, default: false}
         date: {type: string, default: ""}
       required: [messages]

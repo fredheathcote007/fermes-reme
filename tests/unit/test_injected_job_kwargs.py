@@ -193,7 +193,7 @@ async def test_auto_memory_create_uses_model_supplied_date_and_daily_write(tmp_p
 
     assert step.context.response.success is True
     assert wrapper.calls[0]["job_tools"] == ["daily_write"]
-    assert "injected_job_kwargs" not in wrapper.calls[0]
+    assert wrapper.calls[0]["injected_job_kwargs"] == {"_provenance_session_id": "sess-1"}
 
 
 @pytest.mark.asyncio
@@ -219,6 +219,16 @@ async def test_auto_memory_update_scopes_tools_to_exact_note_path(tmp_path, monk
     monkeypatch.setattr(step, "_list_session_note", existing_note)
     monkeypatch.setattr("reme.steps.evolve.auto_memory.refresh_day_index", no_index)
 
+    async def stamp_source(path, scope, image_sources):
+        import frontmatter
+        from reme.steps.file_io._provenance import trusted_provenance
+
+        post = frontmatter.loads(note_file.read_text(encoding="utf-8"))
+        post.metadata.update(trusted_provenance(tmp_path, "session", session_id))
+        note_file.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    monkeypatch.setattr(step, "_ensure_session_frontmatter", stamp_source)
+
     await step(
         session_id=session_id,
         messages=[{"name": "user", "role": "user", "content": "hi again", "created_at": "2025-06-01T11:00:00"}],
@@ -226,7 +236,10 @@ async def test_auto_memory_update_scopes_tools_to_exact_note_path(tmp_path, monk
 
     assert step.context.response.success is True
     assert wrapper.calls[0]["job_tools"] == ["read", "edit", "frontmatter_update", "write"]
-    assert wrapper.calls[0]["injected_job_kwargs"] == {"_allowed_paths": [note_path]}
+    assert wrapper.calls[0]["injected_job_kwargs"] == {
+        "_allowed_paths": [note_path],
+        "_provenance_session_id": session_id,
+    }
 
 
 def test_auto_memory_keeps_original_tool_names():

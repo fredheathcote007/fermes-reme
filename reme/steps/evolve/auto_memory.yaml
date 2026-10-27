@@ -73,6 +73,8 @@ user_message_create: |
 
   ## Step 1 — Skip Check
 
+  If `Extra hint` is nonempty, it is an explicit retention obligation: do not take the skip path; include the hint in the note and call `daily_write`.
+
   Did the conversation produce substantive information worth long-term memory? Pure greetings or small talk → reply with a brief skip message and stop (do not call any tools).
 
   When truly ambiguous, default to writing — losing a memory is worse than writing one extra note.
@@ -108,6 +110,8 @@ user_message_create_zh: |
   将上述对话中的核心信息记录到一条新的日记记忆中。
 
   ## 步骤 1 — 跳过检查
+
+  如果“额外提示”非空，它就是明确的保留义务：不要跳过；将提示包含在记忆中并调用 `daily_write`。
 
   对话是否产生了值得长期记忆的实质性信息？纯粹的寒暄或闲聊 → 回复一条简短的跳过消息并停止（不调用任何工具）。
 
@@ -145,6 +149,8 @@ user_message_update: |
   Merge key information from the conversation above into the existing daily note at the target path.
 
   ## Step 1 — Skip Check
+
+  If `Extra hint` is nonempty, it is an explicit retention obligation: do not take the skip path; inspect and update the target note as needed.
 
   Did the conversation produce substantive information worth long-term memory? Pure greetings or small talk → reply with a brief skip message and stop (do not call any tools).
 
@@ -204,6 +210,8 @@ user_message_update_zh: |
   将上述对话中的核心信息合并到目标路径的已有日记中。
 
   ## 步骤 1 — 跳过检查
+
+  如果“额外提示”非空，它就是明确的保留义务：不要跳过；根据需要检查并更新目标笔记。
 
   对话是否产生了值得长期记忆的实质性信息？纯粹的寒暄或闲聊 → 回复一条简短的跳过消息并停止（不调用任何工具）。
 

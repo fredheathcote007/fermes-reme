@@ -192,7 +192,8 @@ jobs:
           default: ""
         memory_hint:
           type: string
-          description: "optional hint"
+          description: >-
+            optional explicit retention hint; nonblank AgentScope hints require attributable durable evidence
         include_images:
           type: boolean
           description: "Use session images with a vision-capable AgentScope model; save Base64 originals and cite sources"

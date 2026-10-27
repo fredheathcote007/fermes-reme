@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import UTC, datetime
@@ -166,7 +167,11 @@ def test_hermes_provider_captures_with_agentscope_and_recalls_after_restart(tmp_
         assert _MARKER in note.read_text(encoding="utf-8")
         assert saved.metadata["session_id"] == scoped
         assert saved.metadata["source_conversation"] == f"[[session/dialog/{scoped}.jsonl]]"
-        assert "source_hash" not in saved.metadata
+        assert saved.metadata["source_hash"] == {
+            "algorithm": "sha256",
+            "format": "hex",
+            "value": hashlib.sha256(transcript.read_bytes()).hexdigest(),
+        }
         assert transcript.is_file()
         assert _MARKER in transcript.read_text(encoding="utf-8")
         assert len(model.requests) >= 3

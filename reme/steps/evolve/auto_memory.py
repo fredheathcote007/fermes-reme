@@ -21,6 +21,16 @@ from ..base_step import BaseStep
 from ..file_io import extract_daily_date, get_path_lock, parse_daily_date, refresh_day_index, write_file_safe
 from ..file_io import validate_filename_component, validate_session_id
 from ..file_io._path import IMAGE_MIME_BY_EXT, _check_path_permission, resolve_path
+from ..file_io._provenance import (
+    PROVENANCE_SESSION_KEY,
+    ProvenanceError,
+    note_owned_by_session,
+    resolve_session_source,
+    session_source_link,
+    session_source_path,
+    trusted_provenance,
+    verify_note_provenance,
+)
 from ..index import normalize_posix_path
 from ...components import R
 from ...schema import Response
@@ -181,13 +191,18 @@ class AutoMemoryStep(BaseStep):
         return normalize_posix_path(str(self.config_value("session_dir")))
 
     def _session_path(self, session_id: str) -> Path:
-        return self.file_store.workspace_path / self._session_dir() / "dialog" / f"{session_id}.jsonl"
+        return resolve_session_source(
+            Path(self.file_store.workspace_path or "."),
+            self._session_dir(),
+            session_id,
+            require_exists=False,
+        )
 
     def _session_source_path(self, session_id: str) -> str:
-        return normalize_posix_path(f"{self._session_dir()}/dialog/{session_id}.jsonl")
+        return normalize_posix_path(session_source_path(self._session_dir(), session_id))
 
     def _session_link(self, session_id: str) -> str:
-        return f"[[{self._session_source_path(session_id)}]]"
+        return session_source_link(self._session_dir(), session_id)
 
     def _daily_note_path(self, day: str, name: str) -> str:
         return f"{self.config_value('daily_dir')}/{day}/{name}.md"
@@ -213,7 +228,9 @@ class AutoMemoryStep(BaseStep):
     def _find_session_note(self, notes: list[dict], session_id: str) -> dict | None:
         source = self._session_link(session_id)
         for note in notes:
-            if str(note.get(_SESSION_ID_KEY, "")).strip() == session_id:
+            note_session = str(note.get(_SESSION_ID_KEY, "")).strip()
+            note_source = str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip()
+            if note_session == session_id and (not note_source or note_source == source):
                 return note
         for note in notes:
             if str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip() == source:
@@ -233,10 +250,7 @@ class AutoMemoryStep(BaseStep):
         session_id: str,
         image_sources: list[str] | None = None,
     ) -> None:
-        metadata = {
-            _SESSION_ID_KEY: session_id,
-            _SOURCE_CONVERSATION_KEY: self._session_link(session_id),
-        }
+        metadata = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
         if image_sources is not None and (
             not isinstance(image_sources, list) or any(not isinstance(source, str) for source in image_sources)
         ):
@@ -252,6 +266,8 @@ class AutoMemoryStep(BaseStep):
                 if not target.is_file():
                     raise ValueError(f"Memory note not found: {path}")
                 post = frontmatter.loads(target.read_text(encoding="utf-8"))
+                if not note_owned_by_session(post.metadata, metadata):
+                    raise RuntimeError("existing note belongs to a different source session")
                 current_sources = post.metadata.get("source_images", [])
                 if not isinstance(current_sources, list) or any(not isinstance(s, str) for s in current_sources):
                     raise ValueError("Existing source_images must be a list of strings")
@@ -267,6 +283,7 @@ class AutoMemoryStep(BaseStep):
             "frontmatter_update",
             path=path,
             metadata=metadata,
+            _provenance_session_id=session_id,
         )
         if not response.success:
             raise RuntimeError(f"frontmatter_update failed: {response.answer}")
@@ -416,8 +433,8 @@ class AutoMemoryStep(BaseStep):
         iterations.  That text is not an acknowledgement that a file write
         happened.  Calls and results must be known, well-formed, uniquely
         identified, and paired by AgentScope's call ID.  A reply with no tool
-        block is intentionally not considered a failure: legitimate no-op
-        sessions remain successful.
+        block is handled by the caller, which distinguishes an explicit
+        retention request from a genuine no-op.
         """
         execution = reply_result.get("tool_execution") if isinstance(reply_result, dict) else None
         if isinstance(execution, list):
@@ -594,6 +611,24 @@ class AutoMemoryStep(BaseStep):
                     self.context.response.answer = "Error: request_id was already used for different input"
                     return
                 response = Response.model_validate(record["response"])
+                if response.success:
+                    note_path = response.metadata.get("path")
+                    if isinstance(note_path, str) and note_path:
+                        if not verify_note_provenance(
+                            workspace,
+                            workspace / note_path,
+                            self._session_dir(),
+                            str(payload["session_id"]),
+                        ):
+                            self.context.response.success = False
+                            self.context.response.answer = (
+                                "Error: recorded note provenance changed; receipt cannot be safely replayed"
+                            )
+                            return
+                    elif isinstance(payload.get("memory_hint"), str) and payload["memory_hint"].strip():
+                        self.context.response.success = False
+                        self.context.response.answer = "Error: explicit retention receipt has no attributable note"
+                        return
                 self.context.response.answer = response.answer
                 self.context.response.success = response.success
                 self.context.response.metadata.update(response.metadata)
@@ -623,6 +658,7 @@ class AutoMemoryStep(BaseStep):
         raw_messages = self.context.get("messages") or []
         session_id: str = self.context.get("session_id", "")
         memory_hint: str = self.context.get("memory_hint", "")
+        retention_requested = isinstance(memory_hint, str) and bool(memory_hint.strip())
         raw_date = self.context.get("date", "")
         tz = self.app_context.app_config.timezone if self.app_context is not None else None
         current = now(tz)
@@ -656,12 +692,19 @@ class AutoMemoryStep(BaseStep):
 
         history_messages, images, reply_kwargs = self._prepare_image_history(messages, day)
         await self._save_session_messages(session_id, messages)
-
         if not messages:
             self.context.response.success = True
             self.context.response.answer = "Skipped: no messages"
             self.context.response.metadata.update({"date": day, "modified": False, "n_messages": 0})
             self.logger.info(f"[{self.name}] Skipped: no messages session_id={session_id!r} modified=False")
+            return
+
+        try:
+            provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+        except ProvenanceError as exc:
+            self.context.response.success = False
+            self.context.response.answer = f"Error: source provenance unavailable: {exc}"
+            self.context.response.metadata.update({"date": day, "modified": False, "n_messages": len(messages)})
             return
 
         try:
@@ -720,14 +763,16 @@ class AutoMemoryStep(BaseStep):
             reply_kwargs = self._reply_extra_kwargs(day)
         is_agentscope = getattr(self.agent_wrapper, "backend", None) == "agentscope"
         injected_job_kwargs = dict(reply_kwargs.get("injected_job_kwargs") or {})
+        injected_job_kwargs[PROVENANCE_SESSION_KEY] = session_id
         if created and is_agentscope:
             # The source session is application-owned. Keep any other wrapper
             # constraints while hiding this value from the model's tool schema.
             injected_job_kwargs["session_id"] = session_id
-            reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
         if not created:
             injected_job_kwargs["_allowed_paths"] = [note_path]
-            reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
+        # Provenance is always server-owned, including non-AgentScope create
+        # flows where the model does not receive a session_id argument.
+        reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
         result = await self.agent_wrapper.reply(
             user_message,
             system_prompt=self.prompt_format("system_prompt"),
@@ -766,7 +811,11 @@ class AutoMemoryStep(BaseStep):
                 self.logger.info(f"[{self.name}] post-create list failed session_id={session_id!r} answer={str(exc)!r}")
                 return
             if note is None:
-                if self._requested_tool_call_observed(result, durable_tools, require_execution=is_agentscope):
+                if (is_agentscope and retention_requested) or self._requested_tool_call_observed(
+                    result,
+                    durable_tools,
+                    require_execution=is_agentscope,
+                ):
                     self.context.response.success = False
                     self.context.response.answer = (
                         "Error: durable memory write did not create a note for the requested session; "
@@ -809,6 +858,27 @@ class AutoMemoryStep(BaseStep):
                 self.logger.info(f"[{self.name}] post-update failed path={note_path} answer={str(exc)!r}")
                 return
 
+        if not verify_note_provenance(
+            self.file_store.workspace_path,
+            self.file_store.workspace_path / note_path,
+            self._session_dir(),
+            session_id,
+        ):
+            self.context.response.success = False
+            self.context.response.answer = (
+                "Error: durable memory note provenance verification failed; request remains eligible for retry"
+            )
+            self.context.response.metadata.update(
+                {
+                    "date": day,
+                    "path": note_path,
+                    "created": created,
+                    "modified": self._note_modified(before_note_path, before_note_bytes, note_path),
+                    "n_messages": len(messages),
+                },
+            )
+            return
+
         modified = self._note_modified(before_note_path, before_note_bytes, note_path)
         if modified:
             self.context["changes"] = [{"change": "added" if created else "modified", "path": note_path}]
@@ -819,7 +889,12 @@ class AutoMemoryStep(BaseStep):
 
         source_conversation = self._session_link(session_id)
         self.context.response.success = True
-        self.context.response.answer = agent_reply_result_text(result)
+        if retention_requested and not modified:
+            # An attributed existing note may already contain the requested fact. Do not turn
+            # an unchanged disk state into a false claim that this request stored it.
+            self.context.response.answer = "No note change: existing session note retained; no new storage claimed"
+        else:
+            self.context.response.answer = agent_reply_result_text(result)
         self.context.response.metadata.update(
             {
                 "date": day,
@@ -828,6 +903,7 @@ class AutoMemoryStep(BaseStep):
                 "modified": modified,
                 "n_messages": len(messages),
                 "source_conversation": source_conversation,
+                "source_hash": provenance["source_hash"],
                 "index": index_payload,
             },
         )

@@ -72,13 +72,24 @@ provider exposes no tool schemas in this path, and Hermes fences recalled data
 while stripping nested provider-supplied fences/system notes even when tags
 are split across streaming chunks.
 
-The synthetic capture assertions also confirm that current auto-memory files
-provide a session pointer and transcript, but do **not** provide a
-`source_hash`. That is a documented provenance gap; this iteration does not
-alter the ReMe metadata format. The corrupted/partial Markdown fixture checks
-that malformed source data does not suppress valid BM25 recall. These checks
-establish source-level/passive boundary behavior only; they do not prove
-behavioral resistance of a real LLM.
+The original baseline lacked source integrity. The subsequent FHM-007
+provenance candidate stamps protected auto-memory notes with an application-
+generated `source_hash` (SHA-256 of the exact workspace transcript bytes),
+alongside `session_id` and `source_conversation`. It rejects mismatched
+metadata on the auto-memory success path and prevents an AgentScope model
+tool from overriding trusted fields. Its synthetic capture assertion verifies
+the stored digest directly against the saved transcript, and a job-level
+negative test proves a forged hash creates no successful request receipt.
+This hash provides integrity comparison, **not cryptographic identity
+authentication** or proof that remembered content is true. Direct legacy
+file tools without the protected auto-memory context do not imply this trust.
+An earlier hostile-memory fixture deliberately remains unstamped because it
+tests untrusted imported recall rather than protected capture. The
+corrupted/partial Markdown fixture checks that malformed source data does
+not suppress valid BM25 recall. These tests establish source-level/passive
+boundary behaviour only; they do not prove real-model prompt-injection
+resistance, transcript immutability after later turns, or crash-window
+exactly-once recovery.
 
 The bounded sandbox rerun did not qualify this new test: the embedded ReMe
 startup timed out under the supplied Python 3.14 environment, after which the
