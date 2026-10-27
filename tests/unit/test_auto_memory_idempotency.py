@@ -3,14 +3,29 @@
 # pylint: disable=protected-access,missing-function-docstring
 
 import asyncio
+import hashlib
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import frontmatter
 import pytest
 from agentscope.message import Msg
 
 from reme.application import Application
+from reme.components.agent_wrapper.base_agent_wrapper import BaseAgentWrapper
+from reme.components.prompt_handler import PromptHandler
 from reme.components.runtime_context import RuntimeContext
 from reme.steps.evolve.auto_memory import AutoMemoryStep
+
+
+class _SecurityTestWrapper(BaseAgentWrapper):
+    async def reply(self, _inputs, **_kwargs):
+        pytest.fail("protected validation must happen before a model call")
+
+
+class _AutoMemorySubclass(AutoMemoryStep):
+    pass
 
 
 def _step(tmp_path, request_id="batch-1", **kwargs):
@@ -24,6 +39,13 @@ def _step(tmp_path, request_id="batch-1", **kwargs):
         **kwargs,
     )
     return step
+
+
+@pytest.mark.parametrize("body", ["hello", "hello\n", "hello\nworld", "hello\nworld\n"])
+def test_option_b_body_digest_matches_canonical_stored_body(body):
+    canonical = frontmatter.loads(frontmatter.dumps(frontmatter.Post(body))).content
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert AutoMemoryStep._body_digest(body) == expected
 
 
 @pytest.mark.asyncio
@@ -172,6 +194,514 @@ async def test_concurrent_duplicate_waits_for_the_original_request(tmp_path):
     release.set()
     await asyncio.wait_for(asyncio.gather(original, retry), 2)
     assert calls == ["agent"]
+
+
+@pytest.mark.asyncio
+async def test_protected_empty_turn_has_idempotent_noop_receipt_without_commit_or_model_call(tmp_path):
+    """An empty protected turn is replayable without a transcript or fake commit."""
+
+    def make_step():
+        step = AutoMemoryStep(durable_commit=True, agent_scope="test-scope")
+        step.file_store = SimpleNamespace(workspace_path=tmp_path)
+        step.agent_wrapper = _SecurityTestWrapper(backend="agentscope")
+        step.context = RuntimeContext(
+            request_id="protected-empty-turn",
+            session_id="protected-empty-session",
+            messages=[],
+            date="2026-10-21",
+        )
+        return step
+
+    first = make_step()
+    await first.execute()
+    receipts = list(tmp_path.rglob("*.json"))
+    assert len(receipts) == 1
+    record = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert record["outcome"] == "noop"
+    assert record["changes"] == []
+    assert "commit" not in record
+    assert "note_sha256" not in record
+    assert first.context.response.metadata["outcome"] == "noop"
+    assert "commit" not in first.context.response.metadata
+    assert not list(tmp_path.rglob("dialog/*.jsonl"))
+
+    replay = make_step()
+    await replay.execute()
+    assert replay.context.response == first.context.response
+    assert replay.context["changes"] == []
+    assert not list(tmp_path.rglob("dialog/*.jsonl"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_id", "step_kwargs", "diagnostic"),
+    [
+        (None, {"durable_commit": True, "agent_scope": "test-scope"}, "protected memory commit requires request_id"),
+        ("protected-scope-check", {"durable_commit": True}, "configured agent_scope"),
+    ],
+)
+async def test_protected_auto_memory_rejects_missing_identity_before_legacy_model_write(
+    tmp_path,
+    monkeypatch,
+    request_id,
+    step_kwargs,
+    diagnostic,
+):
+    """Protected invocations never fall through to legacy model write tools."""
+    step = AutoMemoryStep(**step_kwargs)
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.context = RuntimeContext(
+        session_id="protected-session",
+        messages=[{"id": "m1", "content": "fact"}],
+        date="2026-10-21",
+    )
+    if request_id is not None:
+        step.context["request_id"] = request_id
+    calls = []
+
+    async def unexpected_legacy_execute():
+        calls.append("legacy-model-write-tools")
+
+    monkeypatch.setattr(step, "_execute", unexpected_legacy_execute)
+    await step.execute()
+
+    assert not step.context.response.success
+    assert diagnostic in step.context.response.answer
+    assert not calls
+    assert not list(tmp_path.rglob("*.md"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step_class", "backend"),
+    [(AutoMemoryStep, "not-agentscope"), (_AutoMemorySubclass, "agentscope")],
+)
+async def test_protected_auto_memory_rejects_unsupported_wrapper_or_subclass_before_execute(
+    tmp_path,
+    monkeypatch,
+    step_class,
+    backend,
+):
+    wrapper = _SecurityTestWrapper(backend=backend)
+    step = step_class(
+        agent_wrapper=wrapper,
+        durable_commit=True,
+        agent_scope="test-scope",
+    )
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.context = RuntimeContext(
+        request_id="unsupported-protected-request",
+        session_id="protected-session",
+        messages=[{"id": "m1", "content": "fact"}],
+        date="2026-10-21",
+    )
+    calls = []
+
+    async def unexpected_execute():
+        calls.append("execute")
+
+    monkeypatch.setattr(step, "_execute", unexpected_execute)
+    await step.execute()
+
+    assert not step.context.response.success
+    assert "exact AgentScope AutoMemoryStep" in step.context.response.answer
+    assert not calls
+    assert not list(tmp_path.rglob("*.md"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable_commit", [1, "true", "yes"])
+async def test_malformed_durable_commit_is_rejected_before_execute(tmp_path, monkeypatch, durable_commit):
+    step = AutoMemoryStep(durable_commit=durable_commit, agent_scope="test-scope")
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.context = RuntimeContext(
+        request_id="malformed-durable-request",
+        session_id="protected-session",
+        messages=[{"id": "m1", "content": "fact"}],
+        date="2026-10-21",
+    )
+    calls = []
+
+    async def unexpected_execute():
+        calls.append("execute")
+
+    monkeypatch.setattr(step, "_execute", unexpected_execute)
+    await step.execute()
+
+    assert not step.context.response.success
+    assert "durable_commit must be a boolean" in step.context.response.answer
+    assert not calls
+    assert not list(tmp_path.rglob("*.md"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_path, monkeypatch):
+    """Protected replay is receipt-free only with matching marker/body evidence."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False)
+    calls = []
+    proposal_body = "The first protected fact."
+    note_path = tmp_path / "workspace" / "daily/2026-10-21/protected-fact.md"
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        body = proposal_body if len(calls) == 1 else "The first protected fact.\nThe second protected fact."
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/protected-fact.md",
+                    "name": "protected-fact",
+                    "description": "A deterministic protected fact.",
+                    "content": body,
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "optionb-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    revised_request = {
+        **request,
+        "messages": [
+            *request["messages"],
+            {"id": "m2", "name": "user", "role": "user", "content": "a new fact"},
+        ],
+    }
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="optionb-1", **request)
+        repeated = await app.run_job("auto_memory", request_id="optionb-1", **request)
+        revised = await app.run_job("auto_memory", request_id="optionb-2", **revised_request)
+        same_after_revision = await app.run_job("auto_memory", request_id="optionb-1", **request)
+        assert first.success and repeated.success and revised.success
+        assert not same_after_revision.success
+        assert len(calls) == 2
+
+        saved = frontmatter.loads(note_path.read_text(encoding="utf-8"))
+        marker = saved.metadata["_reme_commit"]
+        assert marker["request_id"] == "optionb-2"
+        assert marker["note_path"] == "daily/2026-10-21/protected-fact.md"
+        assert marker["body_sha256"]
+        assert marker["source_hash"] != first.metadata["source_hash"]
+        saved.content = "tampered\n"
+        note_path.write_text(frontmatter.dumps(saved), encoding="utf-8")
+        tampered = await app.run_job("auto_memory", request_id="optionb-2", **revised_request)
+
+    assert not tampered.success
+    assert "protected" in tampered.answer.lower()
+    assert len(calls) == 2
+
+
+def test_option_b_system_prompt_renders_literal_json_schema():
+    prompt_file = Path(__file__).resolve().parents[2] / "reme/steps/evolve/auto_memory.yaml"
+    prompt = (
+        PromptHandler()
+        .load_prompt_by_file(prompt_file)
+        .prompt_format(
+            "option_b_system_prompt",
+            agent_scope="test-scope",
+        )
+    )
+    assert '{"path": "workspace-relative target"' in prompt
+    assert "{agent_scope}" not in prompt
+    assert "test-scope" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forgery", ["marker", "receipt"])
+async def test_option_b_refuses_forged_prior_revision_before_model(tmp_path, monkeypatch, forgery):
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/forged-transition.md",
+                    "name": "forged-transition",
+                    "description": "A deterministic protected fact.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "forged-transition-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    note_path = workspace / "daily/2026-10-21/forged-transition.md"
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="forged-a", **request)
+        assert first.success
+        receipt_path = next((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+        saved = frontmatter.loads(note_path.read_text(encoding="utf-8"))
+        if forgery == "marker":
+            saved.metadata["_reme_commit"]["agent_scope"] = "forged-scope"
+            note_path.write_text(frontmatter.dumps(saved), encoding="utf-8")
+        else:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["note_sha256"] = "0" * 64
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        before = note_path.read_bytes()
+        second = await app.run_job("auto_memory", request_id="forged-b", **request)
+
+    assert not second.success
+    assert len(calls) == 1
+    assert note_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_option_b_orphaned_marker_cannot_be_superseded_without_receipt(tmp_path, monkeypatch):
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/orphaned-transition.md",
+                    "name": "orphaned-transition",
+                    "description": "A deterministic protected fact.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "orphaned-transition-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    note_path = workspace / "daily/2026-10-21/orphaned-transition.md"
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="orphaned-a", **request)
+        assert first.success
+        receipt_path = next((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+        receipt_path.unlink()
+        before = note_path.read_bytes()
+        second = await app.run_job("auto_memory", request_id="orphaned-b", **request)
+
+    assert not second.success
+    assert len(calls) == 1
+    assert note_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_option_b_rejects_unmarked_foreign_note_with_matching_source_before_model(tmp_path, monkeypatch):
+    """A source link cannot claim an unmarked note whose session owner differs."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/planted.md"
+    note_path.parent.mkdir(parents=True)
+    original = (
+        "---\nname: planted\n"
+        "session_id: foreign-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nForeign content.\n"
+    )
+    note_path.write_text(original, encoding="utf-8")
+    calls = []
+
+    async def unexpected_model_call(_self, _inputs, **_kwargs):
+        calls.append(1)
+        pytest.fail("foreign unmarked note must be rejected before the model call")
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", unexpected_model_call)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="foreign-unmarked-note",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert not response.success
+    assert "different source session" in response.answer or "protected note" in response.answer
+    assert not calls
+    assert note_path.read_text(encoding="utf-8") == original
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_updates_unmarked_note_with_matching_owner_and_source(tmp_path, monkeypatch):
+    """An unmarked legacy note remains updateable only for its exact owner."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/legacy.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(
+        "---\nname: legacy\ndescription: Legacy note\n"
+        "session_id: protected-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nLegacy content.\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/legacy.md",
+                    "name": "legacy",
+                    "description": "Updated legacy note",
+                    "content": "Updated content.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="matching-unmarked-note",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert response.success
+    assert calls == [1]
+    saved = frontmatter.loads(note_path.read_text(encoding="utf-8"))
+    # python-frontmatter canonicalizes the serialized body without a trailing newline.
+    assert saved.content == "Updated content."
+    assert saved.metadata["session_id"] == "protected-session"
+    assert "_reme_commit" in saved.metadata
+
+
+@pytest.mark.asyncio
+async def test_option_b_rejects_matching_owner_note_through_symlink_before_model(tmp_path, monkeypatch):
+    """Protected lookup cannot read or write a symlinked note target."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        "---\nname: linked\nsession_id: protected-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nOutside content.\n",
+        encoding="utf-8",
+    )
+    note_path = workspace / "daily/2026-10-21/linked.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.symlink_to(outside)
+    original = outside.read_bytes()
+    calls = []
+
+    async def unexpected_model_call(_self, _inputs, **_kwargs):
+        calls.append(1)
+        pytest.fail("symlinked note must be rejected before the model call")
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", unexpected_model_call)
+
+    async def find_linked_note(_self, _day, _session_id):
+        return {"path": "daily/2026-10-21/linked.md"}
+
+    monkeypatch.setattr(AutoMemoryStep, "_list_session_note", find_linked_note)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="symlinked-note",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert not response.success
+    assert not calls
+    assert outside.read_bytes() == original
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_rejects_model_path_mismatch_without_mutation(tmp_path, monkeypatch):
+    """The application-owned existing path remains bound across the proposal CAS."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/bound.md"
+    note_path.parent.mkdir(parents=True)
+    note_path.write_text(
+        "---\nname: bound\ndescription: Bound note\n"
+        "session_id: protected-session\n"
+        "source_conversation: '[[session/dialog/protected-session.jsonl]]'\n"
+        "---\nBound content.\n",
+        encoding="utf-8",
+    )
+    original = note_path.read_bytes()
+    calls = []
+
+    async def mismatched_proposal(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/other.md",
+                    "name": "bound",
+                    "description": "Bound note",
+                    "content": "Changed content.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", mismatched_proposal)
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="mismatched-proposal-path",
+            session_id="protected-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+
+    assert not response.success
+    assert calls == [1]
+    assert note_path.read_bytes() == original
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
 
 
 @pytest.mark.asyncio
@@ -363,12 +893,10 @@ async def test_auto_memory_receipt_requires_current_turn_evidence(
     memory_hint,
 ):
     """Real job execution must not acknowledge an unverified AgentScope turn."""
-    from pathlib import Path
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False)
 
     async def simulated_reply(_self, _inputs, **_kwargs):
@@ -396,13 +924,11 @@ async def test_auto_memory_receipt_requires_current_turn_evidence(
 @pytest.mark.asyncio
 async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, monkeypatch):
     """A forged note after an apparently successful tool result remains retryable."""
-    from pathlib import Path
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
     workspace = tmp_path / "workspace"
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
     note_path = "daily/2026-10-21/forged-note.md"
     note_file = workspace / note_path
@@ -446,10 +972,6 @@ async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, mon
 @pytest.mark.asyncio
 async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeypatch):
     """A cached success cannot acknowledge a deleted or altered durable note."""
-    from pathlib import Path
-
-    import frontmatter
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -463,7 +985,7 @@ async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeyp
         "---\nSynthetic fact.\n",
         encoding="utf-8",
     )
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
     calls = []
 
@@ -505,8 +1027,6 @@ async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeyp
 @pytest.mark.asyncio
 async def test_auto_memory_repair_cannot_claim_foreign_session_note(tmp_path, monkeypatch):
     """Internal frontmatter repair must honour the same ownership boundary as tools."""
-    from pathlib import Path
-
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -520,7 +1040,7 @@ async def test_auto_memory_repair_cannot_claim_foreign_session_note(tmp_path, mo
         "---\nForeign content.\n"
     )
     note.write_text(original, encoding="utf-8")
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
 
     async def no_tool_reply(_self, _inputs, **_kwargs):

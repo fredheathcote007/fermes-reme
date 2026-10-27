@@ -1,7 +1,12 @@
 """File I/O step helpers."""
 
-from ._daily_index import extract_daily_date, parse_daily_date, refresh_day_index, validate_session_id
-from ._file_io import get_path_lock, write_file_safe
+from ._daily_index import (
+    extract_daily_date,
+    parse_daily_date,
+    refresh_day_index,
+    validate_session_id,
+)
+from ._file_io import get_path_lock, write_file_durable, write_file_safe
 from ._path import validate_filename_component
 from .daily_list import DailyListStep
 from .daily_reindex import DailyReindexStep
@@ -28,6 +33,7 @@ __all__ = [
     "validate_filename_component",
     "get_path_lock",
     "write_file_safe",
+    "write_file_durable",
     "DailyListStep",
     "DailyReindexStep",
     "DailyWriteStep",
