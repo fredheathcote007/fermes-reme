@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import sys
-import types
 import asyncio
 import contextvars
 import http.server
@@ -14,9 +12,10 @@ import importlib
 import json
 import os
 import stat
+import sys
 import threading
 import time
-
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -360,6 +359,13 @@ def test_stage1_config_is_local_only_and_has_no_unattended_jobs(tmp_path):
     assert llm["backend"] == "openai"
     assert llm["credential"]["base_url"] == "http://127.0.0.1:1234/v1"
     assert llm["model"] == "local-placeholder"
+    assert config["jobs"]["auto_memory"]["steps"] == [
+        {
+            "backend": "auto_memory_step",
+            "durable_commit": True,
+            "agent_scope": "fermes-hermes-stage1-optionb",
+        },
+    ]
     assert not any(job.get("backend") == "cron" for job in config["jobs"].values())
     assert not any("proactive" in name or "dream" in name for name in config["jobs"])
 
@@ -385,6 +391,46 @@ def test_stage1_config_is_local_only_and_has_no_unattended_jobs(tmp_path):
     upstream = resolve_app_config(config="default", workspace_dir=str(tmp_path / "upstream"), log_config=False)
     for tool_name in ("frontmatter_read", "list_tags"):
         assert config["jobs"][tool_name]["parameters"] == upstream["jobs"][tool_name]["parameters"]
+
+
+@pytest.mark.parametrize(
+    ("variant", "error"),
+    [
+        ("auto_tag", "unapproved job steps"),
+        ("durable_false", "durable_commit=true"),
+        ("durable_missing", "durable_commit=true"),
+        ("wrong_scope", "protected agent_scope"),
+        ("scope_missing", "protected agent_scope"),
+    ],
+)
+def test_stage1_config_rejects_unprotected_auto_memory_variants(tmp_path, monkeypatch, variant, error):
+    from reme.config import resolve_app_config
+
+    # Validate the registry profile exactly as the Hermes guard loads it.
+    # Providing workspace_dir adds a top-level key rejected by the strict guard.
+    loaded = resolve_app_config(config="fermes-hermes-stage1", log_config=False)
+    auto_memory_step = loaded["jobs"]["auto_memory"]["steps"][0]
+    if variant == "auto_tag":
+        loaded["jobs"]["auto_memory"]["steps"].append({"backend": "auto_tag_step"})
+    elif variant == "durable_false":
+        auto_memory_step["durable_commit"] = False
+    elif variant == "durable_missing":
+        del auto_memory_step["durable_commit"]
+    elif variant == "wrong_scope":
+        auto_memory_step["agent_scope"] = "arbitrary-scope"
+    else:
+        del auto_memory_step["agent_scope"]
+    monkeypatch.setattr(CONFIG_MODULE, "_load_embedded_config", lambda _value: loaded)
+
+    with pytest.raises(ReMeConfigError, match=error):
+        parse_config(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(tmp_path / "validation-workspace"),
+                "reme_config": CONFIG_MODULE.STAGE1_CONFIG_NAME,
+            },
+            hermes_home=tmp_path,
+        )
 
 
 def test_save_config_uses_dashboard_layout_and_private_permissions(tmp_path):
@@ -1054,7 +1100,6 @@ def test_recall_timeout_includes_embedded_startup_failure_cleanup(monkeypatch, t
 def test_embedded_start_timeout_closes_real_application_resources(monkeypatch, tmp_path):
     import reme
     import reme.config
-
     from reme.application import Application
     from reme.components import BaseComponent
 
@@ -1192,6 +1237,10 @@ def test_embedded_reme_receipt_covers_success_before_spool_ack_crash_window(monk
         step.context["changes"] = []
 
     monkeypatch.setattr(AutoMemoryStep, "_execute", synthetic_execute)
+    # This provider queue test exercises the pre-Option-B receipt/ACK boundary
+    # with a synthetic step response; the dedicated capture tests cover the
+    # protected commit contract.
+    monkeypatch.setattr(AutoMemoryStep, "_option_b_enabled", lambda _step: False)
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
     profile = tmp_path / "profile"
     provider = ReMeMemoryProvider()

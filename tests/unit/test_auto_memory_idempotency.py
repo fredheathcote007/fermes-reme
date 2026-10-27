@@ -3,12 +3,17 @@
 # pylint: disable=protected-access,missing-function-docstring
 
 import asyncio
+import hashlib
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import frontmatter
 import pytest
 from agentscope.message import Msg
 
 from reme.application import Application
+from reme.components.prompt_handler import PromptHandler
 from reme.components.runtime_context import RuntimeContext
 from reme.steps.evolve.auto_memory import AutoMemoryStep
 
@@ -24,6 +29,13 @@ def _step(tmp_path, request_id="batch-1", **kwargs):
         **kwargs,
     )
     return step
+
+
+@pytest.mark.parametrize("body", ["hello", "hello\n", "hello\nworld", "hello\nworld\n"])
+def test_option_b_body_digest_matches_canonical_stored_body(body):
+    canonical = frontmatter.loads(frontmatter.dumps(frontmatter.Post(body))).content
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert AutoMemoryStep._body_digest(body) == expected
 
 
 @pytest.mark.asyncio
@@ -172,6 +184,224 @@ async def test_concurrent_duplicate_waits_for_the_original_request(tmp_path):
     release.set()
     await asyncio.wait_for(asyncio.gather(original, retry), 2)
     assert calls == ["agent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_id", "step_kwargs", "diagnostic"),
+    [
+        (None, {"durable_commit": True, "agent_scope": "test-scope"}, "protected memory commit requires request_id"),
+        ("protected-scope-check", {"durable_commit": True}, "configured agent_scope"),
+    ],
+)
+async def test_protected_auto_memory_rejects_missing_identity_before_legacy_model_write(
+    tmp_path,
+    monkeypatch,
+    request_id,
+    step_kwargs,
+    diagnostic,
+):
+    """Protected invocations never fall through to legacy model write tools."""
+    step = AutoMemoryStep(**step_kwargs)
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.context = RuntimeContext(
+        session_id="protected-session",
+        messages=[{"id": "m1", "content": "fact"}],
+        date="2026-10-21",
+    )
+    if request_id is not None:
+        step.context["request_id"] = request_id
+    calls = []
+
+    async def unexpected_legacy_execute():
+        calls.append("legacy-model-write-tools")
+
+    monkeypatch.setattr(step, "_execute", unexpected_legacy_execute)
+    await step.execute()
+
+    assert not step.context.response.success
+    assert diagnostic in step.context.response.answer
+    assert calls == []
+    assert not list(tmp_path.rglob("*.md"))
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_path, monkeypatch):
+    """Protected replay is receipt-free only with matching marker/body evidence."""
+    from pathlib import Path
+
+    from reme.application import Application
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False)
+    calls = []
+    proposal_body = "The first protected fact."
+    note_path = tmp_path / "workspace" / "daily/2026-10-21/protected-fact.md"
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        body = proposal_body if len(calls) == 1 else "The first protected fact.\nThe second protected fact."
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/protected-fact.md",
+                    "name": "protected-fact",
+                    "description": "A deterministic protected fact.",
+                    "content": body,
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "optionb-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    revised_request = {
+        **request,
+        "messages": [
+            *request["messages"],
+            {"id": "m2", "name": "user", "role": "user", "content": "a new fact"},
+        ],
+    }
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="optionb-1", **request)
+        repeated = await app.run_job("auto_memory", request_id="optionb-1", **request)
+        revised = await app.run_job("auto_memory", request_id="optionb-2", **revised_request)
+        same_after_revision = await app.run_job("auto_memory", request_id="optionb-1", **request)
+        assert first.success and repeated.success and revised.success
+        assert not same_after_revision.success
+        assert len(calls) == 2
+
+        saved = frontmatter.loads(note_path.read_text(encoding="utf-8"))
+        marker = saved.metadata["_reme_commit"]
+        assert marker["request_id"] == "optionb-2"
+        assert marker["note_path"] == "daily/2026-10-21/protected-fact.md"
+        assert marker["body_sha256"]
+        assert marker["source_hash"] != first.metadata["source_hash"]
+        saved.content = "tampered\n"
+        note_path.write_text(frontmatter.dumps(saved), encoding="utf-8")
+        tampered = await app.run_job("auto_memory", request_id="optionb-2", **revised_request)
+
+    assert not tampered.success
+    assert "protected" in tampered.answer.lower()
+    assert len(calls) == 2
+
+
+def test_option_b_system_prompt_renders_literal_json_schema():
+    prompt_file = Path(__file__).resolve().parents[2] / "reme/steps/evolve/auto_memory.yaml"
+    prompt = (
+        PromptHandler()
+        .load_prompt_by_file(prompt_file)
+        .prompt_format(
+            "option_b_system_prompt",
+            agent_scope="test-scope",
+        )
+    )
+    assert '{"path": "workspace-relative target"' in prompt
+    assert "{agent_scope}" not in prompt
+    assert "test-scope" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forgery", ["marker", "receipt"])
+async def test_option_b_refuses_forged_prior_revision_before_model(tmp_path, monkeypatch, forgery):
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/forged-transition.md",
+                    "name": "forged-transition",
+                    "description": "A deterministic protected fact.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "forged-transition-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    note_path = workspace / "daily/2026-10-21/forged-transition.md"
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="forged-a", **request)
+        assert first.success
+        receipt_path = next((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+        saved = frontmatter.loads(note_path.read_text(encoding="utf-8"))
+        if forgery == "marker":
+            saved.metadata["_reme_commit"]["agent_scope"] = "forged-scope"
+            note_path.write_text(frontmatter.dumps(saved), encoding="utf-8")
+        else:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["note_sha256"] = "0" * 64
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        before = note_path.read_bytes()
+        second = await app.run_job("auto_memory", request_id="forged-b", **request)
+
+    assert not second.success
+    assert len(calls) == 1
+    assert note_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_option_b_orphaned_marker_cannot_be_superseded_without_receipt(tmp_path, monkeypatch):
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/orphaned-transition.md",
+                    "name": "orphaned-transition",
+                    "description": "A deterministic protected fact.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "orphaned-transition-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    note_path = workspace / "daily/2026-10-21/orphaned-transition.md"
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="orphaned-a", **request)
+        assert first.success
+        receipt_path = next((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+        receipt_path.unlink()
+        before = note_path.read_bytes()
+        second = await app.run_job("auto_memory", request_id="orphaned-b", **request)
+
+    assert not second.success
+    assert len(calls) == 1
+    assert note_path.read_bytes() == before
 
 
 @pytest.mark.asyncio
@@ -368,7 +598,7 @@ async def test_auto_memory_receipt_requires_current_turn_evidence(
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False)
 
     async def simulated_reply(_self, _inputs, **_kwargs):
@@ -402,7 +632,7 @@ async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, mon
     from reme.config import resolve_app_config
 
     workspace = tmp_path / "workspace"
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
     note_path = "daily/2026-10-21/forged-note.md"
     note_file = workspace / note_path
@@ -463,7 +693,7 @@ async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeyp
         "---\nSynthetic fact.\n",
         encoding="utf-8",
     )
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
     calls = []
 
@@ -520,7 +750,7 @@ async def test_auto_memory_repair_cannot_claim_foreign_session_note(tmp_path, mo
         "---\nForeign content.\n"
     )
     note.write_text(original, encoding="utf-8")
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
 
     async def no_tool_reply(_self, _inputs, **_kwargs):

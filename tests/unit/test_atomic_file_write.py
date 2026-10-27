@@ -2,16 +2,16 @@
 
 import asyncio
 import os
-from pathlib import Path
 import stat
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 
-from reme.steps.file_io._file_io import write_file_safe
 from reme.components.application_context import ApplicationContext
+from reme.steps.file_io._file_io import write_file_durable, write_file_safe
 from reme.steps.file_io.save import SaveStep
 
 
@@ -51,6 +51,54 @@ async def test_failed_commit_preserves_original_and_cleans_temporary_file(tmp_pa
 
     assert target.read_bytes() == b"original memory"
     assert sorted(path.name for path in tmp_path.iterdir()) == ["memory.md"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="durable protected commits require POSIX")
+async def test_durable_commit_fsyncs_file_and_parent_directory(tmp_path, monkeypatch):
+    """The protected primitive makes both the file and rename directory durable."""
+    target = tmp_path / "nested" / "memory.md"
+    calls = []
+    original_fsync = os.fsync
+
+    def record_fsync(fd):
+        calls.append(fd)
+        return original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    await write_file_durable(target, "durable memory")
+    assert target.read_text(encoding="utf-8") == "durable memory"
+    assert len(calls) >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="durable protected commits require POSIX")
+async def test_durable_commit_fault_preserves_old_note_and_cleans_temp(tmp_path, monkeypatch):
+    """A rename fault cannot turn a partial protected write into success."""
+    target = tmp_path / "memory.md"
+    target.write_text("old durable memory", encoding="utf-8")
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("controlled durable rename failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="controlled durable rename failure"):
+        await write_file_durable(target, "new durable memory")
+    assert target.read_text(encoding="utf-8") == "old durable memory"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="durable protected commits require POSIX")
+async def test_durable_commit_rejects_symlinked_parent(tmp_path):
+    """The directory-relative commit cannot follow a symlinked parent."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        await write_file_durable(link / "memory.md", "must not escape")
+    assert not (outside / "memory.md").exists()
 
 
 @pytest.mark.asyncio

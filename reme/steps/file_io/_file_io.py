@@ -2,15 +2,19 @@
 
 import asyncio
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from secrets import token_hex
 from stat import S_IMODE
-from typing import Iterable
 
 import aiofiles
 import aiofiles.os
 
-from ...constants import DEFAULT_MAX_BYTES, MAX_FILE_READ_BYTES, TRUNCATION_NOTICE_MARKER
+from ...constants import (
+    DEFAULT_MAX_BYTES,
+    MAX_FILE_READ_BYTES,
+    TRUNCATION_NOTICE_MARKER,
+)
 from ...schema import FileChunk
 from ...utils import get_logger
 from ...utils.async_utils import complete_in_thread
@@ -193,6 +197,80 @@ async def write_file_safe(file_path: Path, content: str | bytes, encoding: str =
             os.replace(temporary, file_path)
         finally:
             Path(temporary).unlink(missing_ok=True)
+
+    await complete_in_thread(publish)
+
+
+async def write_file_durable(file_path: Path, content: str | bytes, encoding: str = "utf-8") -> None:
+    """Atomically publish bytes with file and parent-directory durability.
+
+    This stricter primitive is used only by an explicitly opted-in transaction
+    that has already validated workspace ownership and symlink policy. It
+    intentionally uses directory-relative operations so a final-path symlink
+    cannot be followed during the replacement on supported POSIX filesystems.
+    """
+    if isinstance(content, str):
+        try:
+            payload = content.encode(encoding)
+        except (UnicodeEncodeError, LookupError):
+            payload = content.encode("utf-8")
+    else:
+        payload = content
+
+    def publish() -> None:
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise OSError("durable local POSIX file commits are unavailable on this platform")
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        absolute_parent = file_path.parent.absolute()
+        parts = absolute_parent.parts
+        parent_fd = os.open(parts[0] or os.sep, parent_flags)
+        try:
+            for part in parts[1:]:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+        except OSError:
+            os.close(parent_fd)
+            raise
+        temporary_name = f".reme-{token_hex(16)}.tmp"
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            try:
+                existing_fd = os.open(file_path.name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            except FileNotFoundError:
+                mode = None
+            else:
+                try:
+                    mode = S_IMODE(os.fstat(existing_fd).st_mode)
+                finally:
+                    os.close(existing_fd)
+
+            fd = os.open(temporary_name, flags, 0o600 if mode is not None else 0o666, dir_fd=parent_fd)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if mode is not None:
+                    mode_fd = os.open(temporary_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    try:
+                        os.fchmod(mode_fd, mode)
+                        os.fsync(mode_fd)
+                    finally:
+                        os.close(mode_fd)
+                os.replace(temporary_name, file_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(parent_fd)
 
     await complete_in_thread(publish)
 

@@ -5,21 +5,33 @@ import binascii
 import datetime
 import hashlib
 import json
-from pathlib import Path
+import os
 import re
+import stat
+import zoneinfo
+from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
-import zoneinfo
 
 import aiofiles
 import frontmatter
 from agentscope.agent import ContextConfig
 from agentscope.message import DataBlock, Msg, TextBlock, UserMsg
 
-from ._evolve import agent_reply_result_text, format_history, now
+from ...components import R
+from ...schema import Response
+from ...utils.wikilink_handler import WikilinkHandler
 from ..base_step import BaseStep
-from ..file_io import extract_daily_date, get_path_lock, parse_daily_date, refresh_day_index, write_file_safe
-from ..file_io import validate_filename_component, validate_session_id
+from ..file_io import (
+    extract_daily_date,
+    get_path_lock,
+    parse_daily_date,
+    refresh_day_index,
+    validate_filename_component,
+    validate_session_id,
+    write_file_durable,
+    write_file_safe,
+)
 from ..file_io._path import IMAGE_MIME_BY_EXT, _check_path_permission, resolve_path
 from ..file_io._provenance import (
     PROVENANCE_SESSION_KEY,
@@ -32,14 +44,24 @@ from ..file_io._provenance import (
     verify_note_provenance,
 )
 from ..index import normalize_posix_path
-from ...components import R
-from ...schema import Response
-from ...utils.wikilink_handler import WikilinkHandler
+from ._evolve import agent_reply_result_text, format_history, now
 
 _SESSION_ID_KEY = "session_id"
 _SOURCE_CONVERSATION_KEY = "source_conversation"
 _MESSAGE_TIME_ALIASES = ("time_created", "timestamp", "createdAt", "timeCreated", "created_time")
 _SUCCESSFUL_TOOL_STATES = {"success", "succeeded", "ok"}
+_OPTION_B_MARKER = "_reme_commit"
+_OPTION_B_VERSION = 1
+_OPTION_B_RESERVED_METADATA = frozenset(
+    {
+        "name",
+        "description",
+        "session_id",
+        "source_conversation",
+        "source_hash",
+        _OPTION_B_MARKER,
+    },
+)
 
 
 def _checked_write_path(workspace: Path, relative: str, allowed_paths) -> Path:
@@ -57,6 +79,35 @@ def _check_existing_image(target: Path) -> bool:
         return True
     if target.exists():
         raise ValueError(f"Image attachment path is not a file: {target.name}")
+    return False
+
+
+def _read_exact_owned_file(path: Path) -> bytes:
+    """Read a regular file without following a replaced final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("path is not a regular file")
+        chunks = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _has_lexical_symlink(workspace: Path, path: Path) -> bool:
+    """Reject symlink components, including a final component that resolves inside."""
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError:
+        return True
+    current = workspace
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            return True
     return False
 
 
@@ -158,6 +209,14 @@ def _sanitize_msg_for_save(msg: Msg) -> Msg:
     return msg.model_copy(update={"content": new_content})
 
 
+def _source_turn_key(msg: Msg) -> str:
+    """Identify a persisted turn without ephemeral AgentScope identity fields."""
+    payload = msg.model_dump(mode="json")
+    payload.pop("id", None)
+    payload.pop("created_at", None)
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def _normalize_msg_timestamp(item: dict) -> dict:
     """Map common message timestamp aliases to AgentScope's ``created_at`` field."""
     if item.get("created_at"):
@@ -247,6 +306,606 @@ class AutoMemoryStep(BaseStep):
     def _provenance_enabled(self) -> bool:
         """Limit trusted transcript provenance to the Fermes AgentScope step."""
         return type(self) is AutoMemoryStep and getattr(self.agent_wrapper, "backend", None) == "agentscope"
+
+    def _option_b_enabled(self) -> bool:
+        """Return whether this invocation is the explicitly opted-in protected flow."""
+        return (
+            bool(self.kwargs.get("durable_commit"))
+            and self._provenance_enabled()
+            and isinstance(
+                self.context.get("request_id") if self.context is not None else None,
+                str,
+            )
+        )
+
+    def _option_b_scope(self) -> str:
+        scope = self.kwargs.get("agent_scope")
+        if not isinstance(scope, str) or not scope.strip() or len(scope) > 128:
+            raise ValueError("protected memory commit requires a configured agent_scope")
+        return scope
+
+    def _owned_note_target(self, relative: str) -> Path:
+        """Resolve a protected Markdown target and reject symlink components."""
+        workspace = self.file_store.workspace_path.resolve()
+        lexical = workspace / relative
+        if _has_lexical_symlink(workspace, lexical):
+            raise ValueError("protected note path contains a symlink")
+        target, error = resolve_path(workspace, relative)
+        if error or target is None:
+            raise ValueError(error or "Invalid protected note path")
+        if Path(relative).suffix.lower() != ".md" or _has_lexical_symlink(workspace, target):
+            raise ValueError("protected note path contains a symlink or is not Markdown")
+        if not _check_path_permission(workspace, target, self.context.get("_allowed_paths")):
+            raise PermissionError(f"No permission to write {relative}")
+        return target
+
+    def _read_owned_note(self, relative: str, *, missing_ok: bool = False) -> bytes | None:
+        target = self._owned_note_target(relative)
+        try:
+            return _read_exact_owned_file(target)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"protected note is not a readable regular file: {relative}") from exc
+
+    @staticmethod
+    def _canonical_stored_body(body: str) -> str:
+        """Return the body that the Markdown serializer stores and reloads."""
+        serialized = frontmatter.dumps(frontmatter.Post(body))
+        return frontmatter.loads(serialized).content
+
+    @classmethod
+    def _body_digest(cls, body: str) -> str:
+        """Digest the canonical stored body, not the pre-serialization proposal."""
+        canonical_body = cls._canonical_stored_body(body)
+        return hashlib.sha256(canonical_body.encode("utf-8")).hexdigest()
+
+    def _validate_existing_marker(
+        self,
+        post: frontmatter.Post,
+        *,
+        relative: str,
+        session_id: str,
+        source_hash: dict | None,
+        agent_scope: str,
+    ) -> dict:
+        """Validate a prior application marker before allowing a new request to update a note."""
+        marker = post.metadata.get(_OPTION_B_MARKER)
+        required = {
+            "version": _OPTION_B_VERSION,
+            "session_id": session_id,
+            "agent_scope": agent_scope,
+            "note_path": relative,
+        }
+        marker_keys = {*required, "source_hash", "request_id", "fingerprint", "body_sha256", "created"}
+        if (
+            not isinstance(marker, dict)
+            or set(marker) != marker_keys
+            or any(marker.get(key) != value for key, value in required.items())
+            or not isinstance(marker.get("source_hash"), dict)
+            or marker["source_hash"].get("algorithm") != "sha256"
+            or marker["source_hash"].get("format") != "hex"
+            or not isinstance(marker["source_hash"].get("value"), str)
+            or len(marker["source_hash"]["value"]) != 64
+            or any(char not in "0123456789abcdef" for char in marker["source_hash"]["value"].lower())
+            or not isinstance(marker.get("request_id"), str)
+            or not isinstance(marker.get("fingerprint"), str)
+            or not isinstance(marker.get("body_sha256"), str)
+            or not isinstance(marker.get("created"), bool)
+            or marker.get("body_sha256") != self._body_digest(post.content)
+            or (source_hash is not None and marker.get("source_hash") != source_hash)
+        ):
+            raise ValueError("protected note marker is missing or contradictory")
+        return marker
+
+    def _read_commit_note(
+        self,
+        relative: str,
+        *,
+        request_id: str,
+        fingerprint: str,
+        session_id: str,
+        source_hash: dict,
+        agent_scope: str,
+        expected_body_digest: str | None = None,
+    ) -> tuple[frontmatter.Post, bytes, dict]:
+        """Read and verify an application-owned marker and its exact body digest."""
+        raw = self._read_owned_note(relative)
+        assert raw is not None
+        try:
+            post = frontmatter.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise ValueError("protected note is unreadable") from exc
+        marker = self._validate_existing_marker(
+            post,
+            relative=relative,
+            session_id=session_id,
+            source_hash=source_hash,
+            agent_scope=agent_scope,
+        )
+        if marker.get("request_id") != request_id or marker.get("fingerprint") != fingerprint:
+            raise ValueError("protected note marker is missing or contradictory")
+        body_digest = self._body_digest(post.content)
+        if marker.get("body_sha256") != body_digest or (
+            expected_body_digest is not None and body_digest != expected_body_digest
+        ):
+            raise ValueError("protected note body digest does not match its marker")
+        return post, raw, marker
+
+    def _option_b_receipt_path(self, session_id: str, request_id: str) -> Path:
+        """Return the protected receipt path for a prior request in this session."""
+        session_key = hashlib.sha256(session_id.encode()).hexdigest()
+        request_key = hashlib.sha256(request_id.encode()).hexdigest()
+        relative = f"{self.config_value('metadata_dir')}/auto_memory_requests/{session_key}/{request_key}.json"
+        return _checked_write_path(self.file_store.workspace_path, relative, self.context.get("_allowed_paths"))
+
+    def _validate_option_b_receipt_record(
+        self,
+        record: dict,
+        *,
+        request_id: str,
+        fingerprint: str,
+        session_id: str,
+        marker: dict,
+        note_raw: bytes,
+    ) -> Response:
+        """Validate a receipt against the exact marker and note it claims to complete."""
+        if not isinstance(record, dict) or record.get("version") != _OPTION_B_VERSION:
+            raise RuntimeError("protected receipt is malformed")
+        if record.get("fingerprint") != fingerprint:
+            raise RuntimeError("protected receipt fingerprint does not match its marker")
+        response = Response.model_validate(record.get("response"))
+        if not response.success or record.get("commit") != marker:
+            raise RuntimeError("protected receipt does not contain a matching successful commit")
+        note_path = marker.get("note_path")
+        if not isinstance(note_path, str) or not note_path:
+            raise RuntimeError("protected receipt has no note path")
+        expected_changes = [{"change": "added" if marker["created"] else "modified", "path": note_path}]
+        if record.get("note_sha256") != hashlib.sha256(note_raw).hexdigest():
+            raise RuntimeError("protected receipt does not match the committed note bytes")
+        if (
+            response.metadata.get("commit") != marker
+            or response.metadata.get("path") != note_path
+            or response.metadata.get("source_hash") != marker["source_hash"]
+            or response.metadata.get("source_conversation") != self._session_link(session_id)
+            or record.get("changes") != expected_changes
+        ):
+            raise RuntimeError("protected receipt response is not bound to its commit")
+        if marker.get("request_id") != request_id:
+            raise RuntimeError("protected receipt request does not match its marker")
+        return response
+
+    def _validate_superseded_option_b_revision(
+        self,
+        *,
+        relative: str,
+        note_raw: bytes,
+        session_id: str,
+        agent_scope: str,
+    ) -> dict:
+        """Prove a prior marked revision is complete before allowing supersession."""
+        try:
+            post = frontmatter.loads(note_raw.decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise RuntimeError("existing protected note is unreadable") from exc
+        marker = self._validate_existing_marker(
+            post,
+            relative=relative,
+            session_id=session_id,
+            # A completed prior request is bound to the transcript bytes that
+            # existed for that request. B may append new messages, so validate
+            # A's source hash shape here and bind B's current hash to B below.
+            source_hash=None,
+            agent_scope=agent_scope,
+        )
+        prior_request_id = marker.get("request_id")
+        prior_fingerprint = marker.get("fingerprint")
+        if not isinstance(prior_request_id, str) or not isinstance(prior_fingerprint, str):
+            raise TypeError("protected note marker has no prior request identity")
+        receipt_path = self._option_b_receipt_path(session_id, prior_request_id)
+        try:
+            receipt_raw = _read_exact_owned_file(receipt_path)
+            record = json.loads(receipt_raw.decode("utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError("protected prior commit has no durable receipt") from exc
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            raise RuntimeError("protected prior commit receipt is unreadable") from exc
+        self._validate_option_b_receipt_record(
+            record,
+            request_id=prior_request_id,
+            fingerprint=prior_fingerprint,
+            session_id=session_id,
+            marker=marker,
+            note_raw=note_raw,
+        )
+        return marker
+
+    async def _recover_option_b_before_source_append(self, *, day: str, session_id: str, messages: list[Msg]) -> bool:
+        """Recover a marked commit before replay messages can alter its source hash."""
+        assert self.context is not None
+        request_id = self.context.get("request_id")
+        fingerprint = self.context.get("_option_b_fingerprint")
+        if not isinstance(request_id, str) or not isinstance(fingerprint, str):
+            raise TypeError("protected memory commit requires request_id fingerprint state")
+
+        note = await self._list_session_note(day, session_id)
+        if not note:
+            return False
+        relative = str(note.get("path") or "")
+        if not relative:
+            raise RuntimeError("protected session note has no path")
+        raw = self._read_owned_note(relative, missing_ok=True)
+        if raw is None:
+            return False
+        try:
+            post = frontmatter.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise RuntimeError("existing protected note is unreadable") from exc
+        marker = post.metadata.get(_OPTION_B_MARKER)
+        if marker is None:
+            return False
+        if not isinstance(marker, dict):
+            raise RuntimeError("protected note marker is malformed")
+
+        if marker.get("request_id") == request_id:
+            provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+            _, committed_raw, committed_marker = self._read_commit_note(
+                relative,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                session_id=session_id,
+                source_hash=provenance["source_hash"],
+                agent_scope=self._option_b_scope(),
+            )
+            index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+            self._option_b_response(
+                marker=committed_marker,
+                day=day,
+                session_id=session_id,
+                n_messages=len(messages),
+                answer="Recovered durable memory commit without model replay",
+            )
+            self.context.response.metadata["index"] = index_payload
+            self.context.response.metadata["note_sha256"] = hashlib.sha256(committed_raw).hexdigest()
+            return True
+
+        # A later request may supersede this note only after the prior request's
+        # own marker, body, scope, and receipt have been validated. Its source
+        # hash is deliberately not compared with the current transcript hash:
+        # this request may have appended new source turns.
+        self._validate_superseded_option_b_revision(
+            relative=relative,
+            note_raw=raw,
+            session_id=session_id,
+            agent_scope=self._option_b_scope(),
+        )
+        return False
+
+    def _option_b_response(
+        self,
+        *,
+        marker: dict,
+        day: str,
+        session_id: str,
+        n_messages: int,
+        answer: str,
+    ) -> None:
+        assert self.context is not None
+        path = str(marker["note_path"])
+        created = bool(marker.get("created"))
+        self.context["changes"] = [{"change": "added" if created else "modified", "path": path}]
+        self.context.response.success = True
+        self.context.response.answer = answer
+        self.context.response.metadata.update(
+            {
+                "date": day,
+                "path": path,
+                "created": created,
+                "modified": True,
+                "n_messages": n_messages,
+                "source_conversation": self._session_link(session_id),
+                "source_hash": marker["source_hash"],
+                "commit": marker,
+            },
+        )
+
+    @staticmethod
+    def _proposal_text(result: object) -> str | None:
+        if not isinstance(result, dict):
+            return None
+        value = result.get("result")
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        return text or None
+
+    @staticmethod
+    def _proposal_execution_valid(result: object) -> bool:
+        """Accept only read evidence; protected mode exposes no mutating tools."""
+        if not isinstance(result, dict) or not isinstance(result.get("tool_execution"), list):
+            return True
+        calls: dict[str, str] = {}
+        results: dict[str, tuple[str, str]] = {}
+        for block in result["tool_execution"]:
+            if not isinstance(block, dict) or block.get("type") not in {"tool_call", "tool_result"}:
+                continue
+            name = block.get("name")
+            call_id = block.get("call_id", block.get("id"))
+            if name != "read" or not isinstance(call_id, str) or not call_id:
+                return False
+            if block["type"] == "tool_call":
+                if call_id in calls:
+                    return False
+                calls[call_id] = name
+            else:
+                state = str(block.get("state") or "").lower().rsplit(".", 1)[-1]
+                if call_id in results:
+                    return False
+                results[call_id] = (name, state)
+        return set(calls) == set(results) and all(state in _SUCCESSFUL_TOOL_STATES for _, state in results.values())
+
+    async def _execute_option_b(
+        self,
+        *,
+        day: str,
+        session_id: str,
+        messages: list[Msg],
+        memory_hint: str,
+        created: bool,
+        note_path: str,
+        before_note_bytes: bytes | None,
+        provenance: dict,
+        image_sources: list[str],
+        reply_kwargs: dict,
+    ) -> bool:
+        """Run the untrusted proposal phase and application-owned note commit."""
+        assert self.context is not None
+        request_id = self.context.get("request_id")
+        fingerprint = self.context.get("_option_b_fingerprint")
+        if not isinstance(request_id, str) or not isinstance(fingerprint, str):
+            raise TypeError("protected memory commit requires request_id fingerprint state")
+        agent_scope = self._option_b_scope()
+
+        # A matching marker is the recovery path for SIGKILL after note commit.
+        # Structural validation is independent of the current transcript hash:
+        # a distinct request may have appended new source turns since this
+        # marker was committed.
+        if note_path:
+            current = self._read_owned_note(note_path, missing_ok=True)
+            existing_marker = None
+            if current is not None:
+                try:
+                    existing = frontmatter.loads(current.decode("utf-8"))
+                except (UnicodeError, ValueError, TypeError) as exc:
+                    raise RuntimeError("existing protected note is unreadable") from exc
+                existing_marker = existing.metadata.get(_OPTION_B_MARKER)
+                if existing_marker is not None and not isinstance(existing_marker, dict):
+                    raise RuntimeError("protected note marker is malformed")
+            if existing_marker is not None and existing_marker.get("request_id") == request_id:
+                # Same-ID mismatches are corruption or input reuse and must
+                # never fall through to another model mutation.
+                _, raw, marker = self._read_commit_note(
+                    note_path,
+                    request_id=request_id,
+                    fingerprint=fingerprint,
+                    session_id=session_id,
+                    source_hash=provenance["source_hash"],
+                    agent_scope=agent_scope,
+                )
+                index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+                self._option_b_response(
+                    marker=marker,
+                    day=day,
+                    session_id=session_id,
+                    n_messages=len(messages),
+                    answer="Recovered durable memory commit without model replay",
+                )
+                self.context.response.metadata["index"] = index_payload
+                self.context.response.metadata["note_sha256"] = hashlib.sha256(raw).hexdigest()
+                return True
+            if existing_marker is not None:
+                self._validate_superseded_option_b_revision(
+                    relative=note_path,
+                    note_raw=current,
+                    session_id=session_id,
+                    agent_scope=agent_scope,
+                )
+
+        expected_path = note_path
+        if created:
+            # The model chooses only a filename component; the application
+            # derives the daily path and never accepts a model path escape.
+            expected_path = ""
+        injected = dict(reply_kwargs.get("injected_job_kwargs") or {})
+        if not created:
+            injected["_allowed_paths"] = [note_path]
+        reply_kwargs["injected_job_kwargs"] = injected
+        result = await self.agent_wrapper.reply(
+            self.prompt_format(
+                "option_b_user_message",
+                today=day,
+                note=memory_hint or "(none)",
+                note_path=note_path or "(new note; application derives the path)",
+                session_id=session_id,
+                session_file=self._session_source_path(session_id),
+                history=self._format_history(messages),
+            ),
+            system_prompt=self.prompt_format("option_b_system_prompt", agent_scope=agent_scope),
+            job_tools=[] if created else ["read"],
+            **reply_kwargs,
+        )
+        if not self._proposal_execution_valid(result):
+            raise RuntimeError("protected proposal contained failed, unknown, or ambiguous tool execution")
+        text = self._proposal_text(result)
+        if text is None:
+            raise RuntimeError("protected proposal was not a JSON revision")
+        try:
+            proposal = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("protected proposal was not valid JSON") from exc
+        if not isinstance(proposal, dict) or set(proposal) != {"path", "name", "description", "content"}:
+            raise RuntimeError("protected proposal must contain exactly path, name, description, and content")
+        if any(not isinstance(proposal[key], str) for key in proposal):
+            raise RuntimeError("protected proposal fields must be strings")
+        name = proposal["name"]
+        description = proposal["description"]
+        content = proposal["content"]
+        if validate_filename_component(name, kind="name") or not description.strip():
+            raise RuntimeError("protected proposal has invalid name or description")
+        body = content if content.endswith("\n") else content + "\n"
+        if len(body.encode("utf-8")) > self.max_file_bytes():
+            raise RuntimeError("protected proposal exceeds the file byte limit")
+        if created:
+            expected_path = self._daily_note_path(day, name)
+        elif proposal["path"] != note_path:
+            raise RuntimeError("protected update proposal changed the application-owned note path")
+        if proposal["path"] != expected_path:
+            raise RuntimeError("protected proposal path does not match the application-owned daily path")
+        target = self._owned_note_target(expected_path)
+        async with await get_path_lock(target):
+            current = self._read_owned_note(expected_path, missing_ok=True)
+            if current != before_note_bytes:
+                raise RuntimeError("protected note changed while the model prepared its revision")
+            if current is not None:
+                try:
+                    existing = frontmatter.loads(current.decode("utf-8"))
+                except (UnicodeError, ValueError, TypeError) as exc:
+                    raise RuntimeError("existing protected note is unreadable") from exc
+                existing_marker = existing.metadata.get(_OPTION_B_MARKER)
+                if existing_marker is not None:
+                    if not isinstance(existing_marker, dict):
+                        raise RuntimeError("protected note marker is malformed")
+                    if existing_marker.get("request_id") == request_id:
+                        raise RuntimeError("protected note marker already belongs to this request but did not recover")
+                    self._validate_superseded_option_b_revision(
+                        relative=expected_path,
+                        note_raw=current,
+                        session_id=session_id,
+                        agent_scope=agent_scope,
+                    )
+                metadata = {
+                    key: value
+                    for key, value in dict(existing.metadata or {}).items()
+                    if key not in _OPTION_B_RESERVED_METADATA
+                }
+            else:
+                metadata = {}
+            marker = {
+                "version": _OPTION_B_VERSION,
+                "request_id": request_id,
+                "fingerprint": fingerprint,
+                "session_id": session_id,
+                "source_hash": provenance["source_hash"],
+                "agent_scope": agent_scope,
+                "note_path": expected_path,
+                "body_sha256": self._body_digest(body),
+                "created": created,
+            }
+            metadata.update(
+                {
+                    "name": name,
+                    "description": description,
+                    **provenance,
+                    _OPTION_B_MARKER: marker,
+                },
+            )
+            post = frontmatter.Post(body, **metadata)
+            serialized = frontmatter.dumps(post)
+            await write_file_durable(target, serialized)
+            committed, raw, committed_marker = self._read_commit_note(
+                expected_path,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                session_id=session_id,
+                source_hash=provenance["source_hash"],
+                agent_scope=agent_scope,
+                expected_body_digest=marker["body_sha256"],
+            )
+            del committed
+        self.context["changes"] = [{"change": "added" if created else "modified", "path": expected_path}]
+        index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+        self.context.response.success = True
+        self.context.response.answer = "Committed one durable memory revision"
+        self.context.response.metadata.update(
+            {
+                "date": day,
+                "path": expected_path,
+                "created": created,
+                "modified": True,
+                "n_messages": len(messages),
+                "source_conversation": self._session_link(session_id),
+                "source_hash": provenance["source_hash"],
+                "index": index_payload,
+                "commit": committed_marker,
+                "note_sha256": hashlib.sha256(raw).hexdigest(),
+                "image_sources": image_sources,
+            },
+        )
+        return True
+
+    async def _replay_option_b_receipt(self, record: dict, *, fingerprint: str, session_id: str) -> None:
+        """Validate a protected receipt and its note before replaying its response."""
+        assert self.context is not None
+        if not isinstance(record, dict) or record.get("version") != _OPTION_B_VERSION:
+            raise RuntimeError("protected receipt is malformed")
+        if record.get("fingerprint") != fingerprint:
+            self.context.response.success = False
+            self.context.response.answer = "Error: request_id was already used for different input"
+            return
+        marker = record.get("commit")
+        if not isinstance(marker, dict):
+            raise TypeError("protected receipt does not contain a successful commit")
+        provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+        scope = self._option_b_scope()
+        note_path = marker.get("note_path")
+        if not isinstance(note_path, str) or not note_path:
+            raise RuntimeError("protected receipt has no note path")
+        _, raw, note_marker = self._read_commit_note(
+            note_path,
+            request_id=str(self.context.get("request_id")),
+            fingerprint=fingerprint,
+            session_id=session_id,
+            source_hash=provenance["source_hash"],
+            agent_scope=scope,
+        )
+        if note_marker != marker:
+            raise RuntimeError("protected receipt does not match the committed note marker")
+        response = self._validate_option_b_receipt_record(
+            record,
+            request_id=str(self.context.get("request_id")),
+            fingerprint=fingerprint,
+            session_id=session_id,
+            marker=marker,
+            note_raw=raw,
+        )
+        expected_changes = [{"change": "added" if marker["created"] else "modified", "path": note_path}]
+        self.context.response.answer = response.answer
+        self.context.response.success = response.success
+        self.context.response.metadata.update(response.metadata)
+        self.context["changes"] = expected_changes
+
+    async def _write_option_b_receipt(self, path: Path, fingerprint: str) -> None:
+        """Persist the successful protected response after index refresh."""
+        assert self.context is not None
+        commit = self.context.response.metadata.get("commit")
+        note_sha256 = self.context.response.metadata.get("note_sha256")
+        if not isinstance(commit, dict) or not isinstance(note_sha256, str):
+            raise TypeError("protected success has no complete commit evidence")
+        record = {
+            "version": _OPTION_B_VERSION,
+            "fingerprint": fingerprint,
+            "commit": commit,
+            "note_sha256": note_sha256,
+            "response": self.context.response.model_dump(mode="json"),
+            "changes": self.context.get("changes") or [],
+        }
+        await write_file_durable(path, json.dumps(record, ensure_ascii=False, sort_keys=True))
 
     async def _ensure_session_frontmatter(
         self,
@@ -344,9 +1003,23 @@ class AutoMemoryStep(BaseStep):
             by_id: dict[str, Msg] = {}
             for msg in existing:
                 by_id[msg.id] = msg
-            for msg in messages:
-                by_id[msg.id] = msg
-            merged = sorted(by_id.values(), key=lambda m: m.created_at)
+            incoming = [_sanitize_msg_for_save(msg) for msg in messages]
+            existing_by_turn: dict[str, list[Msg]] = {}
+            for msg in existing:
+                existing_by_turn.setdefault(_source_turn_key(msg), []).append(msg)
+            protected = self._option_b_enabled()
+            new_messages = []
+            for msg in incoming:
+                if msg.id in by_id:
+                    by_id[msg.id] = msg
+                elif protected and (matches := existing_by_turn.get(_source_turn_key(msg))):
+                    # Hermes may reconstruct the same turn with a fresh ID and
+                    # timestamp on every retry. Preserve the durable row's
+                    # identity instead of appending a duplicate.
+                    matches.pop(0)
+                else:
+                    new_messages.append(msg)
+            merged = sorted([*by_id.values(), *new_messages], key=lambda m: m.created_at)
 
             can_append = 0 < len(existing) <= len(merged) and all(
                 merged[i].id == existing[i].id for i in range(len(existing))
@@ -359,7 +1032,7 @@ class AutoMemoryStep(BaseStep):
                 if new_msgs:
                     async with aiofiles.open(path, "a", encoding="utf-8") as f:
                         for msg in new_msgs:
-                            await f.write(_sanitize_msg_for_save(msg).model_dump_json() + "\n")
+                            await f.write(msg.model_dump_json() + "\n")
                     self.logger.info(
                         f"[{self.name}] save session appended session_id={session_id!r} "
                         f"existing={len(existing)} appended={len(new_msgs)} total={len(merged)}",
@@ -372,7 +1045,7 @@ class AutoMemoryStep(BaseStep):
             else:
                 async with aiofiles.open(path, "w", encoding="utf-8") as f:
                     for msg in merged:
-                        await f.write(_sanitize_msg_for_save(msg).model_dump_json() + "\n")
+                        await f.write(msg.model_dump_json() + "\n")
                 self.logger.info(
                     f"[{self.name}] save session rewrote session_id={session_id!r} "
                     f"existing={len(existing)} total={len(merged)}",
@@ -585,12 +1258,24 @@ class AutoMemoryStep(BaseStep):
         """Replay completed request IDs without repeating the memory agent."""
         assert self.context is not None
         request_id = self.context.get("request_id")
+        protected_requested = bool(self.kwargs.get("durable_commit"))
         if request_id is None:
+            if protected_requested:
+                self.context.response.success = False
+                self.context.response.answer = "Error: protected memory commit requires request_id"
+                return
             return await self._execute()
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
             self.context.response.success = False
             self.context.response.answer = "Error: request_id must be a string of 1 to 128 characters"
             return
+        if protected_requested:
+            try:
+                self._option_b_scope()
+            except ValueError as exc:
+                self.context.response.success = False
+                self.context.response.answer = f"Error: {exc}"
+                return
 
         payload = {
             key: self.context.get(key) for key in ("session_id", "messages", "date", "memory_hint", "include_images")
@@ -604,6 +1289,8 @@ class AutoMemoryStep(BaseStep):
         fingerprint = hashlib.sha256(
             json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(),
         ).hexdigest()
+        option_b = self._option_b_enabled()
+        self.context["_option_b_fingerprint"] = fingerprint
         session_key = hashlib.sha256(str(payload["session_id"]).encode()).hexdigest()
         request_key = hashlib.sha256(request_id.encode()).hexdigest()
         directory = f"{self.config_value('metadata_dir')}/auto_memory_requests/{session_key}"
@@ -611,15 +1298,44 @@ class AutoMemoryStep(BaseStep):
         allowed = self.context.get("_allowed_paths")
         lock_path = _checked_write_path(workspace, f"{directory}/.lock", allowed)
         async with await get_path_lock(lock_path):
-            path = _checked_write_path(workspace, f"{directory}/{request_key}.json", allowed)
+            receipt_relative = f"{directory}/{request_key}.json"
+            if option_b and _has_lexical_symlink(workspace.resolve(), workspace.resolve() / receipt_relative):
+                self.context.response.success = False
+                self.context.response.answer = "Error: protected receipt path contains a symlink"
+                return
+            path = _checked_write_path(workspace, receipt_relative, allowed)
             if path.exists():
-                record = json.loads(path.read_text(encoding="utf-8"))
-                if record["fingerprint"] != fingerprint:
+                if option_b:
+                    try:
+                        record = json.loads(_read_exact_owned_file(path).decode("utf-8"))
+                    except FileNotFoundError:
+                        record = None
+                    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                        self.context.response.success = False
+                        self.context.response.answer = f"Error: protected receipt is unreadable: {exc}"
+                        return
+                else:
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                if record is None:
+                    pass
+                elif option_b:
+                    try:
+                        await self._replay_option_b_receipt(
+                            record,
+                            fingerprint=fingerprint,
+                            session_id=str(payload["session_id"]),
+                        )
+                    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                        self.context.response.success = False
+                        self.context.response.answer = f"Error: protected receipt replay refused: {exc}"
+                    return
+                if record is not None and record["fingerprint"] != fingerprint:
                     self.context.response.success = False
                     self.context.response.answer = "Error: request_id was already used for different input"
                     return
-                response = Response.model_validate(record["response"])
-                if response.success:
+                if record is not None:
+                    response = Response.model_validate(record["response"])
+                if record is not None and response.success:
                     note_path = response.metadata.get("path")
                     if self._provenance_enabled() and isinstance(note_path, str) and note_path:
                         if not verify_note_provenance(
@@ -641,27 +1357,36 @@ class AutoMemoryStep(BaseStep):
                         self.context.response.success = False
                         self.context.response.answer = "Error: explicit retention receipt has no attributable note"
                         return
-                self.context.response.answer = response.answer
-                self.context.response.success = response.success
-                self.context.response.metadata.update(response.metadata)
-                self.context["changes"] = record["changes"]
-                return
+                    self.context.response.answer = response.answer
+                    self.context.response.success = response.success
+                    self.context.response.metadata.update(response.metadata)
+                    self.context["changes"] = record["changes"]
+                    return
+                if record is not None:
+                    self.context.response.answer = response.answer
+                    self.context.response.success = response.success
+                    self.context.response.metadata.update(response.metadata)
+                    self.context["changes"] = record["changes"]
+                    return
             await self._execute()
             if self.context.response.success:
                 path = _checked_write_path(workspace, f"{directory}/{request_key}.json", allowed)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = _checked_write_path(workspace, f"{directory}/{request_key}.tmp", allowed)
-                await write_file_safe(
-                    temporary,
-                    json.dumps(
-                        {
-                            "fingerprint": fingerprint,
-                            "response": self.context.response.model_dump(mode="json"),
-                            "changes": self.context.get("changes") or [],
-                        },
-                    ),
-                )
-                temporary.replace(path)
+                if option_b:
+                    await self._write_option_b_receipt(path, fingerprint)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = _checked_write_path(workspace, f"{directory}/{request_key}.tmp", allowed)
+                    await write_file_safe(
+                        temporary,
+                        json.dumps(
+                            {
+                                "fingerprint": fingerprint,
+                                "response": self.context.response.model_dump(mode="json"),
+                                "changes": self.context.get("changes") or [],
+                            },
+                        ),
+                    )
+                    temporary.replace(path)
 
     # pylint: disable=too-many-return-statements,too-many-statements
     async def _execute(self):
@@ -702,7 +1427,23 @@ class AutoMemoryStep(BaseStep):
             self.logger.warning(f"[{self.name}] invalid date={raw_date!r}")
             return
 
+        protected = self._provenance_enabled()
+        option_b = self._option_b_enabled()
         history_messages, images, reply_kwargs = self._prepare_image_history(messages, day)
+        if option_b and images:
+            self.context.response.success = False
+            self.context.response.answer = "Error: protected memory commit does not support image attachments yet"
+            return
+        if (
+            option_b
+            and messages
+            and await self._recover_option_b_before_source_append(
+                day=day,
+                session_id=session_id,
+                messages=messages,
+            )
+        ):
+            return
         await self._save_session_messages(session_id, messages)
         if not messages:
             self.context.response.success = True
@@ -711,7 +1452,6 @@ class AutoMemoryStep(BaseStep):
             self.logger.info(f"[{self.name}] Skipped: no messages session_id={session_id!r} modified=False")
             return
 
-        protected = self._provenance_enabled()
         provenance = {}
         if protected:
             try:
@@ -734,7 +1474,11 @@ class AutoMemoryStep(BaseStep):
         note_path = str(note["path"]) if note else ""
         created = note is None
         before_note_path = note_path
-        before_note_bytes = self._note_bytes(note_path) if note_path else None
+        before_note_bytes = (
+            self._read_owned_note(note_path, missing_ok=True)
+            if option_b and note_path
+            else self._note_bytes(note_path) if note_path else None
+        )
         # Keep attachment provenance even when the Agent uses a full rewrite,
         # or this call updates an image-backed note with images disabled.
         image_sources = []
@@ -792,6 +1536,20 @@ class AutoMemoryStep(BaseStep):
             reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
         else:
             reply_kwargs.pop("injected_job_kwargs", None)
+        if option_b:
+            await self._execute_option_b(
+                day=day,
+                session_id=session_id,
+                messages=messages,
+                memory_hint=memory_hint,
+                created=created,
+                note_path=note_path,
+                before_note_bytes=before_note_bytes,
+                provenance=provenance,
+                image_sources=image_sources,
+                reply_kwargs=reply_kwargs,
+            )
+            return
         result = await self.agent_wrapper.reply(
             user_message,
             system_prompt=self.prompt_format("system_prompt"),
