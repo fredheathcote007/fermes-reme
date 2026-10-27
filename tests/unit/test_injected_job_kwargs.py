@@ -193,7 +193,7 @@ async def test_auto_memory_create_uses_model_supplied_date_and_daily_write(tmp_p
 
     assert step.context.response.success is True
     assert wrapper.calls[0]["job_tools"] == ["daily_write"]
-    assert wrapper.calls[0]["injected_job_kwargs"] == {"_provenance_session_id": "sess-1"}
+    assert "injected_job_kwargs" not in wrapper.calls[0]
 
 
 @pytest.mark.asyncio
@@ -236,10 +236,7 @@ async def test_auto_memory_update_scopes_tools_to_exact_note_path(tmp_path, monk
 
     assert step.context.response.success is True
     assert wrapper.calls[0]["job_tools"] == ["read", "edit", "frontmatter_update", "write"]
-    assert wrapper.calls[0]["injected_job_kwargs"] == {
-        "_allowed_paths": [note_path],
-        "_provenance_session_id": session_id,
-    }
+    assert wrapper.calls[0]["injected_job_kwargs"] == {"_allowed_paths": [note_path]}
 
 
 def test_auto_memory_keeps_original_tool_names():

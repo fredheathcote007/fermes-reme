@@ -244,13 +244,21 @@ class AutoMemoryStep(BaseStep):
         notes = list_response.metadata.get("notes") or []
         return self._find_session_note(notes, session_id)
 
+    def _provenance_enabled(self) -> bool:
+        """Limit trusted transcript provenance to the Fermes AgentScope step."""
+        return type(self) is AutoMemoryStep and getattr(self.agent_wrapper, "backend", None) == "agentscope"
+
     async def _ensure_session_frontmatter(
         self,
         path: str,
         session_id: str,
         image_sources: list[str] | None = None,
     ) -> None:
-        metadata = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+        metadata = (
+            trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+            if self._provenance_enabled()
+            else {"session_id": session_id, "source_conversation": self._session_link(session_id)}
+        )
         if image_sources is not None and (
             not isinstance(image_sources, list) or any(not isinstance(source, str) for source in image_sources)
         ):
@@ -266,7 +274,7 @@ class AutoMemoryStep(BaseStep):
                 if not target.is_file():
                     raise ValueError(f"Memory note not found: {path}")
                 post = frontmatter.loads(target.read_text(encoding="utf-8"))
-                if not note_owned_by_session(post.metadata, metadata):
+                if self._provenance_enabled() and not note_owned_by_session(post.metadata, metadata):
                     raise RuntimeError("existing note belongs to a different source session")
                 current_sources = post.metadata.get("source_images", [])
                 if not isinstance(current_sources, list) or any(not isinstance(s, str) for s in current_sources):
@@ -283,7 +291,7 @@ class AutoMemoryStep(BaseStep):
             "frontmatter_update",
             path=path,
             metadata=metadata,
-            _provenance_session_id=session_id,
+            **({PROVENANCE_SESSION_KEY: session_id} if self._provenance_enabled() else {}),
         )
         if not response.success:
             raise RuntimeError(f"frontmatter_update failed: {response.answer}")
@@ -613,7 +621,7 @@ class AutoMemoryStep(BaseStep):
                 response = Response.model_validate(record["response"])
                 if response.success:
                     note_path = response.metadata.get("path")
-                    if isinstance(note_path, str) and note_path:
+                    if self._provenance_enabled() and isinstance(note_path, str) and note_path:
                         if not verify_note_provenance(
                             workspace,
                             workspace / note_path,
@@ -625,7 +633,11 @@ class AutoMemoryStep(BaseStep):
                                 "Error: recorded note provenance changed; receipt cannot be safely replayed"
                             )
                             return
-                    elif isinstance(payload.get("memory_hint"), str) and payload["memory_hint"].strip():
+                    elif (
+                        self._provenance_enabled()
+                        and isinstance(payload.get("memory_hint"), str)
+                        and payload["memory_hint"].strip()
+                    ):
                         self.context.response.success = False
                         self.context.response.answer = "Error: explicit retention receipt has no attributable note"
                         return
@@ -699,13 +711,16 @@ class AutoMemoryStep(BaseStep):
             self.logger.info(f"[{self.name}] Skipped: no messages session_id={session_id!r} modified=False")
             return
 
-        try:
-            provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
-        except ProvenanceError as exc:
-            self.context.response.success = False
-            self.context.response.answer = f"Error: source provenance unavailable: {exc}"
-            self.context.response.metadata.update({"date": day, "modified": False, "n_messages": len(messages)})
-            return
+        protected = self._provenance_enabled()
+        provenance = {}
+        if protected:
+            try:
+                provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+            except ProvenanceError as exc:
+                self.context.response.success = False
+                self.context.response.answer = f"Error: source provenance unavailable: {exc}"
+                self.context.response.metadata.update({"date": day, "modified": False, "n_messages": len(messages)})
+                return
 
         try:
             note = await self._list_session_note(day, session_id)
@@ -763,8 +778,9 @@ class AutoMemoryStep(BaseStep):
             reply_kwargs = self._reply_extra_kwargs(day)
         is_agentscope = getattr(self.agent_wrapper, "backend", None) == "agentscope"
         injected_job_kwargs = dict(reply_kwargs.get("injected_job_kwargs") or {})
-        injected_job_kwargs[PROVENANCE_SESSION_KEY] = session_id
-        if created and is_agentscope:
+        if protected:
+            injected_job_kwargs[PROVENANCE_SESSION_KEY] = session_id
+        if created and protected:
             # The source session is application-owned. Keep any other wrapper
             # constraints while hiding this value from the model's tool schema.
             injected_job_kwargs["session_id"] = session_id
@@ -772,7 +788,10 @@ class AutoMemoryStep(BaseStep):
             injected_job_kwargs["_allowed_paths"] = [note_path]
         # Provenance is always server-owned, including non-AgentScope create
         # flows where the model does not receive a session_id argument.
-        reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
+        if injected_job_kwargs:
+            reply_kwargs["injected_job_kwargs"] = injected_job_kwargs
+        else:
+            reply_kwargs.pop("injected_job_kwargs", None)
         result = await self.agent_wrapper.reply(
             user_message,
             system_prompt=self.prompt_format("system_prompt"),
@@ -858,7 +877,7 @@ class AutoMemoryStep(BaseStep):
                 self.logger.info(f"[{self.name}] post-update failed path={note_path} answer={str(exc)!r}")
                 return
 
-        if not verify_note_provenance(
+        if protected and not verify_note_provenance(
             self.file_store.workspace_path,
             self.file_store.workspace_path / note_path,
             self._session_dir(),
@@ -903,7 +922,7 @@ class AutoMemoryStep(BaseStep):
                 "modified": modified,
                 "n_messages": len(messages),
                 "source_conversation": source_conversation,
-                "source_hash": provenance["source_hash"],
+                **({"source_hash": provenance["source_hash"]} if protected else {}),
                 "index": index_payload,
             },
         )
