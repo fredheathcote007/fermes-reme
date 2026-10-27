@@ -642,7 +642,7 @@ class AutoMemoryStep(BaseStep):
                 {
                     "change": "added" if committed_marker["created"] else "modified",
                     "path": relative,
-                }
+                },
             ]
             await self._publish_option_b_index()
             self._option_b_response(
@@ -809,7 +809,7 @@ class AutoMemoryStep(BaseStep):
                     {
                         "change": "added" if marker["created"] else "modified",
                         "path": note_path,
-                    }
+                    },
                 ]
                 await self._publish_option_b_index()
                 self._option_b_response(
