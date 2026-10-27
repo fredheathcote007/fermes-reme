@@ -143,6 +143,57 @@ def test_shutdown_keeps_profile_lock_until_journal_ack_finishes(monkeypatch, tmp
     contender.release()
 
 
+def test_writer_shutdown_gate_covers_backend_finally_before_journal_ack(monkeypatch, tmp_path):
+    """A deferred backend close cannot release ownership before the writer's journal ACK."""
+    backend = FakeBackend()
+    auto_memory_entered = threading.Event()
+    allow_auto_memory = threading.Event()
+
+    def blocked_auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, messages, timeout, request_id
+        auto_memory_entered.set()
+        assert allow_auto_memory.wait(timeout=2)
+        return {"success": True}
+
+    backend.auto_memory = blocked_auto_memory
+    _use_fake_http_provider(monkeypatch, backend)
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    provider._shutdown_timeout = 0.01
+
+    ack_entered = threading.Event()
+    allow_ack = threading.Event()
+    original_remove = provider._remove_pending_write
+
+    def blocked_remove(record_id):
+        ack_entered.set()
+        assert allow_ack.wait(timeout=2)
+        return original_remove(record_id)
+
+    monkeypatch.setattr(provider, "_remove_pending_write", blocked_remove)
+    provider.sync_turn("user", "assistant")
+    assert auto_memory_entered.wait(timeout=1)
+
+    provider.shutdown()
+    writer = provider._write_thread
+    assert writer is not None and writer.is_alive()
+    allow_auto_memory.set()
+    assert ack_entered.wait(timeout=1)
+
+    contender = _ProfileWriterLock(tmp_path / "reme" / ".writer.lock")
+    with pytest.raises(OSError, match="already owned|temporarily unavailable|resource busy"):
+        contender.acquire()
+
+    allow_ack.set()
+    writer.join(timeout=2)
+    assert writer.is_alive() is False
+    assert provider._deferred_backend_close is False
+    assert backend.closed is True
+    assert provider._profile_lock is None
+    contender.acquire()
+    contender.release()
+
+
 def test_deferred_shutdown_closes_backend_and_releases_profile_lock_once(monkeypatch, tmp_path):
     """A deferred close owns the profile until the later operation finishes it."""
 
@@ -302,6 +353,147 @@ def test_owner_marker_recovers_verified_crash_staging_file(tmp_path):
     assert not staging.exists()
     assert marker.path.is_file()
     marker.release()
+
+
+@pytest.mark.parametrize(
+    ("mode", "accepted"),
+    [(0o444, True), (0o600, True), (0o666, True), (0o644, False)],
+)
+@pytest.mark.skipif(os.name != "posix", reason="simulated Windows mode bits require POSIX chmod semantics")
+def test_owner_marker_windows_staging_modes_remain_fail_closed(monkeypatch, tmp_path, mode, accepted):
+    """Windows' normal/read-only modes are accepted while unknown modes fail closed."""
+    monkeypatch.setattr("hermes_agent._is_windows_platform", lambda: True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = tmp_path / "profile"
+    encoded = (
+        json.dumps(
+            {
+                "format": 1,
+                "owner": str(profile.resolve()),
+                "workspace": str(workspace),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=_WORKSPACE_OWNER_TEMP_PREFIX, dir=workspace)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    staging = Path(temp_name)
+    os.chmod(staging, mode)
+
+    marker = _WorkspaceOwnerMarker(workspace, profile)
+    if accepted:
+        marker.acquire()
+        assert not staging.exists()
+        assert marker.path.is_file()
+        marker.release()
+    else:
+        with pytest.raises(OSError, match="ambiguous"):
+            marker.acquire()
+        assert staging.exists()
+        assert not marker.path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows filesystem mode semantics")
+def test_owner_marker_native_windows_staging_recovery(tmp_path):
+    """Native Windows recovery publishes only an exact, durable marker staging file."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = tmp_path / "profile"
+
+    def write_staging(path, payload):
+        fd, temp_name = tempfile.mkstemp(prefix=_WORKSPACE_OWNER_TEMP_PREFIX, dir=path)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                if hasattr(os, "fchmod"):
+                    try:
+                        os.fchmod(handle.fileno(), 0o600)
+                    except (NotImplementedError, OSError):
+                        pass
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        return Path(temp_name)
+
+    encoded = (
+        json.dumps(
+            {
+                "format": 1,
+                "owner": str(profile.resolve()),
+                "workspace": str(workspace),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    staging = write_staging(workspace, encoded)
+
+    marker = _WorkspaceOwnerMarker(workspace, profile)
+    marker.acquire()
+
+    assert not staging.exists()
+    assert marker.path.is_file()
+    marker.release()
+
+    corrupt_workspace = tmp_path / "corrupt-workspace"
+    corrupt_workspace.mkdir()
+    corrupt_staging = write_staging(corrupt_workspace, b"corrupt owner marker")
+    with pytest.raises(OSError, match="ambiguous"):
+        _WorkspaceOwnerMarker(corrupt_workspace, profile).acquire()
+    assert corrupt_staging.exists()
+    assert not (corrupt_workspace / ".hermes-reme-owner.json").exists()
+
+    foreign_workspace = tmp_path / "foreign-workspace"
+    foreign_workspace.mkdir()
+    foreign_file = foreign_workspace / "user-data"
+    foreign_file.write_bytes(b"do not remove")
+    with pytest.raises(OSError, match="existing workspace"):
+        _WorkspaceOwnerMarker(foreign_workspace, profile).acquire()
+    assert foreign_file.exists()
+    assert not (foreign_workspace / ".hermes-reme-owner.json").exists()
+
+
+def test_owner_marker_keeps_posix_staging_mode_strict(monkeypatch, tmp_path):
+    """POSIX recovery still rejects a staging file that is not exactly 0600."""
+    monkeypatch.setattr("hermes_agent._is_windows_platform", lambda: False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = tmp_path / "profile"
+    encoded = (
+        json.dumps(
+            {
+                "format": 1,
+                "owner": str(profile.resolve()),
+                "workspace": str(workspace),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=_WORKSPACE_OWNER_TEMP_PREFIX, dir=workspace)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    staging = Path(temp_name)
+    os.chmod(staging, 0o644)
+
+    with pytest.raises(OSError, match="ambiguous"):
+        _WorkspaceOwnerMarker(workspace, profile).acquire()
+
+    assert staging.exists()
+    assert not (workspace / ".hermes-reme-owner.json").exists()
 
 
 @pytest.mark.parametrize(

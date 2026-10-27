@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -66,6 +67,21 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _is_windows_platform() -> bool:
+    """Return the platform family used for filesystem mode interpretation."""
+    return sys.platform == "win32"
+
+
+def _safe_staging_mode(mode: int) -> bool:
+    """Accept only private staging modes, including Windows' reduced mode semantics."""
+    mode_bits = stat.S_IMODE(mode)
+    if not _is_windows_platform():
+        return mode_bits == 0o600
+    # Windows may report the mkstemp file as normal/read-only (0666/0444),
+    # while 0600 is also produced by Python builds that honor fchmod.
+    return mode_bits in {0o444, 0o600, 0o666}
 
 
 class _ProfileWriterLock:
@@ -300,7 +316,7 @@ class _WorkspaceOwnerMarker:
             if (  # pylint: disable=too-many-boolean-expressions
                 stat.S_ISLNK(entry_stat.st_mode)
                 or not stat.S_ISREG(entry_stat.st_mode)
-                or stat.S_IMODE(entry_stat.st_mode) != 0o600
+                or not _safe_staging_mode(entry_stat.st_mode)
                 or entry_stat.st_nlink != 1
                 or (current_uid is not None and entry_stat.st_uid != current_uid)
             ):
@@ -839,11 +855,13 @@ class ReMeMemoryProvider(MemoryProvider):
             owner.release()
 
     def _release_profile_resources_if_writer_stopped(self) -> bool:
-        """Release profile ownership only after the writer completed journal handling."""
-        current = threading.current_thread()
+        """Release ownership only after the writer completed journal handling."""
         with self._write_thread_lock:
-            writer = self._write_thread
-            if writer is not None and writer is not current and writer.is_alive():
+            # The writer clears this slot only after its backend call, durable
+            # journal acknowledgement, queue bookkeeping, and task_done all
+            # finish. In particular, do not release from the writer's own
+            # _record_payload finally block before _remove_pending_write.
+            if self._write_thread is not None:
                 return False
             self._release_profile_lock()
             self._release_workspace_owner()
