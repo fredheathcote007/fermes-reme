@@ -69,7 +69,7 @@ def _saved_line(message):
 def memory_setup(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     wrapper = AsAgentWrapper(backend="agentscope", as_llm="")
-    wrapper.reply = AsyncMock(return_value={"result": "ok"})
+    wrapper.reply = AsyncMock(return_value={"result": "ok", "tool_execution": []})
     store = LocalFileStore(embedding_store="")
     app = SimpleNamespace(
         registry=R,
@@ -112,7 +112,7 @@ def test_only_include_images_is_exposed_and_disabled_by_default():
 async def test_text_path_keeps_main_input_kwargs_metadata_and_jsonl(setup, monkeypatch, options, images):
     step, _, path = setup
     wrapper = CcAgentWrapper(backend="claude_code")
-    wrapper.reply = AsyncMock(return_value={"result": "ok"})
+    wrapper.reply = AsyncMock(return_value={"result": "ok", "tool_execution": []})
     wrapper.kwargs["context_config"] = {"max_image_num": 0}
     step.kwargs["agent_wrapper"] = wrapper
     message = _message(images=images)
@@ -196,7 +196,11 @@ async def test_sources_interleave_unchanged_through_native_formatters(setup, mon
     assert [inputs.content[index].model_dump() for index in (1, 3)] == [
         message.content[index].model_dump() for index in (1, 3)
     ]
-    assert options == {"system_prompt": step.prompt_format("system_prompt"), "job_tools": ["daily_write"]}
+    assert options == {
+        "system_prompt": step.prompt_format("system_prompt"),
+        "job_tools": ["daily_write"],
+        "injected_job_kwargs": {"session_id": _SESSION, "_provenance_session_id": _SESSION},
+    }
     assert "auto_memory_images" not in response.metadata
     assert path.read_bytes() == _saved_line(message)
     assert message.model_dump() == original
@@ -273,6 +277,7 @@ async def test_effective_image_limit_is_checked_without_modifying_configs(setup,
         assert wrapper.reply.call_args.kwargs == {
             "system_prompt": step.prompt_format("system_prompt"),
             "job_tools": ["daily_write"],
+            "injected_job_kwargs": {"session_id": _SESSION, "_provenance_session_id": _SESSION},
             **extra,
         }
     assert (component, extra) == snapshots
@@ -327,7 +332,7 @@ async def test_full_history_hook_image_only_turn_and_update_boundaries(setup, mo
     assert options["job_tools"] == (step.update_tools if existing else step.create_tools)
     if existing:
         assert note_path in inputs.content[0].text
-        assert options["injected_job_kwargs"] == {"_allowed_paths": [note_path]}
+        assert options["injected_job_kwargs"] == {"_allowed_paths": [note_path], "_provenance_session_id": _SESSION}
     assert [message.model_dump() for message in (first, second)] == originals
 
 
@@ -380,7 +385,7 @@ async def test_configured_backend_and_job_switch(tmp_path, monkeypatch, backend,
     wrapper = app.context.components["agent_wrapper"]["default"]
     assert isinstance(wrapper, AsAgentWrapper if backend == "agentscope" else CcAgentWrapper)
     assert wrapper.backend == backend
-    wrapper.reply = AsyncMock(return_value={"result": "ok"})
+    wrapper.reply = AsyncMock(return_value={"result": "ok", "tool_execution": []})
     monkeypatch.setattr(AutoMemoryStep, "_list_session_note", AsyncMock(return_value=None))
     job = app.context.jobs["auto_memory"]
     await job.start()
@@ -439,7 +444,23 @@ async def test_default_job_still_passes_memory_changes_to_auto_tag(setup, monkey
 
     async def write_memory(*_args, **_kwargs):
         _write_note(target)
-        return {"result": "Memory written."}
+        # The model double represents a note written by this same session;
+        # it must not resemble a foreign/unowned note under the stricter guard.
+        post = frontmatter.loads(target.read_text(encoding="utf-8"))
+        post.metadata.update(
+            {
+                "session_id": _SESSION,
+                "source_conversation": f"[[session/dialog/{_SESSION}.jsonl]]",
+            },
+        )
+        target.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return {
+            "result": "Memory written.",
+            "tool_execution": [
+                {"type": "tool_call", "name": "daily_write", "call_id": "mock-daily-write"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "mock-daily-write", "state": "success"},
+            ],
+        }
 
     monkeypatch.setattr(AutoMemoryStep, "_list_session_note", find_note)
     wrapper.reply.side_effect = write_memory
@@ -470,7 +491,16 @@ async def test_image_links_survive_native_full_rewrite_and_keep_context(setup, m
     target = workspace / note_path
     old_link = "[[user-owned/manual.png]]"
     writer = WriteStep(app_context=step.app_context, file_store=step.file_store)
-    await writer(path=note_path, name="image-memory", content="Existing fact.", metadata={"source_images": [old_link]})
+    await writer(
+        path=note_path,
+        name="image-memory",
+        content="Existing fact.",
+        metadata={
+            "source_images": [old_link],
+            "session_id": _SESSION,
+            "source_conversation": f"[[session/dialog/{_SESSION}.jsonl]]",
+        },
+    )
 
     monkeypatch.setattr(step, "_list_session_note", AsyncMock(return_value={"path": note_path}))
     monkeypatch.setattr("reme.steps.evolve.auto_memory.refresh_day_index", AsyncMock(return_value={}))
@@ -483,7 +513,7 @@ async def test_image_links_survive_native_full_rewrite_and_keep_context(setup, m
     written_bodies = []
 
     async def full_rewrite(inputs, **kwargs):
-        assert kwargs["injected_job_kwargs"] == {"_allowed_paths": [note_path]}
+        assert kwargs["injected_job_kwargs"] == {"_allowed_paths": [note_path], "_provenance_session_id": _SESSION}
         if isinstance(inputs, Msg):
             blocks = inputs.content
             assert [block.type for block in blocks] == ["text", "data", "text", "data", "text"]
@@ -501,8 +531,20 @@ async def test_image_links_survive_native_full_rewrite_and_keep_context(setup, m
         written_bodies.append(body)
         # Native write replaces frontmatter as well as the body. Auto Memory
         # must restore previous image sources without rewriting this body.
-        await writer(path=note_path, name="image-memory", description="Images", content=body)
-        return {"result": "Updated."}
+        await writer(
+            path=note_path,
+            name="image-memory",
+            description="Images",
+            content=body,
+            _provenance_session_id=_SESSION,
+        )
+        return {
+            "result": "Updated.",
+            "tool_execution": [
+                {"type": "tool_call", "name": "write", "call_id": "mock-full-rewrite"},
+                {"type": "tool_result", "name": "write", "call_id": "mock-full-rewrite", "state": "success"},
+            ],
+        }
 
     wrapper.reply.side_effect = full_rewrite
     await _run(step, [first, second], include_images=True)
@@ -540,6 +582,9 @@ async def test_invalid_note_sources_only_block_image_writes(setup, monkeypatch, 
     monkeypatch.setattr(step, "_ensure_session_frontmatter", AsyncMock())
     monkeypatch.setattr(step, "_rename_from_frontmatter_name", AsyncMock(return_value=note_path))
     monkeypatch.setattr("reme.steps.evolve.auto_memory.refresh_day_index", AsyncMock(return_value={}))
+    # This image-only test intentionally bypasses provenance stamping; source
+    # integrity is covered by dedicated provenance and capture tests.
+    monkeypatch.setattr("reme.steps.evolve.auto_memory.verify_note_provenance", lambda *_args: True)
     message = _message(images=images)
     if enabled and images:
         with pytest.raises(ValueError, match="source_images"):
@@ -577,6 +622,8 @@ async def test_source_save_precedes_single_note_lookup_and_image_writes(setup, m
     monkeypatch.setattr(step, "_ensure_session_frontmatter", AsyncMock())
     monkeypatch.setattr(step, "_rename_from_frontmatter_name", AsyncMock(return_value=note_path))
     monkeypatch.setattr("reme.steps.evolve.auto_memory.refresh_day_index", AsyncMock(return_value={}))
+    # This ordering-only fixture replaces provenance stamping with a mock.
+    monkeypatch.setattr("reme.steps.evolve.auto_memory.verify_note_provenance", lambda *_args: True)
     response = await _run(step, [message], include_images=enabled)
 
     lookup.assert_awaited_once_with(_DAY, _SESSION)

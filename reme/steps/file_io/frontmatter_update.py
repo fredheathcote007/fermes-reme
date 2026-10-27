@@ -16,8 +16,15 @@ from pathlib import Path
 
 import frontmatter
 
-from ._file_io import get_path_lock
+from ._file_io import get_path_lock, write_file_safe
 from ._path import _check_path_permission, display_path, gate_md, resolve_path
+from ._provenance import (
+    PROVENANCE_SESSION_KEY,
+    ProvenanceError,
+    note_owned_by_session,
+    strip_model_provenance,
+    trusted_provenance,
+)
 from ..base_step import BaseStep
 from ...components import R
 
@@ -40,7 +47,9 @@ class FrontmatterUpdateStep(BaseStep):
         assert self.context is not None
         path: str = self.context.get("path") or ""
         assert path, "path is required"
-        metadata = self.context.get("metadata") or {}
+        provenance_session_id = self.context.get(PROVENANCE_SESSION_KEY)
+        raw_metadata = self.context.get("metadata") or {}
+        metadata = strip_model_provenance(raw_metadata) if provenance_session_id is not None else raw_metadata
         assert isinstance(metadata, dict), "metadata must be a dict"
 
         allowed_keys = self.context.get("_allowed_frontmatter_keys")
@@ -71,15 +80,31 @@ class FrontmatterUpdateStep(BaseStep):
                         payload = {"path": path, "error": f"{display_path(workspace_dir, target)} not found"}
                     elif not is_md:
                         payload = {"path": path, "error": "not markdown"}
-                    elif not metadata:
+                    elif not metadata and provenance_session_id is None:
                         payload = {"path": path, "error": "no fields to update"}
                     elif key_error:
                         payload = {"path": path, "error": key_error}
                     else:
-                        post = frontmatter.loads(target.read_text(encoding="utf-8"))
-                        post.metadata.update(metadata)
-                        target.write_text(frontmatter.dumps(post), encoding="utf-8")
-                        payload = {"path": path, "updated": metadata}
+                        payload = {}
+                        if provenance_session_id is not None:
+                            try:
+                                metadata.update(
+                                    trusted_provenance(
+                                        workspace_dir,
+                                        str(self.config_value("session_dir")),
+                                        str(provenance_session_id),
+                                    ),
+                                )
+                            except ProvenanceError as exc:
+                                payload = {"path": path, "error": f"source provenance unavailable: {exc}"}
+                        if "error" not in payload:
+                            post = frontmatter.loads(target.read_text(encoding="utf-8"))
+                            if provenance_session_id is not None and not note_owned_by_session(post.metadata, metadata):
+                                payload = {"path": path, "error": "existing note belongs to a different source session"}
+                            else:
+                                post.metadata.update(metadata)
+                                await write_file_safe(target, frontmatter.dumps(post))
+                                payload = {"path": path, "updated": metadata}
             if target != original_target:
                 payload["resolved_path"] = display_path(workspace_dir, target)
 

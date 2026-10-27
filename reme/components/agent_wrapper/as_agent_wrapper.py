@@ -153,6 +153,51 @@ class AsAgentWrapper(BaseAgentWrapper):
         """Normalize AgentScope's portable input/output usage."""
         return TokenUsage.from_provider(usage)
 
+    @staticmethod
+    def _tool_execution_summary(messages: Any) -> list[dict[str, str]]:
+        """Return redacted tool evidence from the explicitly bounded reply context."""
+        if isinstance(messages, (list, tuple)):
+            messages = list(messages)
+        else:
+            messages = [messages]
+
+        summary = []
+        for message in messages:
+            if isinstance(message, dict):
+                content = message.get("content")
+            else:
+                content = getattr(message, "content", None)
+            if not isinstance(content, (list, tuple)):
+                continue
+
+            for block in content:
+                if isinstance(block, dict):
+                    block_type = block.get("type")
+                    name = block.get("name")
+                    call_id = block.get("id", block.get("call_id"))
+                    state = block.get("state")
+                else:
+                    block_type = getattr(block, "type", None)
+                    name = getattr(block, "name", None)
+                    call_id = getattr(block, "id", None)
+                    state = getattr(block, "state", None)
+                if hasattr(block_type, "value"):
+                    block_type = block_type.value
+                if block_type not in {"tool_call", "tool_result"}:
+                    continue
+
+                evidence = {
+                    "type": str(block_type),
+                    "name": str(name or ""),
+                    "call_id": str(call_id or ""),
+                }
+                if block_type == "tool_result":
+                    if hasattr(state, "value"):
+                        state = state.value
+                    evidence["state"] = str(state or "")
+                summary.append(evidence)
+        return summary
+
     def __init__(self, as_llm: str = "default", session_retention_days: int = 10, **kwargs):
         super().__init__(**kwargs)
         self.as_llm = self.bind(as_llm, BaseAsLLM, optional=False)
@@ -348,6 +393,10 @@ class AsAgentWrapper(BaseAgentWrapper):
         agent, inputs = await self._build_agent(inputs, **kwargs)
 
         await agent.observe(inputs)
+        # AgentScope appends each message produced by this reply after the
+        # observed input.  Keep this boundary before reply() so prior-turn
+        # tool evidence cannot be mistaken for current-turn execution.
+        turn_context_start = len(agent.state.context)
         last_msg = await agent.reply()
         usage = self._agentscope_usage(last_msg.usage) if last_msg.usage is not None else None
         await self._dump_state(agent.state)
@@ -356,6 +405,7 @@ class AsAgentWrapper(BaseAgentWrapper):
             "session_id": agent.state.session_id,
             "last_message": last_msg.model_dump(),
             "result": last_msg.get_text_content(),
+            "tool_execution": self._tool_execution_summary(agent.state.context[turn_context_start:]),
         }
 
         if usage is None:

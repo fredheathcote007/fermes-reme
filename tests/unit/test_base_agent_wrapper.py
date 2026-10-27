@@ -1,5 +1,8 @@
 """Tests for shared agent wrapper behavior."""
 
+# These tests intentionally exercise the private injection contract.
+# pylint: disable=protected-access
+
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -265,3 +268,111 @@ async def test_agentscope_structured_output_uses_model_tool_choice_policy(tmp_pa
         "structured_model": {"type": "object"},
     }
     assert result["structured_output"] == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_agentscope_tool_summary_is_current_turn_redacted_and_id_paired(tmp_path, monkeypatch):
+    """Tool evidence excludes prior context and tool arguments/results."""
+
+    class FakeMessage:
+        """Synthetic AgentScope final reply without tool execution in this message."""
+
+        usage = None
+
+        @staticmethod
+        def model_dump():
+            """Provide serialisable final assistant text."""
+            return {"content": [{"type": "text", "text": "done"}]}
+
+        @staticmethod
+        def get_text_content():
+            """Return the final reply body."""
+            return "done"
+
+    class FakeAgent:
+        """Simulate a reply with an old and a current tool execution turn."""
+
+        def __init__(self):
+            self.state = SimpleNamespace(
+                session_id="session-1",
+                context=[
+                    {
+                        "content": [
+                            {"type": "tool_call", "name": "daily_write", "id": "old", "input": "secret"},
+                            {
+                                "type": "tool_result",
+                                "name": "daily_write",
+                                "id": "old",
+                                "state": "error",
+                                "output": "old output",
+                            },
+                        ],
+                    },
+                ],
+            )
+
+        async def observe(self, _inputs):
+            """Append the current input to the context boundary."""
+            self.state.context.append({"content": [{"type": "text", "text": "current user"}]})
+
+        async def reply(self):
+            """Emit a new tool call/result while keeping prior context intact."""
+            self.state.context.extend(
+                [
+                    {
+                        "content": [
+                            {"type": "tool_call", "name": "daily_write", "id": "new", "input": "secret"},
+                            {
+                                "type": "tool_result",
+                                "name": "daily_write",
+                                "id": "new",
+                                "state": "success",
+                                "output": "private output",
+                            },
+                        ],
+                    },
+                    {"content": [{"type": "text", "text": "done"}]},
+                ],
+            )
+            return FakeMessage()
+
+    agent = FakeAgent()
+    wrapper = AsAgentWrapper(app_context=ApplicationContext(workspace_dir=str(tmp_path)), as_llm="")
+
+    async def build_agent(_inputs, **_kwargs):
+        return agent, _inputs
+
+    async def dump_state(_state):
+        return
+
+    monkeypatch.setattr(wrapper, "_build_agent", build_agent)
+    monkeypatch.setattr(wrapper, "_dump_state", dump_state)
+
+    result = await wrapper.reply("hello")
+
+    assert result["tool_execution"] == [
+        {"type": "tool_call", "name": "daily_write", "call_id": "new"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "new", "state": "success"},
+    ]
+
+
+def test_session_id_is_server_owned_when_injected():
+    """A model cannot select a different memory-owning session."""
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "session_id": {"type": "string"}},
+        "required": ["name", "session_id"],
+    }
+    injection = {"session_id": "trusted-session"}
+    exposed = BaseAgentWrapper._strip_injected_parameters(schema, injection)
+    assert exposed["required"] == ["name"]
+    assert "session_id" not in exposed["properties"]
+    assert BaseAgentWrapper._merge_injected_job_kwargs({"name": "note"}, injection) == {
+        "name": "note",
+        "session_id": "trusted-session",
+    }
+    with pytest.raises(ValueError, match="session_id"):
+        BaseAgentWrapper._merge_injected_job_kwargs(
+            {"name": "note", "session_id": "foreign-session"},
+            injection,
+        )

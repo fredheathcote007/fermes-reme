@@ -58,8 +58,11 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             key="reme_config",
             label="ReMe configuration",
             kind=KIND_TEXT,
-            default="default",
-            description="Built-in config name or a YAML/JSON path used by embedded mode.",
+            default="fermes-hermes-stage1",
+            description=(
+                "Embedded mode defaults to restricted local-only Fermes Stage 1. "
+                "Custom configurations require explicit advanced opt-in."
+            ),
             group="Embedded",
         ),
         ProviderField(

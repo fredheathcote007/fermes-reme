@@ -39,6 +39,11 @@ adds the returned evidence to its protected memory context.
 - A working ReMe model configuration for `auto_memory`; BM25 recall itself does
   not require an embedding model.
 
+For Fermes Stage 1 embedded qualification, use the repository's dedicated
+`fermes-hermes-stage1` config. It removes unattended jobs, disables vector
+retrieval, and defaults the explicit OpenAI-compatible model endpoint to the
+loopback LM Studio address `http://127.0.0.1:1234/v1`.
+
 ## Install and configure
 
 Hermes can install the plugin directly from this repository subdirectory:
@@ -142,7 +147,7 @@ Then configure a dedicated workspace:
 {
   "mode": "embedded",
   "workspace_dir": "~/.reme-hermes-default",
-  "reme_config": "default"
+  "reme_config": "fermes-hermes-stage1"
 }
 ```
 
@@ -204,8 +209,12 @@ use different ports as well.
 - Cron, flush, and subagent contexts do not record conversational memory.
 - Health, recall, and write cooldowns are independent. Backend failures log a
   warning and do not fail the main Hermes conversation.
-- The writer is FIFO and in-memory. A process crash can lose queued turns;
-  persistent spooling is intentionally outside this first dual-mode version.
+- Completed turns are appended to the profile-local
+  `$HERMES_HOME/reme/pending-writes.jsonl` spool and `fsync`ed before they are
+  queued. The spool record ID is passed as ReMe's `auto_memory` `request_id`,
+  so retrying an accepted record uses ReMe's existing receipt/idempotency path.
+  A failed backend or acknowledgement leaves the record for retry; delivery is
+  not claimed to be multi-process safe.
 
 Run `hermes memory status` after installation, then start a new Hermes session.
 
@@ -306,14 +315,18 @@ hermes memory status
 
 - Install `reme-ai[core]` into the exact Python environment that launches Hermes.
 - Use an absolute, writable workspace outside the source repository.
-- Check that the selected ReMe config exposes all three required jobs.
+- Check that the selected ReMe config exposes all three required jobs. For
+  Fermes Stage 1, select `fermes-hermes-stage1` explicitly rather than the
+  upstream `default` config.
 
 ### Recall works but completed turns are not written
 
 - `cron`, `flush`, and `subagent` contexts intentionally skip writes.
 - Wait for the asynchronous writer before inspecting `daily/`.
 - Check Hermes and ReMe logs for an `auto_memory` error or cooldown warning.
-- The current FIFO queue is in memory; an abrupt process exit may lose pending writes.
+- Inspect `$HERMES_HOME/reme/pending-writes.jsonl` for a retained record after a
+  failed backend. The local spool protects accepted records after `fsync`, but
+  shared-profile multi-process operation is not qualified.
 
 ### Recall returns no useful context
 

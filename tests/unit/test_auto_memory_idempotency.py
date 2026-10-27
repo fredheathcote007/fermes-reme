@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from agentscope.message import Msg
 
+from reme.application import Application
 from reme.components.runtime_context import RuntimeContext
 from reme.steps.evolve.auto_memory import AutoMemoryStep
 
@@ -66,7 +67,8 @@ async def test_completed_request_survives_restart_without_repeating_agent(tmp_pa
 
     async def execute():
         first.context.response.answer = "recorded"
-        first.context.response.metadata = {"path": "daily/note.md"}
+        # This unit test exercises receipt replay, not physical-note provenance.
+        first.context.response.metadata = {"synthetic": "no-durable-note"}
         first.context["changes"] = [{"change": "modified", "path": "daily/note.md"}]
 
     first._execute = execute
@@ -80,6 +82,74 @@ async def test_completed_request_survives_restart_without_repeating_agent(tmp_pa
     await replay.execute()
     assert replay.context.response == first.context.response
     assert replay.context["changes"] == first.context["changes"]
+
+
+@pytest.mark.asyncio
+async def test_application_run_job_replays_real_receipt_without_repeating_side_effect(tmp_path, monkeypatch):
+    calls = []
+
+    async def synthetic_execute(step):
+        calls.append(step.context.get("request_id"))
+        step.context.response.answer = "synthetic receipt"
+        step.context.response.metadata = {"side_effect": "once"}
+        step.context["changes"] = [{"change": "modified", "path": "daily/note.md"}]
+
+    monkeypatch.setattr(AutoMemoryStep, "_execute", synthetic_execute)
+    app = Application(
+        workspace_dir=str(tmp_path),
+        enable_logo=False,
+        log_to_console=False,
+        log_to_file=False,
+        service={"backend": "cli"},
+        components={
+            "tokenizer": {"default": {"backend": "regex"}},
+            "file_graph": {"default": {"backend": "local"}},
+            "keyword_index": {"default": {"backend": "bm25", "tokenizer": "default"}},
+            "file_store": {
+                "default": {
+                    "backend": "local",
+                    "embedding_store": "",
+                    "keyword_index": "default",
+                    "file_graph": "default",
+                },
+            },
+        },
+        jobs={
+            "auto_memory": {
+                "backend": "base",
+                "steps": [{"backend": "auto_memory_step"}],
+            },
+        },
+    )
+
+    async with app:
+        first = await app.run_job(
+            "auto_memory",
+            request_id="application-receipt-1",
+            session_id="session-1",
+            messages=[{"id": "m1", "content": "fact"}],
+            date="2026-10-21",
+        )
+        replay = await app.run_job(
+            "auto_memory",
+            request_id="application-receipt-1",
+            session_id="session-1",
+            messages=[{"id": "m1", "content": "fact"}],
+            date="2026-10-21",
+        )
+        conflict = await app.run_job(
+            "auto_memory",
+            request_id="application-receipt-1",
+            session_id="session-1",
+            messages=[{"id": "m2", "content": "different fact"}],
+            date="2026-10-21",
+        )
+
+    assert calls == ["application-receipt-1"]
+    assert replay == first
+    assert replay.metadata == {"side_effect": "once"}
+    assert conflict.success is False
+    assert "different input" in conflict.answer
 
 
 @pytest.mark.asyncio
@@ -130,6 +200,106 @@ async def test_failed_request_can_retry_but_reusing_a_completed_id_for_other_inp
     assert "different input" in conflicting.context.response.answer
 
 
+def test_failed_durable_tool_calls_are_not_treated_as_a_noop():
+    failed_reply = {
+        "last_message": {
+            "content": [
+                {"type": "tool_call", "name": "daily_write", "input": "{}"},
+                {"type": "tool_result", "name": "daily_write", "state": "error"},
+                {"type": "text", "text": "I reached the maximum number of reasoning iterations."},
+            ],
+        },
+    }
+
+    assert AutoMemoryStep._all_requested_writes_failed(failed_reply, ["daily_write"])
+    assert not AutoMemoryStep._all_requested_writes_failed(
+        {"last_message": {"content": [{"type": "text", "text": "Nothing to remember."}]}},
+        ["daily_write"],
+    )
+    assert not AutoMemoryStep._all_requested_writes_failed(
+        {
+            "last_message": {
+                "content": [
+                    {"type": "tool_call", "name": "daily_write", "id": "c1", "input": "{}"},
+                    {"type": "tool_result", "name": "daily_write", "id": "c1", "state": "success"},
+                ],
+            },
+        },
+        ["daily_write"],
+    )
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        [{"type": "tool_call", "name": "daily_write", "call_id": "c1"}],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "unknown", "state": "error"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "error"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "error"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "error"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "interrupted"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "not-a-state"},
+        ],
+        [
+            {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+            {"type": "tool_result", "name": "other_tool", "call_id": "c1", "state": "error"},
+        ],
+    ],
+)
+def test_durable_tool_execution_fails_closed_for_invalid_pairing(execution):
+    assert AutoMemoryStep._all_requested_writes_failed({"tool_execution": execution}, ["daily_write"])
+
+
+def test_same_name_tool_calls_pair_by_call_id_and_mixed_results_fail_closed():
+    execution = [
+        {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+        {"type": "tool_call", "name": "daily_write", "call_id": "c2"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c2", "state": "error"},
+    ]
+    assert AutoMemoryStep._all_requested_writes_failed({"tool_execution": execution}, ["daily_write"])
+
+
+def test_current_turn_without_tools_does_not_reuse_previous_turn_execution():
+    assert not AutoMemoryStep._all_requested_writes_failed(
+        {
+            "tool_execution": [],
+            "last_message": {
+                "content": [
+                    {"type": "tool_call", "name": "daily_write", "call_id": "old"},
+                    {"type": "tool_result", "name": "daily_write", "call_id": "old", "state": "error"},
+                ],
+            },
+        },
+        ["daily_write"],
+    )
+
+
+def test_same_name_tool_calls_with_distinct_success_ids_are_not_failures():
+    execution = [
+        {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+        {"type": "tool_call", "name": "daily_write", "call_id": "c2"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c2", "state": "success"},
+        {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+    ]
+    assert not AutoMemoryStep._all_requested_writes_failed({"tool_execution": execution}, ["daily_write"])
+
+
 @pytest.mark.asyncio
 async def test_receipts_obey_workspace_permissions(tmp_path):
     step = _step(tmp_path, _allowed_paths=["daily"])
@@ -146,3 +316,231 @@ async def test_rejects_invalid_request_id_before_running_agent(tmp_path, request
     assert not step.context.response.success
     assert "request_id" in step.context.response.answer
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_execution", "expected_success", "memory_hint"),
+    [
+        (None, False, ""),
+        ([{"type": "tool_call", "name": "daily_write", "call_id": "c1"}], False, ""),
+        (
+            [
+                {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "wrong", "state": "success"},
+            ],
+            False,
+            "",
+        ),
+        (
+            [
+                {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+                {"type": "tool_call", "name": "daily_write", "call_id": "c2"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "c2", "state": "error"},
+            ],
+            False,
+            "",
+        ),
+        (
+            [
+                {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+            ],
+            False,
+            "",
+        ),
+        ([], True, ""),
+        ([], False, "must remember this"),
+        ([], True, "   "),
+    ],
+)
+async def test_auto_memory_receipt_requires_current_turn_evidence(
+    tmp_path,
+    monkeypatch,
+    tool_execution,
+    expected_success,
+    memory_hint,
+):
+    """Real job execution must not acknowledge an unverified AgentScope turn."""
+    from pathlib import Path
+
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(tmp_path / "workspace"), log_config=False)
+
+    async def simulated_reply(_self, _inputs, **_kwargs):
+        result = {"result": "done", "last_message": {"content": [{"type": "text", "text": "done"}]}}
+        if tool_execution is not None:
+            result["tool_execution"] = tool_execution
+        return result
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", simulated_reply)
+    app = Application(**config)
+    async with app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="current-turn-contract-test",
+            session_id="synthetic-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic calibration record."}],
+            date="2026-10-21",
+            memory_hint=memory_hint,
+        )
+    assert response.success is expected_success
+    receipts = list((tmp_path / "workspace" / "metadata" / "auto_memory_requests").rglob("*.json"))
+    assert bool(receipts) is expected_success
+
+
+@pytest.mark.asyncio
+async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, monkeypatch):
+    """A forged note after an apparently successful tool result remains retryable."""
+    from pathlib import Path
+
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = "daily/2026-10-21/forged-note.md"
+    note_file = workspace / note_path
+
+    async def simulated_reply(_self, _inputs, **_kwargs):
+        note_file.parent.mkdir(parents=True, exist_ok=True)
+        note_file.write_text(
+            "---\nname: forged-note\nsession_id: synthetic-session\n"
+            "source_conversation: '[[session/dialog/synthetic-session.jsonl]]'\n"
+            "source_hash: {algorithm: sha256, format: hex, value: deadbeef}\n"
+            "---\nsynthetic fact\n",
+            encoding="utf-8",
+        )
+        return {
+            "result": "done",
+            "tool_execution": [
+                {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
+                {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
+            ],
+        }
+
+    async def find_note(_self, _day, _session_id):
+        return {"path": note_path} if note_file.exists() else None
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", simulated_reply)
+    monkeypatch.setattr(AutoMemoryStep, "_list_session_note", find_note)
+    app = Application(**config)
+    async with app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="forged-source-hash",
+            session_id="synthetic-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+    assert not response.success
+    assert "provenance verification failed" in response.answer
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeypatch):
+    """A cached success cannot acknowledge a deleted or altered durable note."""
+    from pathlib import Path
+
+    import frontmatter
+
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    note_path = "daily/2026-10-21/existing.md"
+    note = workspace / note_path
+    note.parent.mkdir(parents=True)
+    note.write_text(
+        "---\nname: existing\nsession_id: synthetic-session\n"
+        "source_conversation: '[[session/dialog/synthetic-session.jsonl]]'\n"
+        "---\nSynthetic fact.\n",
+        encoding="utf-8",
+    )
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+
+    async def no_tool_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": "no change",
+            "tool_execution": [],
+            "last_message": {"content": [{"type": "text", "text": "no change"}]},
+        }
+
+    async def find_existing(_self, _day, _session_id):
+        return {"path": note_path}
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", no_tool_reply)
+    monkeypatch.setattr(AutoMemoryStep, "_list_session_note", find_existing)
+    job_kwargs = {
+        "request_id": "replay-tamper-proof",
+        "session_id": "synthetic-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+        "date": "2026-10-21",
+    }
+    app = Application(**config)
+    async with app:
+        first = await app.run_job("auto_memory", **job_kwargs)
+        assert first.success
+        assert list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+        initial_model_calls = len(calls)
+        saved = frontmatter.loads(note.read_text(encoding="utf-8"))
+        assert saved.metadata.get("source_hash")
+        saved.metadata["source_hash"]["value"] = "0" * 64
+        note.write_text(frontmatter.dumps(saved), encoding="utf-8")
+        repeated = await app.run_job("auto_memory", **job_kwargs)
+        assert not repeated.success
+        assert "provenance" in repeated.answer
+        assert len(calls) == initial_model_calls
+
+
+@pytest.mark.asyncio
+async def test_auto_memory_repair_cannot_claim_foreign_session_note(tmp_path, monkeypatch):
+    """Internal frontmatter repair must honour the same ownership boundary as tools."""
+    from pathlib import Path
+
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    note_path = "daily/2026-10-21/existing.md"
+    note = workspace / note_path
+    note.parent.mkdir(parents=True)
+    original = (
+        "---\nname: existing\nsession_id: foreign-session\n"
+        "source_conversation: '[[session/dialog/foreign-session.jsonl]]'\n"
+        "---\nForeign content.\n"
+    )
+    note.write_text(original, encoding="utf-8")
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+
+    async def no_tool_reply(_self, _inputs, **_kwargs):
+        return {"result": "done", "tool_execution": [], "last_message": {"content": [{"type": "text", "text": "done"}]}}
+
+    async def find_foreign(_self, _day, _session_id):
+        return {"path": note_path}
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", no_tool_reply)
+    monkeypatch.setattr(AutoMemoryStep, "_list_session_note", find_foreign)
+    app = Application(**config)
+    async with app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="foreign-note-repair",
+            session_id="synthetic-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
+            date="2026-10-21",
+        )
+    assert not response.success
+    assert "different source session" in response.answer
+    assert note.read_text(encoding="utf-8") == original
+    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))

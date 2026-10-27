@@ -5,6 +5,7 @@ import frontmatter
 from ._base import _FileIOStep
 from ._file_io import detect_file_encoding, get_path_lock, write_file_safe
 from ._path import _check_path_permission, NON_MD_WARNING, gate_md, resolve_path
+from ._provenance import PROVENANCE_SESSION_KEY, ProvenanceError, strip_model_provenance, trusted_provenance
 from ...components import R
 
 
@@ -32,6 +33,7 @@ class WriteStep(_FileIOStep):
         content = self.context.get("content")
         content = "" if content is None else str(content)
         metadata_raw = self.context.get("metadata")
+        provenance_session_id = self.context.get(PROVENANCE_SESSION_KEY)
 
         target, err = resolve_path(self.workspace_path, raw)
         if err:
@@ -50,12 +52,24 @@ class WriteStep(_FileIOStep):
             meta: dict = {}
             # Expand `metadata` dict first, skipping the two reserved keys.
             if isinstance(metadata_raw, dict):
-                for k, v in metadata_raw.items():
+                protected = self.context.get(PROVENANCE_SESSION_KEY) is not None
+                source_metadata = strip_model_provenance(metadata_raw) if protected else metadata_raw
+                for k, v in source_metadata.items():
                     if k in ("name", "description"):
                         continue
-                    if v is None:
-                        continue
                     meta[str(k)] = v
+            if provenance_session_id is not None:
+                try:
+                    meta.update(
+                        trusted_provenance(
+                            self.workspace_path,
+                            str(self.config_value("session_dir")),
+                            str(provenance_session_id),
+                        ),
+                    )
+                except ProvenanceError as exc:
+                    self._fail(f"source provenance unavailable: {exc}", path=raw)
+                    return None
             # Layer explicit name/description on top (always wins).
             for key in ("name", "description"):
                 value = self.context.get(key)
@@ -79,6 +93,23 @@ class WriteStep(_FileIOStep):
         lock = await get_path_lock(target)
         async with lock:
             existed = target.exists()
+            if provenance_session_id is not None:
+                if not is_md:
+                    self._fail("trusted memory writes require Markdown", path=raw)
+                    return None
+                if existed:
+                    try:
+                        previous = frontmatter.loads(target.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                        self._fail(f"existing note ownership unreadable: {type(exc).__name__}", path=raw)
+                        return None
+                    previous_meta = previous.metadata or {}
+                    if (
+                        previous_meta.get("session_id") != meta["session_id"]
+                        or previous_meta.get("source_conversation") != meta["source_conversation"]
+                    ):
+                        self._fail("existing note belongs to a different source session", path=raw)
+                        return None
             # Preserve the existing file's encoding when overwriting (e.g. GBK
             # CSV stays GBK). New files are written as UTF-8.
             encoding = await detect_file_encoding(target) if existed else "utf-8"

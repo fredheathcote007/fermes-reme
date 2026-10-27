@@ -2,12 +2,13 @@
 
 from ._base import _FileIOStep
 from ._daily_index import parse_daily_date, refresh_day_index, validate_session_id
-from ._path import validate_filename_component
+from ._path import resolve_path, validate_filename_component
+from ._provenance import ProvenanceError, trusted_provenance
 from ..index import normalize_posix_path
 from ...components import R
 from ...steps.evolve import now
 
-_RESERVED_METADATA_KEYS = {"name", "description", "session_id", "source_conversation"}
+_RESERVED_METADATA_KEYS = {"name", "description", "session_id", "source_conversation", "source_hash"}
 
 
 @R.register("daily_write_step")
@@ -41,7 +42,7 @@ class DailyWriteStep(_FileIOStep):
             return None
         return name, description, session_id, content
 
-    def _metadata(self, session_id: str) -> dict:
+    def _metadata(self, provenance: dict) -> dict:
         assert self.context is not None
         metadata_raw = self.context.get("metadata")
         metadata = {}
@@ -51,13 +52,13 @@ class DailyWriteStep(_FileIOStep):
             }
         metadata.update(
             {
-                "session_id": session_id,
-                "source_conversation": self._session_link(session_id),
+                **provenance,
             },
         )
         # ``write`` takes name/description as explicit parameters, not metadata.
         return metadata
 
+    # pylint: disable=too-many-return-statements
     async def execute(self):
         assert self.context is not None
         collected = self._collect_required()
@@ -73,7 +74,42 @@ class DailyWriteStep(_FileIOStep):
             return self.context.response
         daily_dir = self.config_value("daily_dir")
         path = f"{daily_dir}/{day}/{name}.md"
-        source_conversation = self._session_link(session_id)
+        trusted_session = self.context.get("_provenance_session_id")
+        if trusted_session is not None and str(trusted_session) != session_id:
+            self._fail("model session differs from trusted source session", path=path)
+            return self.context.response
+        if trusted_session is None:
+            # Preserve upstream direct daily_write without inventing a source
+            # hash: only the internally scoped auto_memory path proves bytes.
+            provenance = {"session_id": session_id, "source_conversation": self._session_link(session_id)}
+        else:
+            try:
+                provenance = trusted_provenance(self.workspace_path, self._session_dir(), session_id)
+            except ProvenanceError as exc:
+                self._fail(f"source provenance unavailable: {exc}", path=path, session_id=session_id)
+                return self.context.response
+
+        target, path_error = resolve_path(self.workspace_path, path)
+        if path_error or target is None:
+            self._fail(path_error or "invalid daily note path", path=path)
+            return self.context.response
+        if target.is_file():
+            try:
+                import frontmatter
+
+                existing = frontmatter.loads(target.read_text(encoding="utf-8"))
+                existing_owner = existing.metadata.get("source_conversation") or existing.metadata.get("session_id")
+                if existing_owner and existing_owner not in {
+                    provenance["source_conversation"],
+                    provenance["session_id"],
+                }:
+                    self._fail("daily note belongs to a different source session", path=path)
+                    return self.context.response
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                self._fail(f"existing daily note cannot be verified: {type(exc).__name__}", path=path)
+                return self.context.response
+
+        source_conversation = provenance["source_conversation"]
 
         write_responses = await self.dispatch_steps(
             [{"backend": "write_step"}],
@@ -81,7 +117,8 @@ class DailyWriteStep(_FileIOStep):
             name=name,
             description=description,
             content=content,
-            metadata=self._metadata(session_id),
+            metadata=self._metadata(provenance),
+            _provenance_session_id=trusted_session,
         )
         write_response = write_responses[0]
         write_success = write_response.success

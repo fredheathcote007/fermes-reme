@@ -246,11 +246,18 @@ class EmbeddedReMeBackend:
         messages: list[dict[str, Any]],
         *,
         timeout: float,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Run ReMe's automatic-memory job on the owned loop."""
         with self._operation_lock:
+            kwargs: dict[str, Any] = {
+                "session_id": session_id,
+                "messages": messages,
+            }
+            if request_id is not None:
+                kwargs["request_id"] = request_id
             return self._submit(
-                self._run_job("auto_memory", session_id=session_id, messages=messages),
+                self._run_job("auto_memory", **kwargs),
                 timeout=timeout,
             )
 
