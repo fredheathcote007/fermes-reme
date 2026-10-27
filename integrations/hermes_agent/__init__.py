@@ -49,6 +49,7 @@ _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
 _PROFILE_LOCK_FILENAME = ".writer.lock"
 _WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
+_WORKSPACE_OWNER_TEMP_PREFIX = f".{_WORKSPACE_OWNER_FILENAME}."
 _HELD_PROFILE_LOCKS: set[str] = set()
 _HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
@@ -231,8 +232,10 @@ class _WorkspaceOwnerMarker:
             raise OSError("workspace owner marker could not be inspected") from exc
         else:
             marker_exists = True
-        if not marker_exists and any(self.workspace.iterdir()):
-            raise OSError("existing workspace is unowned; explicit migration required")
+        if not marker_exists:
+            self._remove_safe_staging_files(encoded)
+            if any(self.workspace.iterdir()):
+                raise OSError("existing workspace is unowned; explicit migration required")
 
         # Publishing the final name with O_EXCL before writing it leaves a
         # corrupt marker behind if the process dies during the write. A
@@ -241,7 +244,7 @@ class _WorkspaceOwnerMarker:
         temp_name: str | None = None
         try:
             fd, temp_name = tempfile.mkstemp(
-                prefix=f".{_WORKSPACE_OWNER_FILENAME}.",
+                prefix=_WORKSPACE_OWNER_TEMP_PREFIX,
                 dir=self.workspace,
             )
             try:
@@ -276,6 +279,62 @@ class _WorkspaceOwnerMarker:
                 except FileNotFoundError:
                     pass
         self._owned = True
+
+    def _remove_safe_staging_files(self, encoded: bytes) -> None:
+        """Remove only verified leftovers from an interrupted marker publish."""
+        staging_paths: list[Path] = []
+        try:
+            entries = tuple(self.workspace.iterdir())
+        except OSError as exc:
+            raise OSError("workspace contents could not be inspected") from exc
+        current_uid = os.getuid() if hasattr(os, "getuid") else None
+        for entry in entries:
+            if not entry.name.startswith(_WORKSPACE_OWNER_TEMP_PREFIX):
+                raise OSError("existing workspace is unowned; explicit migration required")
+            try:
+                entry_stat = entry.lstat()
+            except OSError as exc:
+                raise OSError("workspace owner staging file could not be inspected") from exc
+            # Keep every fail-closed identity check explicit; these checks jointly prove that
+            # the staging file is safe to remove after an interrupted marker publish.
+            if (  # pylint: disable=too-many-boolean-expressions
+                stat.S_ISLNK(entry_stat.st_mode)
+                or not stat.S_ISREG(entry_stat.st_mode)
+                or stat.S_IMODE(entry_stat.st_mode) != 0o600
+                or entry_stat.st_nlink != 1
+                or (current_uid is not None and entry_stat.st_uid != current_uid)
+            ):
+                raise OSError("workspace owner staging file is ambiguous")
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(entry, flags)
+            except OSError as exc:
+                raise OSError("workspace owner staging file could not be opened") from exc
+            try:
+                opened_stat = os.fstat(fd)
+                if (
+                    opened_stat.st_dev != entry_stat.st_dev
+                    or opened_stat.st_ino != entry_stat.st_ino
+                    or opened_stat.st_size != len(encoded)
+                ):
+                    raise OSError("workspace owner staging file is ambiguous")
+                if os.read(fd, len(encoded) + 1) != encoded:
+                    raise OSError("workspace owner staging file is ambiguous")
+            finally:
+                os.close(fd)
+            staging_paths.append(entry)
+        for entry in staging_paths:
+            try:
+                entry.unlink()
+            except OSError as exc:
+                raise OSError("workspace owner staging file could not be removed") from exc
+        if staging_paths:
+            try:
+                _fsync_directory(self.workspace)
+            except OSError as exc:
+                raise OSError("workspace owner staging cleanup could not be made durable") from exc
 
     def release(self) -> None:
         """Release this provider's in-memory reference without deleting ownership."""
@@ -759,8 +818,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 self._close_backend_locked(
                     timeout=max(0.0, deadline - time.monotonic()),
                 )
-                self._deferred_backend_close = False
-                self._release_profile_resources_if_writer_stopped()
+                self._finish_deferred_backend_close_locked()
             finally:
                 self._backend_lock.release()
         else:
@@ -836,9 +894,9 @@ class ReMeMemoryProvider(MemoryProvider):
                     "Cannot disable ReMe while its previous writer is still running",
                 )
             self._accept_writes = False
-            self._release_profile_lock()
         with self._backend_lock:
             self._close_backend_locked()
+        self._release_profile_lock()
         self._config = None
         self._backend_label = "missing Hermes profile"
         self._session_id = str(session_id or "")
@@ -1180,7 +1238,12 @@ class ReMeMemoryProvider(MemoryProvider):
     def _close_backend_if_shutdown_locked(self) -> None:
         if self._deferred_backend_close:
             self._close_backend_locked()
-            self._deferred_backend_close = False
+            self._finish_deferred_backend_close_locked()
+
+    def _finish_deferred_backend_close_locked(self) -> None:
+        """Finish shutdown ownership release after backend close completes."""
+        self._deferred_backend_close = False
+        self._release_profile_resources_if_writer_stopped()
 
     def _close_backend_locked(self, *, timeout: float | None = None) -> None:
         backend, self._backend = self._backend, None
