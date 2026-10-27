@@ -332,6 +332,7 @@ def test_owner_marker_windows_mode_path_without_fchmod(monkeypatch, tmp_path):
         def __init__(self, real_os):
             self._real_os = real_os
             self.chmod_calls = []
+            self.link_calls = []
             self.fsync_calls = []
 
         def __getattr__(self, name):
@@ -339,12 +340,19 @@ def test_owner_marker_windows_mode_path_without_fchmod(monkeypatch, tmp_path):
                 raise AttributeError(name)
             return getattr(self._real_os, name)
 
-        def chmod(self, path, mode, *, follow_symlinks=True):
-            """Record the simulated Windows chmod call and apply it on POSIX."""
-            self.chmod_calls.append((path, mode, follow_symlinks))
-            # Linux is only simulating the Windows mode API here; its chmod
-            # implementation does not support follow_symlinks=False.
+        def chmod(self, path, mode, **kwargs):
+            """Simulate Python 3.11 Windows chmod, which rejects the keyword."""
+            if kwargs:
+                raise TypeError("follow_symlinks is unsupported")
+            self.chmod_calls.append((path, mode))
             return self._real_os.chmod(path, mode)
+
+        def link(self, source, target, **kwargs):
+            """Simulate Python 3.11 Windows hard-link support."""
+            if kwargs:
+                raise TypeError("follow_symlinks is unsupported")
+            self.link_calls.append((source, target))
+            return self._real_os.link(source, target)
 
         def fsync(self, fd):
             """Record and forward the marker file flush."""
@@ -362,7 +370,8 @@ def test_owner_marker_windows_mode_path_without_fchmod(monkeypatch, tmp_path):
 
     assert not hasattr(compat_os, "fchmod")
     assert len(compat_os.chmod_calls) == 1
-    assert compat_os.chmod_calls[0][1:] == (0o600, False)
+    assert compat_os.chmod_calls[0][1] == 0o600
+    assert len(compat_os.link_calls) == 1
     # One flush protects the marker bytes and one protects its POSIX directory entry
     # in this deterministic Linux simulation. The native Windows path still flushes bytes.
     assert len(compat_os.fsync_calls) >= 2
@@ -372,6 +381,44 @@ def test_owner_marker_windows_mode_path_without_fchmod(monkeypatch, tmp_path):
     reopened.acquire()
     reopened.release()
     marker.release()
+
+
+def test_owner_marker_windows_rejects_reparse_staging(monkeypatch, tmp_path):
+    """Windows identity checks reject a staging entry reported as a reparse point."""
+    monkeypatch.setattr("hermes_agent._is_windows_platform", lambda: True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = tmp_path / "profile"
+    fd, temp_name = tempfile.mkstemp(prefix=_WORKSPACE_OWNER_TEMP_PREFIX, dir=workspace)
+    os.close(fd)
+    staging = Path(temp_name)
+    monkeypatch.setattr(
+        "hermes_agent._is_reparse_point",
+        lambda path, _file_stat: path == staging,
+    )
+
+    with pytest.raises(OSError, match="ambiguous"):
+        _WorkspaceOwnerMarker(workspace, profile).acquire()
+
+    assert staging.exists()
+    assert not (workspace / ".hermes-reme-owner.json").exists()
+
+
+def test_simulated_windows_profile_lock_and_pending_write(monkeypatch, tmp_path):
+    """The Windows-compatible mode path covers both profile locks and the journal."""
+    monkeypatch.setattr("hermes_agent._is_windows_platform", lambda: True)
+    lock = _ProfileWriterLock(tmp_path / "reme" / ".writer.lock")
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+
+    lock.acquire()
+    try:
+        record = provider._append_pending_write({"session_id": "s", "messages": []})
+    finally:
+        lock.release()
+
+    assert record["id"]
+    assert provider._pending_path.read_text(encoding="utf-8").strip()
 
 
 def test_owner_marker_recovers_verified_crash_staging_file(tmp_path):
@@ -519,6 +566,23 @@ def test_owner_marker_native_windows_staging_recovery(tmp_path):
         _WorkspaceOwnerMarker(foreign_workspace, profile).acquire()
     assert foreign_file.exists()
     assert not (foreign_workspace / ".hermes-reme-owner.json").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file locking")
+def test_native_windows_profile_lock_and_pending_write(tmp_path):
+    """Native Windows exercises the lock and journal through the path-based mode helper."""
+    lock = _ProfileWriterLock(tmp_path / "reme" / ".writer.lock")
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+
+    lock.acquire()
+    try:
+        record = provider._append_pending_write({"session_id": "s", "messages": []})
+    finally:
+        lock.release()
+
+    assert record["id"]
+    assert provider._pending_path.read_text(encoding="utf-8").strip()
 
 
 def test_owner_marker_keeps_posix_staging_mode_strict(monkeypatch, tmp_path):

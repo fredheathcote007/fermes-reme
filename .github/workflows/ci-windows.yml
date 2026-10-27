@@ -52,4 +52,8 @@ jobs:
             -v
 
       - name: Run native Windows owner marker recovery test
-        run: python -m pytest tests/unit/test_fermes_bugbot_provider_regressions.py::test_owner_marker_native_windows_staging_recovery -v
+        run: |
+          python -m pytest `
+            tests/unit/test_fermes_bugbot_provider_regressions.py::test_owner_marker_native_windows_staging_recovery `
+            tests/unit/test_fermes_bugbot_provider_regressions.py::test_native_windows_profile_lock_and_pending_write `
+            -v

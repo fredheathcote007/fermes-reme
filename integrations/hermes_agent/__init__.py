@@ -94,10 +94,12 @@ def _set_private_file_mode(path: Path, fd: int) -> None:
         if chmod is None:
             raise OSError("private file mode is unsupported on Windows")
         try:
-            # Windows chmod only controls its read-only attribute.  The file
-            # came from mkstemp or an exclusive open, so do not silently skip
-            # this operation when a compatible stdlib implementation is absent.
-            chmod(path, stat.S_IREAD | stat.S_IWRITE, follow_symlinks=False)
+            # Python 3.11's Windows chmod does not implement follow_symlinks.
+            # The descriptor is retained from mkstemp/exclusive creation while
+            # the path-based operation is guarded by identity and reparse checks.
+            before = _verify_private_file_identity(path, fd, require_single_link=True)
+            chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            _verify_private_file_identity(path, fd, expected_stat=before)
         except (NotImplementedError, OSError, TypeError) as exc:
             raise OSError("private file mode is unsupported on Windows") from exc
         return
@@ -137,6 +139,46 @@ def _is_reparse_point(path: Path, file_stat: os.stat_result) -> bool:
 def _is_unsafe_link(path: Path, file_stat: os.stat_result) -> bool:
     """Return whether a path entry is a symlink or Windows reparse point."""
     return stat.S_ISLNK(file_stat.st_mode) or _is_reparse_point(path, file_stat)
+
+
+def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    """Return whether two stat results identify the same device and inode."""
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _owned_by_current_user(file_stat: os.stat_result, current_uid: int | None) -> bool:
+    """Return whether a stat result belongs to the current user when supported."""
+    return current_uid is None or file_stat.st_uid == current_uid
+
+
+def _verify_private_file_identity(
+    path: Path,
+    fd: int,
+    *,
+    expected_stat: os.stat_result | None = None,
+    require_single_link: bool = False,
+) -> os.stat_result:
+    """Verify that a path and open descriptor still name the same private file."""
+    path_stat = path.lstat()
+    fd_stat = os.fstat(fd)
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    if _is_unsafe_link(path, path_stat) or _is_unsafe_link(path, fd_stat):
+        raise OSError("private file target is ambiguous")
+    if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(fd_stat.st_mode):
+        raise OSError("private file target is ambiguous")
+    if not _same_file_identity(path_stat, fd_stat):
+        raise OSError("private file target is ambiguous")
+    if expected_stat is not None and not _same_file_identity(path_stat, expected_stat):
+        raise OSError("private file target is ambiguous")
+    if expected_stat is not None and not _same_file_identity(fd_stat, expected_stat):
+        raise OSError("private file target is ambiguous")
+    if require_single_link and path_stat.st_nlink != 1:
+        raise OSError("private file target is ambiguous")
+    if not _owned_by_current_user(path_stat, current_uid) or not _owned_by_current_user(fd_stat, current_uid):
+        raise OSError("private file target is ambiguous")
+    if not _safe_staging_mode(path_stat.st_mode) or not _safe_staging_mode(fd_stat.st_mode):
+        raise OSError("private file target is ambiguous")
+    return path_stat
 
 
 class _ProfileWriterLock:
@@ -334,18 +376,29 @@ class _WorkspaceOwnerMarker:
                     handle.write(encoded)
                     handle.flush()
                     _fsync_file(handle.fileno())
+                    temp_path = Path(temp_name)
+                    before_link = _verify_private_file_identity(
+                        temp_path,
+                        handle.fileno(),
+                        require_single_link=True,
+                    )
+                    try:
+                        if _is_windows_platform():
+                            # Windows Python 3.11 exposes CreateHardLink through
+                            # os.link but rejects the follow_symlinks keyword.
+                            os.link(temp_path, self.path)
+                        else:
+                            os.link(temp_path, self.path, follow_symlinks=False)
+                    except FileExistsError:
+                        self._read_existing()
+                        self._owned = True
+                        return
+                    _verify_private_file_identity(temp_path, handle.fileno(), expected_stat=before_link)
+                    _verify_private_file_identity(self.path, handle.fileno(), expected_stat=before_link)
+                    _fsync_directory(self.workspace)
             finally:
                 if fd >= 0:
                     os.close(fd)
-            try:
-                os.link(temp_name, self.path, follow_symlinks=False)
-            except FileExistsError:
-                self._read_existing()
-                self._owned = True
-                return
-            except (NotImplementedError, OSError) as exc:
-                raise OSError("workspace owner marker could not be atomically installed") from exc
-            _fsync_directory(self.workspace)
         except _WorkspaceOwnerConflict:
             raise
         except OSError as exc:
