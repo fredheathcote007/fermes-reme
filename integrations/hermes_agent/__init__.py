@@ -55,6 +55,11 @@ _HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
 def _fsync_directory(path: Path) -> None:
     """Flush a directory entry after creating or replacing the profile spool."""
+    if os.name == "nt":
+        # Windows does not expose a portable fsync-able directory handle.
+        # The file itself is flushed before publication; never substitute an
+        # unsafe rename when directory metadata cannot be flushed.
+        return
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -119,6 +124,10 @@ class _ProfileWriterLock:
             os.close(fd)
             with _HELD_PROFILE_LOCKS_LOCK:
                 _HELD_PROFILE_LOCKS.discard(self._key)
+
+
+class _WorkspaceOwnerConflict(OSError):
+    """The workspace marker belongs to a different Hermes profile."""
 
 
 class _WorkspaceOwnerMarker:
@@ -201,7 +210,7 @@ class _WorkspaceOwnerMarker:
             or marker.get("owner") != self.profile_home
             or marker.get("workspace") != str(self.workspace)
         ):
-            raise OSError("workspace belongs to another Hermes profile")
+            raise _WorkspaceOwnerConflict("workspace belongs to another Hermes profile")
 
     def acquire(self) -> None:
         """Create the owner marker atomically or validate its existing owner."""
@@ -214,28 +223,58 @@ class _WorkspaceOwnerMarker:
         encoded = (json.dumps(marker, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8")
         # Do not silently claim a workspace containing another identity's
         # historical data. Existing workspaces require an explicit migration.
-        if not self.path.exists() and any(self.workspace.iterdir()):
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            marker_exists = False
+        except OSError as exc:
+            raise OSError("workspace owner marker could not be inspected") from exc
+        else:
+            marker_exists = True
+        if not marker_exists and any(self.workspace.iterdir()):
             raise OSError("existing workspace is unowned; explicit migration required")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+
+        # Publishing the final name with O_EXCL before writing it leaves a
+        # corrupt marker behind if the process dies during the write. A
+        # private, durable temporary file plus a hard link publishes the
+        # completed bytes atomically and cannot overwrite a competing marker.
+        temp_name: str | None = None
         try:
-            fd = os.open(self.path, flags, 0o600)
-        except FileExistsError:
-            self._read_existing()
-            self._owned = True
-            return
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{_WORKSPACE_OWNER_FILENAME}.",
+                dir=self.workspace,
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    fd = -1
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            try:
+                os.link(temp_name, self.path)
+            except FileExistsError:
+                self._read_existing()
+                self._owned = True
+                return
+            except (NotImplementedError, OSError) as exc:
+                raise OSError("workspace owner marker could not be atomically installed") from exc
+            _fsync_directory(self.workspace)
+        except _WorkspaceOwnerConflict:
+            raise
         except OSError as exc:
-            raise OSError("workspace owner marker could not be created") from exc
-        try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, encoded)
-            os.fsync(fd)
-        except OSError as exc:
+            if str(exc).startswith("workspace owner marker"):
+                raise
             raise OSError("workspace owner marker could not be made durable") from exc
         finally:
-            os.close(fd)
-        _fsync_directory(self.workspace)
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
         self._owned = True
 
     def release(self) -> None:
@@ -721,8 +760,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     timeout=max(0.0, deadline - time.monotonic()),
                 )
                 self._deferred_backend_close = False
-                self._release_profile_lock()
-                self._release_workspace_owner()
+                self._release_profile_resources_if_writer_stopped()
             finally:
                 self._backend_lock.release()
         else:
@@ -741,6 +779,17 @@ class ReMeMemoryProvider(MemoryProvider):
         owner, self._workspace_owner = self._workspace_owner, None
         if owner is not None:
             owner.release()
+
+    def _release_profile_resources_if_writer_stopped(self) -> bool:
+        """Release profile ownership only after the writer completed journal handling."""
+        current = threading.current_thread()
+        with self._write_thread_lock:
+            writer = self._write_thread
+            if writer is not None and writer is not current and writer.is_alive():
+                return False
+            self._release_profile_lock()
+            self._release_workspace_owner()
+            return True
 
     def _atexit_shutdown(self) -> None:
         try:
@@ -781,6 +830,13 @@ class ReMeMemoryProvider(MemoryProvider):
 
     def _disable_without_profile(self, session_id: str, profile_id: Any) -> None:
         """Fail closed when Hermes does not provide its profile home."""
+        with self._write_thread_lock:
+            if self._write_thread is not None and self._write_thread.is_alive():
+                raise RuntimeError(
+                    "Cannot disable ReMe while its previous writer is still running",
+                )
+            self._accept_writes = False
+            self._release_profile_lock()
         with self._backend_lock:
             self._close_backend_locked()
         self._config = None
@@ -789,7 +845,6 @@ class ReMeMemoryProvider(MemoryProvider):
         self._profile_id = str(profile_id or "default")
         self._pending_path = None
         self._release_workspace_owner()
-        self._accept_writes = False
         self._backend_available = False
         self._recall_status = None
         self._unavailable_reason = "hermes_home is required for profile-scoped ReMe state"
@@ -978,6 +1033,8 @@ class ReMeMemoryProvider(MemoryProvider):
             with self._write_thread_lock:
                 if self._write_thread is current:
                     self._write_thread = None
+            if self._shutdown_started:
+                self._release_profile_resources_if_writer_stopped()
 
     def _record_payload(
         self,
@@ -1124,8 +1181,6 @@ class ReMeMemoryProvider(MemoryProvider):
         if self._deferred_backend_close:
             self._close_backend_locked()
             self._deferred_backend_close = False
-            self._release_profile_lock()
-            self._release_workspace_owner()
 
     def _close_backend_locked(self, *, timeout: float | None = None) -> None:
         backend, self._backend = self._backend, None
