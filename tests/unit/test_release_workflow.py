@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release-python.yml"
 
 
@@ -17,14 +16,25 @@ def _publication_allowed(
     event_sha_is_on_main: bool,
 ) -> bool:
     """Mirror the workflow's opt-in, event/ref, and event-SHA ancestry policy."""
-    return publishing_enabled and (
-        (event_name == "workflow_dispatch" and ref == "refs/heads/main")
-        or (event_name == "release" and target_commitish == "main")
-    ) and event_sha_is_on_main
+    return (
+        publishing_enabled
+        and (
+            (event_name == "workflow_dispatch" and ref == "refs/heads/main")
+            or (event_name == "release" and target_commitish == "main")
+        )
+        and event_sha_is_on_main
+    )
 
 
 @pytest.mark.parametrize(
-    ("event_name", "ref", "target_commitish", "publishing_enabled", "event_sha_is_on_main", "expected"),
+    (
+        "event_name",
+        "ref",
+        "target_commitish",
+        "publishing_enabled",
+        "event_sha_is_on_main",
+        "expected",
+    ),
     [
         ("workflow_dispatch", "refs/heads/main", "", True, True, True),
         ("workflow_dispatch", "refs/heads/main", "", True, False, False),
@@ -46,9 +56,16 @@ def test_release_workflow_publication_truth_table(
     expected: bool,
 ) -> None:
     """Keep release and dispatch publication paths behind the same trust-boundary checks."""
-    assert _publication_allowed(
-        event_name, ref, target_commitish, publishing_enabled, event_sha_is_on_main
-    ) is expected
+    assert (
+        _publication_allowed(
+            event_name,
+            ref,
+            target_commitish,
+            publishing_enabled,
+            event_sha_is_on_main,
+        )
+        is expected
+    )
 
 
 def test_release_workflow_is_valid_yaml_and_guards_both_jobs() -> None:
