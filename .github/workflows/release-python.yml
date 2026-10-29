@@ -26,8 +26,40 @@ jobs:
       expected_version: ${{ github.event.release.tag_name }}
       upload_artifacts: true
 
+  validate-publish-target:
+    name: Validate publication target
+    if: >-
+      vars.FERMES_ENABLE_PUBLISHING == 'true' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'release' && github.event.release.target_commitish == 'main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the publication commit is on main
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          # GITHUB_SHA is the tagged commit for published release events and the selected commit for dispatch.
+          target_commit="$WORKFLOW_SHA"
+          git merge-base --is-ancestor "$target_commit" refs/remotes/origin/main
+
   publish-reme:
-    needs: build
+    if: >-
+      vars.FERMES_ENABLE_PUBLISHING == 'true' &&
+      needs.build.result == 'success' &&
+      needs.validate-publish-target.result == 'success' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'release' && github.event.release.target_commitish == 'main'))
+    needs: [build, validate-publish-target]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi

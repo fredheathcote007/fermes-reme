@@ -1,0 +1,24 @@
+# Fermes ReMe is maintained by @fredheathcote007. These ownership entries identify
+# the maintainer; they do not require a second reviewer or add branch protection.
+
+/.github/ @fredheathcote007
+/.github/workflows/ @fredheathcote007
+/SECURITY.md @fredheathcote007
+
+# Dependency manifests and release/CI configuration.
+/**/pyproject.toml @fredheathcote007
+/**/package.json @fredheathcote007
+/**/package-lock.json @fredheathcote007
+/scripts/ @fredheathcote007
+
+# Sensitive runtime, file, service, integration, and container boundaries.
+/reme/config/ @fredheathcote007
+/reme/components/agent_wrapper/ @fredheathcote007
+/reme/components/client/ @fredheathcote007
+/reme/components/file_store/ @fredheathcote007
+/reme/components/service/ @fredheathcote007
+/reme/components/outbound_proxy/ @fredheathcote007
+/reme/steps/file_io/ @fredheathcote007
+/integrations/ @fredheathcote007
+/Dockerfile @fredheathcote007
+/docker-compose.yml @fredheathcote007

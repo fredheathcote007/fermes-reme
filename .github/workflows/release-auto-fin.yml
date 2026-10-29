@@ -150,6 +150,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: vars.FERMES_ENABLE_PUBLISHING == 'true' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -101,7 +101,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.ref == 'refs/heads/main'
+    # Fork safety: package publication is opt-in through a reviewed repository variable.
+    if: github.ref == 'refs/heads/main' && vars.FERMES_ENABLE_PUBLISHING == 'true'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
