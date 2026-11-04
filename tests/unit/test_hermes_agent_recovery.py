@@ -13,7 +13,7 @@ import types
 from dataclasses import dataclass
 from pathlib import Path
 
-from tests.unit.hermes_agent_test_support import FakeBackend
+from unit.hermes_agent_test_support import FakeBackend
 
 _PLUGIN_PARENT = Path(__file__).resolve().parents[2] / "integrations"
 if str(_PLUGIN_PARENT) not in sys.path:
