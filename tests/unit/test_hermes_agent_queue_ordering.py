@@ -26,6 +26,28 @@ config_path = _integration.config_path
 TURN_PAYLOAD_MODULE = importlib.import_module("hermes_agent.turn_payload")
 
 
+class ManualTimer:
+    """Timer double whose wakeup is driven explicitly by the test."""
+
+    instances = []
+
+    def __init__(self, _delay, callback):
+        self._callback = callback
+        self.cancelled = False
+        self.started = False
+        self.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.cancelled:
+            self._callback()
+
+
 def test_spooled_turn_keeps_created_at_across_midnight_and_retry(monkeypatch, tmp_path):
     entered = threading.Event()
     allow_first = threading.Event()
@@ -206,6 +228,89 @@ def test_failed_first_record_blocks_later_record_until_recovery(monkeypatch, tmp
     assert backend.request_ids[2] != backend.request_ids[1]
     quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
     assert not quarantine.exists()
+
+
+def test_retry_rebuilds_fifo_when_new_turn_arrives_before_timer(monkeypatch, tmp_path):
+    ManualTimer.instances = []
+    monkeypatch.setattr(PLUGIN_MODULE.threading, "Timer", ManualTimer)
+    backend = FakeBackend()
+    first_failed = threading.Event()
+    retry_scheduled = threading.Event()
+    retry_started = threading.Event()
+    all_writes = threading.Event()
+    seen = []
+
+    def auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, timeout
+        seen.append((request_id, messages[0]["content"]))
+        if len(seen) == 1:
+            first_failed.set()
+            return {"success": False, "answer": "transient"}
+        if len(seen) == 2:
+            retry_started.set()
+        if len(seen) == 4:
+            all_writes.set()
+        return {"success": True}
+
+    backend.auto_memory = auto_memory
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=60))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    schedule_retry = provider._schedule_retry
+
+    def schedule_and_signal(record):
+        schedule_retry(record)
+        retry_scheduled.set()
+
+    monkeypatch.setattr(provider, "_schedule_retry", schedule_and_signal)
+    provider.sync_turn("first", "assistant")
+    assert first_failed.wait(timeout=1)
+    assert retry_scheduled.wait(timeout=1)
+    assert len(ManualTimer.instances) == 1
+
+    # Simulate the cooldown expiring while its timer is still waiting to run.
+    provider._next_write_attempt = time.monotonic() - 1
+    provider.sync_turn("second", "assistant")
+    assert retry_started.wait(timeout=1)
+    provider.sync_turn("third", "assistant")
+    assert all_writes.wait(timeout=1)
+    provider.shutdown()
+
+    assert [content for _request_id, content in seen] == [
+        "first",
+        "first",
+        "second",
+        "third",
+    ]
+    assert ManualTimer.instances[0].cancelled is True
+    assert provider._read_pending_writes() == []
+
+
+def test_early_retry_timer_rearms_once_and_shutdown_cancels_wakeup(monkeypatch, tmp_path):
+    ManualTimer.instances = []
+    monkeypatch.setattr(PLUGIN_MODULE.threading, "Timer", ManualTimer)
+    backend = FakeBackend()
+    backend.auto_memory = lambda *args, **kwargs: {"success": False, "answer": "transient"}
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=60))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path)
+    provider.sync_turn("queued", "assistant")
+    deadline = time.monotonic() + 1
+    while len(ManualTimer.instances) < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(ManualTimer.instances) == 1
+
+    provider._next_write_attempt = time.monotonic() + 60
+    ManualTimer.instances[0].fire()
+    assert len(ManualTimer.instances) == 2
+    assert len(provider._retry_timers) == 1
+    provider.shutdown()
+
+    assert provider._retry_timers == set()
+    assert ManualTimer.instances[1].cancelled is True
+    assert provider._read_pending_writes()
 
 
 def test_restart_replays_pending_records_in_spool_order(monkeypatch, tmp_path):

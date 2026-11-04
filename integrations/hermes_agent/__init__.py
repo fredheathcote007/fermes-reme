@@ -43,6 +43,7 @@ from .http_backend import HttpReMeBackend
 from .retry_policy import is_permanent_write_failure as _is_permanent_write_failure
 from .turn_payload import build_turn_payload as _build_turn_payload
 from .turn_payload import scoped_session_id
+from .write_queue import RetryWakeup, rebuild_write_queue_locked
 from .durability import (
     _fsync_directory as _durability_fsync_directory,
     _fsync_file as _durability_fsync_file,
@@ -421,6 +422,8 @@ class ReMeMemoryProvider(MemoryProvider):
         self._write_thread_lock = threading.RLock()
         self._pending_lock = threading.Lock()
         self._retry_timers: set[threading.Timer] = set()
+        self._retry_wakeup = RetryWakeup(self)
+        self._retry_wakeup_pending, self._writer_starting, self._pending_generation = False, False, 0
         self._pending_path: Path | None = None
         self._profile_lock: _ProfileWriterLock | None = None
         self._workspace_owner: _WorkspaceOwnerMarker | None = None
@@ -585,6 +588,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._write_queue = queue.Queue()
         self._queued_record_ids = set()
         self._retry_timers = set()
+        self._retry_wakeup_pending, self._writer_starting, self._pending_generation = False, False, 0
         self._write_thread = None
         self._shutdown_started = False
         self._deferred_backend_close = False
@@ -839,6 +843,8 @@ class ReMeMemoryProvider(MemoryProvider):
             self._shutdown_started = True
             self._accept_writes = False
             thread = self._write_thread
+            self._retry_wakeup.cancel_locked()
+            self._retry_wakeup_pending = False
             if thread is not None:
                 self._write_queue.put(None)
         if thread is not None:
@@ -926,6 +932,7 @@ class ReMeMemoryProvider(MemoryProvider):
             except (OSError, TypeError, ValueError) as exc:
                 logger.error("ReMe could not durably accept a completed turn: %s", exc)
                 return False
+            self._pending_generation += 1
             self._queue_pending_records((record,))
             self._start_writer_if_needed()
             return True
@@ -953,20 +960,41 @@ class ReMeMemoryProvider(MemoryProvider):
         logger.warning("ReMe provider is unavailable because Hermes supplied no hermes_home")
 
     def _start_writer_if_needed(self) -> None:
+        """Start one writer after taking a durable, FIFO-ordered queue snapshot."""
         with self._write_thread_lock:
-            if self._write_thread is not None and self._write_thread.is_alive():
+            if self._write_thread is not None or self._writer_starting:
                 return
             if time.monotonic() < self._next_write_attempt:
+                if self._retry_wakeup_pending:
+                    self._retry_wakeup.arm_locked()
                 return
-            self._queue_pending_records()
-            if self._write_queue.empty():
+            self._writer_starting = True
+            generation = self._pending_generation
+        records = self._read_pending_writes()
+        with self._write_thread_lock:
+            if self._shutdown_started:
+                self._writer_starting = False
                 return
-            self._write_thread = spawn_profile_thread(
-                self._write_loop,
-                args=(self._write_queue,),
-                name="reme-memory-writer",
-            )
-            self._write_thread.start()
+            if generation != self._pending_generation:
+                self._writer_starting = False
+                self._start_writer_if_needed()
+                return
+            try:
+                rebuild_write_queue_locked(self, records)
+                if self._write_queue.empty():
+                    self._retry_wakeup_pending = False
+                    self._retry_wakeup.cancel_locked()
+                    return
+                self._write_thread = spawn_profile_thread(
+                    self._write_loop,
+                    args=(self._write_queue,),
+                    name="reme-memory-writer",
+                )
+                self._retry_wakeup_pending = False
+                self._retry_wakeup.cancel_locked()
+                self._write_thread.start()
+            finally:
+                self._writer_starting = False
 
     def _queue_pending_records(
         self,
@@ -1246,12 +1274,15 @@ class ReMeMemoryProvider(MemoryProvider):
                         self._defer_write_retry()
                         retry = True
                     if retry:
+                        failure_kind = self._last_write_failure_kind or "retryable"
+                        if failure_kind == "cooldown":
+                            self._schedule_retry(payload)
+                            return
                         try:
                             prior_attempts = int(payload.get("attempts", 0))
                         except (TypeError, ValueError):
                             prior_attempts = 0
                         payload["attempts"] = max(0, prior_attempts) + 1
-                        failure_kind = self._last_write_failure_kind or "retryable"
                         if failure_kind == "permanent":
                             quarantine_reason = "permanent_refusal"
                             if self._quarantine_pending_write(payload, quarantine_reason):
@@ -1270,15 +1301,20 @@ class ReMeMemoryProvider(MemoryProvider):
                         self._schedule_retry(payload)
                         return
                 finally:
-                    if payload is not None:
-                        with self._write_thread_lock:
+                    with self._write_thread_lock:
+                        if payload is not None:
                             self._queued_record_ids.discard(payload.get("id", ""))
-                    write_queue.task_done()
+                        write_queue.task_done()
         finally:
-            current = threading.current_thread()
+            should_restart = False
             with self._write_thread_lock:
-                if self._write_thread is current:
+                if self._write_thread is threading.current_thread():
                     self._write_thread = None
+                    should_restart = (
+                        self._retry_wakeup_pending and not self._shutdown_started and not self._retry_timers
+                    )
+            if should_restart:
+                self._start_writer_if_needed()
             if self._shutdown_started:
                 self._release_profile_resources_if_writer_stopped()
 
@@ -1291,6 +1327,7 @@ class ReMeMemoryProvider(MemoryProvider):
     ) -> bool:
         self._last_write_failure_kind = ""
         if respect_cooldown and time.monotonic() < self._next_write_attempt:
+            self._last_write_failure_kind = "cooldown"
             logger.warning(
                 "ReMe write for session %s skipped during cooldown",
                 payload["session_id"],
@@ -1327,7 +1364,8 @@ class ReMeMemoryProvider(MemoryProvider):
                 return True
             except ReMeBackendError as exc:
                 self._last_write_failure_kind = "permanent" if _is_permanent_write_failure(exc) else "retryable"
-                self._defer_write_retry()
+                if self._last_write_failure_kind != "permanent":
+                    self._defer_write_retry()
                 logger.warning(
                     "ReMe recording failed at %s (%s)",
                     self._backend_label,
@@ -1343,40 +1381,13 @@ class ReMeMemoryProvider(MemoryProvider):
         self._next_write_attempt = max(self._next_write_attempt, self._next_health_probe, retry_at)
 
     def _schedule_retry(self, record: dict[str, Any]) -> None:
-        """Retry the failed record first, preserving the durable queue order."""
-        delay = max(0.01, self._next_write_attempt - time.monotonic())
-        timer: threading.Timer
-
-        def enqueue() -> None:
-            with self._write_thread_lock:
-                self._retry_timers.discard(timer)
-                if self._shutdown_started:
-                    return
-                queued: list[dict[str, Any]] = []
-                while True:
-                    try:
-                        queued_record = self._write_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    try:
-                        if queued_record is not None and queued_record.get("id") != record["id"]:
-                            queued.append(queued_record)
-                    finally:
-                        self._write_queue.task_done()
-                self._queued_record_ids.discard(record["id"])
-                self._queued_record_ids.add(record["id"])
-                self._write_queue.put(record)
-                for queued_record in queued:
-                    self._write_queue.put(queued_record)
-                self._start_writer_if_needed()
-
-        timer = threading.Timer(delay, enqueue)
-        timer.daemon = True
+        """Arrange one wakeup; the durable journal supplies the record later."""
+        del record
         with self._write_thread_lock:
             if self._shutdown_started:
                 return
-            self._retry_timers.add(timer)
-        timer.start()
+            self._retry_wakeup_pending = True
+            self._retry_wakeup.arm_locked()
 
     # pylint: disable-next=too-many-return-statements
     def _ensure_backend(

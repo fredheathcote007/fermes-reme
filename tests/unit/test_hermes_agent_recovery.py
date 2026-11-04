@@ -305,6 +305,46 @@ def test_permanent_refusal_is_quarantined_instead_of_retried_forever(monkeypatch
     assert pending.read_text(encoding="utf-8") == ""
 
 
+def test_permanent_refusal_does_not_cooldown_following_record(monkeypatch, tmp_path):
+    backend = _FakeBackend()
+    calls = []
+
+    def auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, timeout
+        calls.append((request_id, messages[0]["content"]))
+        if len(calls) == 1:
+            raise ReMeBackendError("Error: protected note marker is contradictory")
+        return {"success": True}
+
+    backend.auto_memory = auto_memory
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=60))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    updated = []
+    original_update = provider._update_pending_write
+
+    def capture_update(record):
+        updated.append((record["id"], record["attempts"]))
+        return original_update(record)
+
+    monkeypatch.setattr(provider, "_update_pending_write", capture_update)
+    provider.sync_turn("refused", "assistant")
+    provider.sync_turn("valid", "assistant")
+    deadline = time.monotonic() + 1
+    while len(calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    assert [content for _request_id, content in calls] == ["refused", "valid"]
+    assert not updated
+    assert provider._next_write_attempt == 0.0
+    assert provider._read_pending_writes() == []
+    quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
+    assert len(quarantine.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_retryable_error_prefix_remains_durable_and_is_not_quarantined(monkeypatch, tmp_path):
     backend = _FakeBackend()
     retry_invocations = []
