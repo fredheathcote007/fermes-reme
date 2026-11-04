@@ -50,3 +50,10 @@ jobs:
             tests/unit/test_auto_dream.py::test_dream_extract_matches_posix_catalog_paths `
             tests/unit/test_read_with_neighbors.py::test_read_with_neighbors_uses_posix_nested_path `
             -v
+
+      - name: Run native Windows owner marker recovery test
+        run: |
+          python -m pytest `
+            tests/unit/test_fermes_bugbot_provider_regressions.py::test_owner_marker_native_windows_staging_recovery `
+            tests/unit/test_fermes_bugbot_provider_regressions.py::test_native_windows_profile_lock_and_pending_write `
+            -v
