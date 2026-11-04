@@ -42,6 +42,7 @@ from .config import (
 )
 from .embedded_backend import EmbeddedReMeBackend
 from .http_backend import HttpReMeBackend
+from .retry_policy import is_permanent_write_failure as _is_permanent_write_failure
 from .durability import (
     _fsync_directory as _durability_fsync_directory,
     _fsync_file as _durability_fsync_file,
@@ -83,33 +84,6 @@ _same_file_identity = _durability_same_file_identity
 _set_private_file_mode = _durability_set_private_file_mode
 _verify_private_file_identity = _durability_verify_private_file_identity
 _configure_durability_runtime(globals())
-
-
-def _is_permanent_write_failure(error: BaseException) -> bool:
-    """Recognize application refusals that cannot improve by replaying unchanged input."""
-    detail = str(error).strip().lower()
-    return any(
-        marker in detail
-        for marker in (
-            "request_id was already used for different input",
-            "protected note marker",
-            "protected note belongs to",
-            "source provenance",
-            "superseded",
-            "foreign",
-            "frontmatter key collision",
-            "protected receipt is malformed",
-            "protected receipt is not a ",
-            "protected receipt fingerprint does not match",
-            "protected receipt has no note path",
-            "protected receipt has an unknown outcome",
-            "protected receipt does not match",
-            "protected receipt response is not bound",
-            "protected receipt request does not match",
-            "protected prior commit has no durable receipt",
-            "protected note body digest",
-        )
-    )
 
 
 class _ProfileWriterLock:

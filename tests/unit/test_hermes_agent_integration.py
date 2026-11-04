@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.unit.hermes_agent_test_support import FakeBackend
+
 _PLUGIN_PARENT = Path(__file__).resolve().parents[2] / "integrations"
 if str(_PLUGIN_PARENT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_PARENT))
@@ -547,42 +549,8 @@ def test_embedded_backend_owns_application_lifecycle(monkeypatch, tmp_path):
     assert backend.state == "closed"
 
 
-class _FakeBackend:
-    label = "fake"
-
-    def __init__(self):
-        self.writes = []
-        self.request_ids = []
-        self.closed = False
-
-    def start(self):
-        return None
-
-    def health(self, *, timeout):
-        del timeout
-        return {"success": True, "metadata": {"health": {"healthy": True}}}
-
-    def search(self, query, *, limit, timeout):
-        del query, limit, timeout
-        return {
-            "success": True,
-            "answer": " remembered ",
-            "metadata": {"counts": {"returned": 2}},
-        }
-
-    def auto_memory(self, session_id, messages, *, timeout, request_id=None):
-        del timeout
-        self.writes.append((session_id, messages))
-        self.request_ids.append(request_id)
-        return {"success": True}
-
-    def close(self, *, timeout):
-        del timeout
-        self.closed = True
-
-
 def test_provider_selects_backend_recalls_and_writes(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
     provider = ReMeMemoryProvider()
@@ -730,7 +698,7 @@ def test_embedded_provider_rejects_reused_workspace_across_profiles(monkeypatch,
     workspace = tmp_path / "shared-workspace"
     stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backend)
 
@@ -765,7 +733,7 @@ def test_workspace_owner_failure_does_not_log_marker_contents(monkeypatch, tmp_p
     stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: _FakeBackend())
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: FakeBackend())
 
     provider = ReMeMemoryProvider()
     provider.initialize("session", hermes_home=tmp_path / "profile")
@@ -779,7 +747,7 @@ def test_embedded_provider_same_profile_restart_reuses_owner_marker(monkeypatch,
     workspace = tmp_path / "workspace"
     stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
-    backends = [_FakeBackend(), _FakeBackend()]
+    backends = [FakeBackend(), FakeBackend()]
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backends.pop(0))
 
@@ -812,7 +780,7 @@ def test_custom_embedded_config_requires_explicit_warning_opt_in(monkeypatch, tm
         reme_config=str(custom),
         allow_custom_config=True,
     )
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backend)
     provider = ReMeMemoryProvider()
@@ -822,7 +790,7 @@ def test_custom_embedded_config_requires_explicit_warning_opt_in(monkeypatch, tm
 
 
 def test_same_profile_provider_fails_closed_when_writer_is_owned(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
     owner = ReMeMemoryProvider()
@@ -843,7 +811,7 @@ def test_same_profile_provider_fails_closed_when_writer_is_owned(monkeypatch, tm
 
 
 def test_reinitialize_closes_previous_backend(monkeypatch, tmp_path):
-    backends = [_FakeBackend(), _FakeBackend()]
+    backends = [FakeBackend(), FakeBackend()]
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backends.pop(0))
     provider = ReMeMemoryProvider()
@@ -858,7 +826,7 @@ def test_reinitialize_closes_previous_backend(monkeypatch, tmp_path):
 
 
 def test_invalid_reinitialize_closes_previous_backend_and_disables_writes(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     outcomes = iter([ReMeConfig(), ReMeConfigError("broken profile config")])
 
     def load(_home=None):
@@ -887,7 +855,7 @@ def test_invalid_reinitialize_closes_previous_backend_and_disables_writes(monkey
 
 
 def test_provider_failure_does_not_escape_model_path(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     backend.search = lambda *args, **kwargs: (_ for _ in ()).throw(
         ReMeBackendError("offline"),
     )
@@ -920,7 +888,7 @@ def test_backend_creation_is_serialized(monkeypatch):
     def factory(config):
         del config
         time.sleep(0.05)
-        backend = _FakeBackend()
+        backend = FakeBackend()
         created.append(backend)
         return backend
 
@@ -948,7 +916,7 @@ def test_shutdown_defers_close_until_inflight_recall_finishes():
     entered = threading.Event()
     release = threading.Event()
 
-    class BlockingBackend(_FakeBackend):
+    class BlockingBackend(FakeBackend):
         def search(self, query, *, limit, timeout):
             del query, limit, timeout
             entered.set()
@@ -978,9 +946,9 @@ def test_shutdown_drains_all_accepted_writes_before_closing_backend(tmp_path):
     entered = threading.Event()
     release = threading.Event()
 
-    class BlockingBackend(_FakeBackend):
+    class BlockingBackend(FakeBackend):
         def auto_memory(self, session_id, messages, *, timeout, request_id=None):
-            del timeout
+            del timeout, request_id
             self.writes.append((session_id, messages))
             if len(self.writes) == 1:
                 entered.set()
@@ -1015,7 +983,7 @@ def test_shutdown_drains_all_accepted_writes_before_closing_backend(tmp_path):
 def test_writer_inherits_hermes_profile_context(tmp_path):
     profile = contextvars.ContextVar("test_hermes_profile", default="default")
 
-    class ContextBackend(_FakeBackend):
+    class ContextBackend(FakeBackend):
         def __init__(self):
             super().__init__()
             self.profile = None
@@ -1045,9 +1013,9 @@ def test_recall_timeout_includes_waiting_for_background_write(tmp_path):
     write_release = threading.Event()
     search_entered = threading.Event()
 
-    class BlockingBackend(_FakeBackend):
+    class BlockingBackend(FakeBackend):
         def auto_memory(self, session_id, messages, *, timeout, request_id=None):
-            del session_id, messages, timeout
+            del session_id, messages, timeout, request_id
             write_entered.set()
             write_release.wait(timeout=2)
             return {"success": True}
@@ -1181,11 +1149,11 @@ def test_shutdown_discard_keeps_sentinel_for_inflight_writer():
 
 
 def test_accepted_write_is_replayed_after_backend_failure(monkeypatch, tmp_path):
-    failed = _FakeBackend()
+    failed = FakeBackend()
     failed.auto_memory = lambda *args, **kwargs: (_ for _ in ()).throw(
         ReMeBackendError("injected write failure"),
     )
-    recovered = _FakeBackend()
+    recovered = FakeBackend()
     backends = iter([failed, recovered])
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: next(backends))
@@ -1210,62 +1178,8 @@ def test_accepted_write_is_replayed_after_backend_failure(monkeypatch, tmp_path)
     assert pending.read_text(encoding="utf-8") == ""
 
 
-def test_permanent_refusal_is_quarantined_instead_of_retried_forever(monkeypatch, tmp_path):
-    backend = _FakeBackend()
-    backend.auto_memory = lambda *args, **kwargs: (_ for _ in ()).throw(
-        ReMeBackendError("Error: protected note marker is contradictory"),
-    )
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
-
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
-    provider.sync_turn("refused user", "assistant")
-    quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
-    deadline = time.monotonic() + 2
-    while not quarantine.exists() and time.monotonic() < deadline:
-        time.sleep(0.005)
-    provider.shutdown()
-
-    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
-    assert quarantine.is_file()
-    assert json.loads(quarantine.read_text(encoding="utf-8").splitlines()[0])["reason"] == "permanent_refusal"
-    assert pending.read_text(encoding="utf-8") == ""
-
-
-def test_retryable_error_prefix_remains_durable_and_is_not_quarantined(monkeypatch, tmp_path):
-    backend = _FakeBackend()
-    retry_invocations = []
-    retry_started = threading.Event()
-
-    def retryable_auto_memory(*args, **kwargs):
-        del args, kwargs
-        retry_invocations.append(None)
-        retry_started.set()
-        raise ReMeBackendError("Error: durable memory write failed; request remains eligible for retry")
-
-    backend.auto_memory = retryable_auto_memory
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
-
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
-    provider.sync_turn("retryable user", "assistant")
-    deadline = time.monotonic() + 0.3
-    retry_started.wait(timeout=max(0, deadline - time.monotonic()))
-    while len(retry_invocations) < 2 and time.monotonic() < deadline:
-        time.sleep(0.005)
-    provider.shutdown()
-
-    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
-    quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
-    assert len(retry_invocations) >= 2
-    assert pending.read_text(encoding="utf-8").strip()
-    assert not quarantine.exists()
-
-
 def test_backend_unavailable_cycles_keep_spool_until_health_recovers(monkeypatch, tmp_path):
-    class FlakyHealthBackend(_FakeBackend):
+    class FlakyHealthBackend(FakeBackend):
         def __init__(self):
             super().__init__()
             self.health_failures = 7
@@ -1297,7 +1211,7 @@ def test_backend_unavailable_cycles_keep_spool_until_health_recovers(monkeypatch
 
 
 def test_backend_unavailable_result_is_backed_off_without_attempt_budget(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     provider = ReMeMemoryProvider()
     provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
     provider._accept_writes = True
@@ -1350,7 +1264,7 @@ def test_embedded_mode_fails_fast_as_unsupported_on_windows(monkeypatch, tmp_pat
 
 
 def test_retried_spool_record_reuses_record_id_after_ack_failure(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
 
@@ -1445,7 +1359,7 @@ def test_embedded_reme_receipt_covers_success_before_spool_ack_crash_window(monk
 
 
 def test_failed_first_record_does_not_stall_later_record(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     calls = 0
 
     def auto_memory(session_id, messages, *, timeout, request_id=None):
@@ -1478,7 +1392,7 @@ def test_failed_first_record_does_not_stall_later_record(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("response", [{"success": False}, [], None])
 def test_false_or_malformed_auto_memory_ack_keeps_spool_record(monkeypatch, tmp_path, response):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     backend.auto_memory = lambda *args, **kwargs: response
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
