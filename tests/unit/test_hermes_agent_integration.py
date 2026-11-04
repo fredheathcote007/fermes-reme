@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from unit.hermes_agent_test_support import FakeBackend
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hermes_agent_test_support import FakeBackend
 
 _PLUGIN_PARENT = Path(__file__).resolve().parents[2] / "integrations"
 if str(_PLUGIN_PARENT) not in sys.path:

@@ -114,7 +114,7 @@ import sys
 import time
 
 test_path, ready_fd, hermes_home = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-spec = importlib.util.spec_from_file_location("hermes_agent_test_support", test_path)
+spec = importlib.util.spec_from_file_location("hermes_agent_integration_subprocess", test_path)
 module = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 sys.modules[spec.name] = module
