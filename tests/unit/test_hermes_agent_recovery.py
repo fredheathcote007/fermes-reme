@@ -57,6 +57,24 @@ def test_protected_identity_mismatch_remains_permanent(detail):
 
 
 @pytest.mark.parametrize(
+    ("detail", "permanent"),
+    [
+        ("protected receipt is malformed", True),
+        ("protected receipt response is malformed", True),
+        ("protected receipt does not contain a successful commit", True),
+        ("protected no-op receipt contains commit evidence", True),
+        ("protected no-op receipt response is malformed", True),
+        ("protected prior commit receipt is malformed", True),
+        ("protected receipt storage error: [Errno 13] Permission denied", False),
+        ("protected receipt storage error: [Errno 24] Too many open files", False),
+        ("protected prior commit receipt storage error", False),
+    ],
+)
+def test_receipt_corruption_is_permanent_but_storage_errors_retry(detail, permanent):
+    assert PLUGIN_MODULE._is_permanent_write_failure(ReMeBackendError(detail)) is permanent
+
+
+@pytest.mark.parametrize(
     ("response", "message"),
     [
         ({"success": False, "error": "memory extraction exploded"}, "memory extraction exploded"),

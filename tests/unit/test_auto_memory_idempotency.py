@@ -444,6 +444,126 @@ async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_option_b_create_collision_allocates_unique_note_without_replay(tmp_path, monkeypatch):
+    """Two protected sessions sharing a proposed name retain both revisions."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/shared-name.md",
+                    "name": "shared-name",
+                    "description": "A shared-name test note.",
+                    "content": f"Protected fact {len(calls)}.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="collision-a", session_id="collision-session-a", **request)
+        second = await app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request)
+        replay = await app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request)
+
+    assert first.success and second.success and replay.success
+    assert first.metadata["path"] == "daily/2026-10-21/shared-name.md"
+    assert second.metadata["path"].startswith("daily/2026-10-21/shared-name--")
+    assert second.metadata["path"] != first.metadata["path"]
+    assert replay.metadata["path"] == second.metadata["path"]
+    assert len(calls) == 2
+    assert (
+        "Protected fact 1."
+        in frontmatter.loads(
+            (workspace / first.metadata["path"]).read_text(encoding="utf-8"),
+        ).content
+    )
+    assert (
+        "Protected fact 2."
+        in frontmatter.loads(
+            (workspace / second.metadata["path"]).read_text(encoding="utf-8"),
+        ).content
+    )
+
+
+@pytest.mark.asyncio
+async def test_option_b_recovers_after_malformed_day_index_is_repaired(tmp_path, monkeypatch):
+    """A derived-index parse failure does not force protected model replay."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    index = workspace / "daily/2026-10-21.md"
+    index.parent.mkdir(parents=True)
+    malformed_index = b"---\ntags: [\n---\nmanual index bytes\n"
+    index.write_bytes(malformed_index)
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/repaired-index.md",
+                    "name": "repaired-index",
+                    "description": "A recovery test note.",
+                    "content": "The protected recovery fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    original_receipt = AutoMemoryStep._write_option_b_receipt
+    receipt_calls = []
+
+    async def lose_first_receipt(step, path, fingerprint):
+        receipt_calls.append(1)
+        if len(receipt_calls) == 1:
+            raise OSError("simulated receipt loss")
+        await original_receipt(step, path, fingerprint)
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    monkeypatch.setattr(AutoMemoryStep, "_write_option_b_receipt", lose_first_receipt)
+    request = {
+        "request_id": "malformed-index-recovery",
+        "session_id": "malformed-index-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", **request)
+        note = workspace / "daily/2026-10-21/repaired-index.md"
+        assert not first.success
+        assert note.is_file()
+        assert index.read_bytes() == malformed_index
+        assert not list((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+
+        index.write_text("---\nname: 2026-10-21\n---\nrepaired\n", encoding="utf-8")
+        second = await app.run_job("auto_memory", **request)
+
+    assert second.success
+    assert calls == [1]
+    assert receipt_calls == [1, 1]
+    assert note.read_text(encoding="utf-8").count("The protected recovery fact.") == 1
+
+
+@pytest.mark.asyncio
 async def test_option_b_recovery_scans_prior_daily_directory_before_appending(tmp_path, monkeypatch):
     """A receipt loss recovered after midnight does not invoke the model twice."""
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper

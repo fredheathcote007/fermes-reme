@@ -587,7 +587,10 @@ class AutoMemoryStep(BaseStep):
             raise RuntimeError("protected receipt is not a commit")
         if record.get("fingerprint") != fingerprint:
             raise RuntimeError("protected receipt fingerprint does not match its marker")
-        response = Response.model_validate(record.get("response"))
+        try:
+            response = Response.model_validate(record.get("response"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("protected receipt response is malformed") from exc
         if not response.success or record.get("commit") != marker:
             raise RuntimeError("protected receipt does not contain a matching successful commit")
         note_path = marker.get("note_path")
@@ -621,7 +624,10 @@ class AutoMemoryStep(BaseStep):
             raise RuntimeError("protected receipt fingerprint does not match its request")
         if any(key in record for key in ("commit", "note_sha256")) or record.get("changes") != []:
             raise RuntimeError("protected no-op receipt contains commit evidence")
-        response = Response.model_validate(record.get("response"))
+        try:
+            response = Response.model_validate(record.get("response"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("protected no-op receipt response is malformed") from exc
         metadata = response.metadata
         if (
             not response.success
@@ -666,8 +672,10 @@ class AutoMemoryStep(BaseStep):
             record = json.loads(receipt_raw.decode("utf-8"))
         except FileNotFoundError as exc:
             raise RuntimeError("protected prior commit has no durable receipt") from exc
-        except (OSError, UnicodeError, ValueError, TypeError) as exc:
-            raise RuntimeError("protected prior commit receipt is unreadable") from exc
+        except OSError as exc:
+            raise RuntimeError("protected prior commit receipt storage error") from exc
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise RuntimeError("protected prior commit receipt is malformed") from exc
         self._validate_option_b_receipt_record(
             record,
             request_id=prior_request_id,
@@ -1014,69 +1022,91 @@ class AutoMemoryStep(BaseStep):
             raise RuntimeError("protected update proposal changed the application-owned note path")
         if proposal["path"] != expected_path:
             raise RuntimeError("protected proposal path does not match the application-owned daily path")
-        target = self._owned_note_target(expected_path)
-        async with await get_path_lock(target):
-            current = self._read_owned_note(expected_path, missing_ok=True)
-            if current != before_note_bytes:
-                raise RuntimeError("protected note changed while the model prepared its revision")
-            if current is not None:
-                try:
-                    existing = frontmatter.loads(current.decode("utf-8"))
-                except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
-                    raise RuntimeError("existing protected note is unreadable") from exc
-                if not self._option_b_note_owned_by_session(existing.metadata, provenance):
-                    raise RuntimeError("existing protected note belongs to a different source session")
-                existing_marker = existing.metadata.get(_OPTION_B_MARKER)
-                if existing_marker is not None:
-                    if not isinstance(existing_marker, dict):
-                        raise RuntimeError("protected note marker is malformed")
-                    if existing_marker.get("request_id") == request_id:
-                        raise RuntimeError("protected note marker already belongs to this request but did not recover")
-                    self._validate_superseded_option_b_revision(
-                        relative=expected_path,
-                        note_raw=current,
-                        session_id=session_id,
-                        agent_scope=agent_scope,
-                    )
-                metadata = {
-                    key: value
-                    for key, value in dict(existing.metadata or {}).items()
-                    if key not in _OPTION_B_RESERVED_METADATA
+        candidate_names = [name]
+        if created:
+            request_suffix = hashlib.sha256(f"{session_id}\0{request_id}".encode("utf-8")).hexdigest()[:8]
+            suffixed_name = f"{name}--{request_suffix}"
+            candidate_names.extend(
+                [suffixed_name, *(f"{suffixed_name}-{index}" for index in range(2, 101))],
+            )
+
+        committed = raw = committed_marker = None
+        for candidate_name in candidate_names:
+            candidate_path = self._daily_note_path(day, candidate_name) if created else expected_path
+            target = self._owned_note_target(candidate_path)
+            async with await get_path_lock(target):
+                # A create-path collision belongs to another invocation. It is
+                # not an update race and must not cause another model call.
+                if created and target.exists():
+                    continue
+                current = self._read_owned_note(candidate_path, missing_ok=True)
+                if current != before_note_bytes:
+                    raise RuntimeError("protected note changed while the model prepared its revision")
+                if current is not None:
+                    try:
+                        existing = frontmatter.loads(current.decode("utf-8"))
+                    except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
+                        raise RuntimeError("existing protected note is unreadable") from exc
+                    if not self._option_b_note_owned_by_session(existing.metadata, provenance):
+                        raise RuntimeError("existing protected note belongs to a different source session")
+                    existing_marker = existing.metadata.get(_OPTION_B_MARKER)
+                    if existing_marker is not None:
+                        if not isinstance(existing_marker, dict):
+                            raise RuntimeError("protected note marker is malformed")
+                        if existing_marker.get("request_id") == request_id:
+                            raise RuntimeError(
+                                "protected note marker already belongs to this request but did not recover",
+                            )
+                        self._validate_superseded_option_b_revision(
+                            relative=candidate_path,
+                            note_raw=current,
+                            session_id=session_id,
+                            agent_scope=agent_scope,
+                        )
+                    metadata = {
+                        key: value
+                        for key, value in dict(existing.metadata or {}).items()
+                        if key not in _OPTION_B_RESERVED_METADATA
+                    }
+                else:
+                    metadata = {}
+                marker = {
+                    "version": _OPTION_B_VERSION,
+                    "request_id": request_id,
+                    "fingerprint": fingerprint,
+                    "session_id": session_id,
+                    "source_hash": provenance["source_hash"],
+                    "agent_scope": agent_scope,
+                    "note_path": candidate_path,
+                    "body_sha256": self._body_digest(body),
+                    "created": created,
                 }
-            else:
-                metadata = {}
-            marker = {
-                "version": _OPTION_B_VERSION,
-                "request_id": request_id,
-                "fingerprint": fingerprint,
-                "session_id": session_id,
-                "source_hash": provenance["source_hash"],
-                "agent_scope": agent_scope,
-                "note_path": expected_path,
-                "body_sha256": self._body_digest(body),
-                "created": created,
-            }
-            metadata.update(
-                {
-                    "name": name,
-                    "description": description,
-                    **provenance,
-                    _OPTION_B_MARKER: marker,
-                },
-            )
-            post = frontmatter.Post(body, **metadata)
-            serialized = frontmatter.dumps(post)
-            await write_file_durable(target, serialized)
-            committed, raw, committed_marker = self._read_commit_note(
-                expected_path,
-                request_id=request_id,
-                fingerprint=fingerprint,
-                session_id=session_id,
-                source_hash=provenance["source_hash"],
-                agent_scope=agent_scope,
-                expected_body_digest=marker["body_sha256"],
-            )
-            del committed
+                metadata.update(
+                    {
+                        "name": candidate_name,
+                        "description": description,
+                        **provenance,
+                        _OPTION_B_MARKER: marker,
+                    },
+                )
+                post = frontmatter.Post(body, **metadata)
+                serialized = frontmatter.dumps(post)
+                await write_file_durable(target, serialized)
+                committed, raw, committed_marker = self._read_commit_note(
+                    candidate_path,
+                    request_id=request_id,
+                    fingerprint=fingerprint,
+                    session_id=session_id,
+                    source_hash=provenance["source_hash"],
+                    agent_scope=agent_scope,
+                    expected_body_digest=marker["body_sha256"],
+                )
+                expected_path = candidate_path
+                name = candidate_name
+                del committed
+                break
+        else:
+            raise RuntimeError(f"cannot allocate unique note name for: {name!r}")
         self.context["changes"] = [{"change": "added" if created else "modified", "path": expected_path}]
         index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
         await self._publish_option_b_index()
@@ -1619,9 +1649,13 @@ class AutoMemoryStep(BaseStep):
                         record = json.loads(_read_exact_owned_file(path).decode("utf-8"))
                     except FileNotFoundError:
                         record = None
-                    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                    except OSError as exc:
                         self.context.response.success = False
-                        self.context.response.answer = f"Error: protected receipt is unreadable: {exc}"
+                        self.context.response.answer = f"Error: protected receipt storage error: {exc}"
+                        return
+                    except (UnicodeError, ValueError, TypeError):
+                        self.context.response.success = False
+                        self.context.response.answer = "Error: protected receipt is malformed"
                         return
                 else:
                     record = json.loads(path.read_text(encoding="utf-8"))

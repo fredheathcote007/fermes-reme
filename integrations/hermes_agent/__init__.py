@@ -60,6 +60,19 @@ _WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
 _WORKSPACE_OWNER_TEMP_PREFIX = f".{_WORKSPACE_OWNER_FILENAME}."
 
 
+def _valid_pending_payload(payload: object) -> bool:
+    """Validate the durable turn shape before it can enter the FIFO."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("session_id"), str):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    required = ("id", "name", "role", "content", "created_at")
+    return all(
+        isinstance(message, dict) and all(isinstance(message.get(key), str) for key in required) for message in messages
+    )
+
+
 def _is_windows_platform() -> bool:
     """Return the platform family used for filesystem mode interpretation."""
     return sys.platform == "win32"
@@ -1006,10 +1019,17 @@ class ReMeMemoryProvider(MemoryProvider):
                     except (json.JSONDecodeError, TypeError, ValueError):
                         updated.append(raw_line)
                         continue
-                    if isinstance(current, dict) and current.get("id") == record.get("id"):
-                        current = record
+                    if (
+                        isinstance(current, dict)
+                        and current.get("id") == record.get("id")
+                        and _valid_pending_payload(current.get("payload"))
+                    ):
+                        updated.append((json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
                         found = True
-                    updated.append((json.dumps(current, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+                    else:
+                        # Shape-invalid JSON is poison too; keep its exact
+                        # bytes while updating a later valid record.
+                        updated.append(raw_line)
                 if not found:
                     return False
                 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -1120,9 +1140,9 @@ class ReMeMemoryProvider(MemoryProvider):
                 if (
                     not isinstance(record, dict)
                     or not isinstance(record.get("id"), str)
-                    or not isinstance(record.get("payload"), dict)
+                    or not _valid_pending_payload(record.get("payload"))
                 ):
-                    raise TypeError("record must contain string id and object payload")
+                    raise TypeError("record does not contain a valid durable turn payload")
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 logger.error(
                     "ReMe durable write queue %s line %d is retained but invalid: %s",
@@ -1158,7 +1178,11 @@ class ReMeMemoryProvider(MemoryProvider):
                     except (json.JSONDecodeError, TypeError, ValueError):
                         kept.append(raw_line)
                         continue
-                    if isinstance(record, dict) and record.get("id") == record_id:
+                    if (
+                        isinstance(record, dict)
+                        and record.get("id") == record_id
+                        and _valid_pending_payload(record.get("payload"))
+                    ):
                         removed = True
                     else:
                         kept.append(raw_line)

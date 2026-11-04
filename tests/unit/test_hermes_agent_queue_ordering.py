@@ -383,12 +383,10 @@ def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_
     provider._pending_path.parent.mkdir()
     valid = {"id": "valid", "payload": {"session_id": "s", "messages": []}}
     binary_poison = b'{"id":"binary-poison","payload":\xff}\n'
+    shape_poison = b'{"id": "poison", "attempts": 0, "payload": {}}\n'
+    message_poison = b'{"id": "message-poison", "payload": ' b'{"session_id": "s", "messages": [{"role": "user"}]}}\n'
     provider._pending_path.write_bytes(
-        binary_poison
-        + b"not-json\n"
-        + b'{"id": "poison", "payload": "not-an-object"}\n'
-        + json.dumps(valid).encode()
-        + b"\n",
+        binary_poison + b"not-json\n" + shape_poison + message_poison + json.dumps(valid).encode() + b"\n",
     )
 
     assert provider._read_pending_writes() == [valid]
@@ -397,7 +395,8 @@ def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_
     remaining = provider._pending_path.read_bytes()
     assert binary_poison in remaining
     assert b"not-json" in remaining
-    assert b'"poison"' in remaining
+    assert shape_poison in remaining
+    assert message_poison in remaining
     assert b'"valid"' not in remaining
 
 

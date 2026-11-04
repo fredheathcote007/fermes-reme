@@ -2,10 +2,34 @@
 
 from __future__ import annotations
 
+_PERMANENT_RECEIPT_ERRORS = frozenset(
+    {
+        "protected receipt is malformed",
+        "protected receipt is unreadable",
+        "protected receipt is not a commit",
+        "protected receipt fingerprint does not match its marker",
+        "protected receipt does not contain a matching successful commit",
+        "protected receipt does not contain a successful commit",
+        "protected receipt has no note path",
+        "protected receipt has an unknown outcome",
+        "protected receipt does not match the committed note bytes",
+        "protected receipt response is malformed",
+        "protected receipt response is not bound to its commit",
+        "protected receipt request does not match its marker",
+        "protected no-op receipt contains commit evidence",
+        "protected no-op receipt response is malformed",
+        "protected prior commit receipt is malformed",
+    },
+)
+
 
 def is_permanent_write_failure(error: BaseException) -> bool:
     """Recognize application refusals that cannot improve by replaying unchanged input."""
     detail = str(error).strip().lower()
+    if detail.startswith("error:"):
+        detail = detail[6:].strip()
+    if detail in _PERMANENT_RECEIPT_ERRORS:
+        return True
     return any(
         marker in detail
         for marker in (
@@ -28,6 +52,5 @@ def is_permanent_write_failure(error: BaseException) -> bool:
             "protected note body digest",
             "protected note is unreadable",
             "protected daily note is unreadable",
-            "protected receipt is unreadable",
         )
     )
