@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import types
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -290,6 +291,34 @@ def test_http_client_enforces_request_timeout(reme_http_server):
 
     with pytest.raises(ReMeServiceError):
         ReMeHttpClient(endpoint, timeout=1).call("slow", timeout=0.1)
+
+
+def test_http_error_body_is_not_exposed(monkeypatch):
+    endpoint = "http://127.0.0.1:2333"
+
+    class ErrorResponse:
+        reason = "Unprocessable Entity"
+
+        def read(self):
+            return b"conversation-secret-and-tool-arguments"
+
+        def close(self):
+            return None
+
+    def raise_http_error(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            f"{endpoint}/auto_memory",
+            422,
+            "Unprocessable Entity",
+            hdrs=None,
+            fp=ErrorResponse(),
+        )
+
+    monkeypatch.setattr(CLIENT_MODULE.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(ReMeServiceError) as exc_info:
+        ReMeHttpClient(endpoint, timeout=1).call("auto_memory")
+    assert "conversation-secret" not in str(exc_info.value)
+    assert "HTTP 422" in str(exc_info.value)
 
 
 def test_http_backend_requires_semantically_healthy_response(reme_http_server):
@@ -1179,6 +1208,43 @@ def test_accepted_write_is_replayed_after_backend_failure(monkeypatch, tmp_path)
 
     assert recovered.writes[0][1][0]["content"] == "durable user"
     assert pending.read_text(encoding="utf-8") == ""
+
+
+def test_permanent_refusal_is_quarantined_instead_of_retried_forever(monkeypatch, tmp_path):
+    backend = _FakeBackend()
+    backend.auto_memory = lambda *args, **kwargs: (_ for _ in ()).throw(
+        ReMeBackendError("Error: protected note marker is contradictory"),
+    )
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    provider.sync_turn("refused user", "assistant")
+    quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
+    deadline = time.monotonic() + 2
+    while not quarantine.exists() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
+    assert quarantine.is_file()
+    assert json.loads(quarantine.read_text(encoding="utf-8").splitlines()[0])["reason"] == "permanent_refusal"
+    assert pending.read_text(encoding="utf-8") == ""
+
+
+def test_embedded_mode_fails_fast_as_unsupported_on_windows(monkeypatch, tmp_path):
+    config = ReMeConfig(mode="embedded", workspace_dir=str(tmp_path / "workspace"))
+    monkeypatch.setattr(PLUGIN_MODULE.sys, "platform", "win32")
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
+
+    provider = ReMeMemoryProvider()
+
+    assert provider.is_available() is False
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+
+    assert provider._accept_writes is False
+    assert "Windows is unsupported" in provider.unavailable_reason()
 
 
 def test_retried_spool_record_reuses_record_id_after_ack_failure(monkeypatch, tmp_path):

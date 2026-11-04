@@ -3,6 +3,7 @@
 # pylint: disable=protected-access,missing-function-docstring
 
 import asyncio
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ from reme.components.agent_wrapper.base_agent_wrapper import BaseAgentWrapper
 from reme.components.prompt_handler import PromptHandler
 from reme.components.runtime_context import RuntimeContext
 from reme.steps.evolve.auto_memory import AutoMemoryStep
+from reme.steps.evolve import auto_memory as auto_memory_module
 
 
 class _SecurityTestWrapper(BaseAgentWrapper):
@@ -399,6 +401,54 @@ async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_pa
     assert not tampered.success
     assert "protected" in tampered.answer.lower()
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_option_b_recovery_scans_prior_daily_directory_before_appending(tmp_path, monkeypatch):
+    """A receipt loss recovered after midnight does not invoke the model twice."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+    clock = iter((datetime(2026, 10, 21), datetime(2026, 10, 22)))
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/cross-midnight.md",
+                    "name": "cross-midnight",
+                    "description": "A protected fact.",
+                    "content": "The protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    async def lost_receipt(_self, _path, _fingerprint):
+        return None
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    monkeypatch.setattr(auto_memory_module, "now", lambda _tz: next(clock))
+    monkeypatch.setattr(AutoMemoryStep, "_messages_day", staticmethod(lambda _messages, _timezone=None: None))
+    monkeypatch.setattr(AutoMemoryStep, "_write_option_b_receipt", lost_receipt)
+    request = {
+        "session_id": "cross-midnight-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+    }
+
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="cross-midnight-request", **request)
+        second = await app.run_job("auto_memory", request_id="cross-midnight-request", **request)
+
+    assert first.success and second.success
+    assert calls == [1]
+    assert second.metadata["path"] == "daily/2026-10-21/cross-midnight.md"
+    assert len(list((workspace / "daily").glob("**/cross-midnight.md"))) == 1
 
 
 @pytest.mark.asyncio

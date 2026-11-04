@@ -237,6 +237,7 @@ def test_parallel_profile_workers_keep_spools_and_sessions_isolated(monkeypatch,
         assert len(backend.writes) == 1
         assert backend.writes[0][0].startswith(f"hermes-profile-{index}-session-{index}-")
         assert backend.writes[0][1][0]["content"] == f"worker-{index} user"
+        assert backend.writes[0][1][0]["id"] != backend.writes[0][1][1]["id"]
         assert pending.read_text(encoding="utf-8") == ""
 
 

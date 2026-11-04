@@ -205,7 +205,9 @@ use different ports as well.
 - Successful recall exposes a Hermes recall indicator using ReMe's returned
   result count when available.
 - `sync_turn` sends only the latest completed turn and uses a filename-safe ID
-  derived from both the Hermes profile and session.
+  derived from both the Hermes profile and session. Each accepted turn also
+  carries stable message IDs, so identical later turns are not collapsed into
+  an earlier transcript row.
 - Cron, flush, and subagent contexts do not record conversational memory.
 - Health, recall, and write cooldowns are independent. Backend failures log a
   warning and do not fail the main Hermes conversation.
@@ -213,8 +215,14 @@ use different ports as well.
   `$HERMES_HOME/reme/pending-writes.jsonl` spool and `fsync`ed before they are
   queued. The spool record ID is passed as ReMe's `auto_memory` `request_id`,
   so retrying an accepted record uses ReMe's existing receipt/idempotency path.
-  A failed backend or acknowledgement leaves the record for retry; delivery is
+  A failed backend or acknowledgement leaves the record for bounded retry;
+  permanent refusals and exhausted retries are durably moved to
+  `$HERMES_HOME/reme/quarantined-writes.jsonl` for operator review. Delivery is
   not claimed to be multi-process safe.
+
+Embedded Stage 1 requires local POSIX durable filesystem primitives. It fails
+closed before startup on Windows; use HTTP mode with an independently managed
+ReMe service when that boundary is required.
 
 Run `hermes memory status` after installation, then start a new Hermes session.
 

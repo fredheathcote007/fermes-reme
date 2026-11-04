@@ -197,3 +197,31 @@ async def test_concurrent_append_survives_rewrite_race(step, monkeypatch):
 
     _assert_transcript(step._session_path(_SESSION), ["m0", "m_mid", "m1", "m2"])
     _assert_serialized(interleaving)
+
+
+@pytest.mark.asyncio
+async def test_protected_transcript_keeps_identical_distinct_turns(tmp_path, monkeypatch):
+    """Repeated identical text is not mistaken for a retry of an earlier turn."""
+    durable_calls = []
+
+    async def durable_write(path, content):
+        durable_calls.append(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    monkeypatch.setattr(auto_memory, "write_file_durable", durable_write)
+    step = AutoMemoryStep(durable_commit=True, agent_scope="test-scope")
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.agent_wrapper = SimpleNamespace(backend="agentscope")
+    step.context = SimpleNamespace(
+        data={"request_id": "request-1"},
+        get=lambda key, default=None: {"request_id": "request-1"}.get(key, default),
+    )
+
+    first = _msg("turn-1", "2026-10-01T10:00:00")
+    second = _msg("turn-2", "2026-10-01T10:01:00")
+    await step._save_session_messages(_SESSION, [first])
+    await step._save_session_messages(_SESSION, [second])
+
+    _assert_transcript(step._session_path(_SESSION), ["turn-1", "turn-2"])
+    assert len(durable_calls) == 2

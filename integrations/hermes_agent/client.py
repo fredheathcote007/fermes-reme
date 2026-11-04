@@ -78,8 +78,13 @@ class ReMeHttpClient:
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            raise ReMeServiceError(f"HTTP {exc.code}: {detail or exc.reason}") from exc
+            # Error bodies can echo prompts, tool arguments, or conversation
+            # text.  Keep transport diagnostics bounded to status metadata.
+            try:
+                exc.close()
+            except OSError:
+                pass
+            raise ReMeServiceError(f"HTTP {exc.code}: {exc.reason}") from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise ReMeServiceError(str(reason)) from exc

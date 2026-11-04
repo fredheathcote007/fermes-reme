@@ -48,6 +48,8 @@ _NON_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _SDK_INSTALL_HINT = 'Embedded ReMe mode requires the SDK. Install it with: pip install "reme-ai[core]"'
 _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
+_QUARANTINE_QUEUE_FILENAME = "quarantined-writes.jsonl"
+_MAX_WRITE_ATTEMPTS = 5
 _PROFILE_LOCK_FILENAME = ".writer.lock"
 _WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
 _WORKSPACE_OWNER_TEMP_PREFIX = f".{_WORKSPACE_OWNER_FILENAME}."
@@ -75,6 +77,24 @@ def _fsync_directory(path: Path) -> None:
 def _is_windows_platform() -> bool:
     """Return the platform family used for filesystem mode interpretation."""
     return sys.platform == "win32"
+
+
+def _is_permanent_write_failure(error: BaseException) -> bool:
+    """Recognize application refusals that cannot improve by replaying unchanged input."""
+    detail = str(error).strip().lower()
+    return detail.startswith("error:") or any(
+        marker in detail
+        for marker in (
+            "request_id was already used for different input",
+            "protected receipt replay refused",
+            "protected note marker",
+            "protected note belongs to",
+            "source provenance",
+            "superseded",
+            "foreign",
+            "frontmatter key collision",
+        )
+    )
 
 
 def _safe_staging_mode(mode: int) -> bool:
@@ -517,6 +537,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._next_health_probe = 0.0
         self._next_recall_attempt = 0.0
         self._next_write_attempt = 0.0
+        self._last_write_failure_kind = ""
         self._session_id = ""
         self._profile_id = "default"
         self._write_enabled = True
@@ -547,6 +568,11 @@ class ReMeMemoryProvider(MemoryProvider):
         """Check configuration and local dependencies without network or writes."""
         try:
             config = load_config()
+            if config.mode == "embedded" and _is_windows_platform():
+                self._unavailable_reason = (
+                    "embedded ReMe Option B requires POSIX durable filesystem primitives; Windows is unsupported"
+                )
+                return False
             if config.mode == "embedded" and importlib.util.find_spec("reme") is None:
                 self._unavailable_reason = _SDK_INSTALL_HINT
                 return False
@@ -599,6 +625,10 @@ class ReMeMemoryProvider(MemoryProvider):
         self._release_workspace_owner()
         try:
             if config.mode == "embedded":
+                if _is_windows_platform():
+                    raise ReMeConfigError(
+                        "Embedded ReMe Option B requires POSIX durable filesystem primitives; Windows is unsupported",
+                    )
                 _validate_embedded_policy(
                     config.reme_config,
                     allow_custom=config.allow_custom_config,
@@ -677,6 +707,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._next_health_probe = 0.0
         self._next_recall_attempt = 0.0
         self._next_write_attempt = 0.0
+        self._last_write_failure_kind = ""
         self._accept_writes = True
         self._write_queue = queue.Queue()
         self._queued_record_ids = set()
@@ -895,11 +926,12 @@ class ReMeMemoryProvider(MemoryProvider):
                 "ReMe skipped a completed turn because Hermes supplied no session id",
             )
             return
+        turn_id = uuid.uuid4().hex
         payload = {
             "session_id": _scoped_session_id(self._profile_id, routed_session),
             "messages": [
-                {"name": "user", "role": "user", "content": user},
-                {"name": "assistant", "role": "assistant", "content": assistant},
+                {"id": f"{turn_id}:user", "name": "user", "role": "user", "content": user},
+                {"id": f"{turn_id}:assistant", "name": "assistant", "role": "assistant", "content": assistant},
             ],
         }
         if not self._enqueue_write(payload):
@@ -1075,17 +1107,30 @@ class ReMeMemoryProvider(MemoryProvider):
     def _append_pending_write(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._pending_path is None:
             raise OSError("profile-local ReMe queue path is not configured")
-        record = {"id": uuid.uuid4().hex, "payload": payload}
+        record = {"id": uuid.uuid4().hex, "attempts": 0, "payload": payload}
         path = self._pending_path
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise OSError(f"Refusing unsafe ReMe queue path: {path}")
         if path.parent.is_symlink():
             raise OSError(f"Refusing symlinked ReMe queue directory: {path.parent}")
+        parent_created = not path.parent.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if parent_created:
+            _fsync_directory(path.parent.parent)
         with self._pending_lock:
             if path.is_symlink() or (path.exists() and not path.is_file()):
                 raise OSError(f"Refusing unsafe ReMe queue path: {path}")
             os.chmod(path.parent, 0o700)
+            if path.exists() and path.stat().st_size:
+                with path.open("rb") as existing:
+                    existing.seek(-1, os.SEEK_END)
+                    if existing.read(1) != b"\n":
+                        repair_fd = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
+                        try:
+                            os.write(repair_fd, b"\n")
+                            _fsync_file(repair_fd)
+                        finally:
+                            os.close(repair_fd)
             flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -1104,6 +1149,82 @@ class ReMeMemoryProvider(MemoryProvider):
                     os.close(fd)
             _fsync_directory(path.parent)
         return record
+
+    def _update_pending_write(self, record: dict[str, Any]) -> bool:
+        """Persist retry metadata without changing the record's queue position."""
+        path = self._pending_path
+        if path is None or not path.is_file() or path.is_symlink() or path.parent.is_symlink():
+            return False
+        with self._pending_lock:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+                updated: list[str] = []
+                found = False
+                for line in lines:
+                    try:
+                        current = json.loads(line)
+                    except json.JSONDecodeError:
+                        updated.append(line)
+                        continue
+                    if isinstance(current, dict) and current.get("id") == record.get("id"):
+                        current = record
+                        found = True
+                    updated.append(json.dumps(current, ensure_ascii=False, sort_keys=True) + "\n")
+                if not found:
+                    return False
+                fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.writelines(updated)
+                        handle.flush()
+                        _fsync_file(handle.fileno())
+                    os.chmod(temp_name, 0o600)
+                    os.replace(temp_name, path)
+                    _fsync_directory(path.parent)
+                finally:
+                    if os.path.exists(temp_name):
+                        os.unlink(temp_name)
+            except OSError as exc:
+                logger.error("ReMe could not persist durable write retry state: %s", exc)
+                return False
+        return True
+
+    def _quarantine_pending_write(self, record: dict[str, Any], reason: str) -> bool:
+        """Durably move a refused/exhausted record out of the active retry queue."""
+        path = self._pending_path
+        if path is None or path.is_symlink() or path.parent.is_symlink():
+            return False
+        quarantine = path.parent / _QUARANTINE_QUEUE_FILENAME
+        if quarantine.is_symlink() or (quarantine.exists() and not quarantine.is_file()):
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "id": record.get("id"),
+            "attempts": record.get("attempts", 0),
+            "reason": reason,
+            "payload": record.get("payload"),
+        }
+        with self._pending_lock:
+            try:
+                flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(quarantine, flags, 0o600)
+                try:
+                    _set_private_file_mode(quarantine, fd)
+                    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                        fd = -1
+                        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+                        handle.flush()
+                        _fsync_file(handle.fileno())
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+                _fsync_directory(quarantine.parent)
+            except (OSError, TypeError, ValueError) as exc:
+                logger.error("ReMe could not quarantine durable write: %s", exc)
+                return False
+        return self._remove_pending_write(str(record.get("id", "")))
 
     def _read_pending_writes(self) -> list[dict[str, Any]]:
         path = self._pending_path
@@ -1205,17 +1326,40 @@ class ReMeMemoryProvider(MemoryProvider):
                             payload["payload"],
                             request_id=payload["id"],
                             respect_cooldown=False,
-                        ) or not self._remove_pending_write(payload["id"]):
+                        ):
+                            retry = True
+                        elif not self._remove_pending_write(payload["id"]):
+                            self._last_write_failure_kind = "ack_failure"
                             retry = True
                     except Exception:
                         logger.exception(
                             "Unexpected ReMe recording failure; durable write remains queued",
                         )
+                        self._last_write_failure_kind = "retryable"
                         retry = True
                     if retry:
+                        try:
+                            prior_attempts = int(payload.get("attempts", 0))
+                        except (TypeError, ValueError):
+                            prior_attempts = 0
+                        payload["attempts"] = max(0, prior_attempts) + 1
+                        failure_kind = self._last_write_failure_kind or "retryable"
+                        if failure_kind == "permanent" or payload["attempts"] >= _MAX_WRITE_ATTEMPTS:
+                            quarantine_reason = (
+                                "permanent_refusal" if failure_kind == "permanent" else "retry_limit_exhausted"
+                            )
+                            if self._quarantine_pending_write(payload, quarantine_reason):
+                                logger.error(
+                                    "ReMe durable write %s was quarantined (%s)",
+                                    payload.get("id", "unknown"),
+                                    quarantine_reason,
+                                )
+                                continue
+                        self._update_pending_write(payload)
                         logger.warning(
-                            "ReMe durable write %s remains queued for a later retry",
+                            "ReMe durable write %s remains queued for a later retry (attempt %d)",
                             payload.get("id", "unknown"),
+                            payload["attempts"],
                         )
                         self._schedule_retry(payload)
                 finally:
@@ -1238,6 +1382,7 @@ class ReMeMemoryProvider(MemoryProvider):
         request_id: str | None = None,
         respect_cooldown: bool = True,
     ) -> bool:
+        self._last_write_failure_kind = ""
         if respect_cooldown and time.monotonic() < self._next_write_attempt:
             logger.warning(
                 "ReMe write for session %s skipped during cooldown",
@@ -1272,11 +1417,12 @@ class ReMeMemoryProvider(MemoryProvider):
                     )
                 return True
             except ReMeBackendError as exc:
+                self._last_write_failure_kind = "permanent" if _is_permanent_write_failure(exc) else "retryable"
                 self._next_write_attempt = time.monotonic() + self._health_retry_seconds
                 logger.warning(
-                    "ReMe recording failed at %s: %s",
+                    "ReMe recording failed at %s (%s)",
                     self._backend_label,
-                    exc,
+                    self._last_write_failure_kind,
                 )
             finally:
                 self._close_backend_if_shutdown_locked()

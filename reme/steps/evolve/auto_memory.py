@@ -217,14 +217,6 @@ def _sanitize_msg_for_save(msg: Msg) -> Msg:
     return msg.model_copy(update={"content": new_content})
 
 
-def _source_turn_key(msg: Msg) -> str:
-    """Identify a persisted turn without ephemeral AgentScope identity fields."""
-    payload = msg.model_dump(mode="json")
-    payload.pop("id", None)
-    payload.pop("created_at", None)
-    return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-
-
 def _normalize_msg_timestamp(item: dict) -> dict:
     """Map common message timestamp aliases to AgentScope's ``created_at`` field."""
     if item.get("created_at"):
@@ -331,6 +323,68 @@ class AutoMemoryStep(BaseStep):
             raise RuntimeError(f"daily_list failed: {list_response.answer}")
         notes = list_response.metadata.get("notes") or []
         return self._find_session_note(notes, session_id, fail_closed=self._option_b_enabled())
+
+    def _find_cross_day_option_b_marker(
+        self,
+        *,
+        request_id: str,
+        fingerprint: str,
+        session_id: str,
+        agent_scope: str,
+    ) -> tuple[str, bytes, dict] | None:
+        """Find the unique protected marker for a request across daily directories."""
+        workspace = self.file_store.workspace_path.resolve()
+        daily_dir = str(self.config_value("daily_dir"))
+        daily_root, error = resolve_path(workspace, daily_dir)
+        if error or daily_root is None or _has_lexical_symlink(workspace, daily_root):
+            raise RuntimeError("protected daily path is invalid")
+        try:
+            date_entries = list(os.scandir(daily_root)) if daily_root.is_dir() else []
+        except OSError as exc:
+            raise RuntimeError("protected daily path is unreadable") from exc
+
+        matches: list[tuple[str, bytes, dict]] = []
+        for date_entry in date_entries:
+            if date_entry.is_symlink():
+                raise RuntimeError("protected daily path contains a symlink")
+            if not date_entry.is_dir(follow_symlinks=False) or parse_daily_date(date_entry.name) is None:
+                continue
+            try:
+                note_entries = list(os.scandir(date_entry.path))
+            except OSError as exc:
+                raise RuntimeError("protected daily note directory is unreadable") from exc
+            for note_entry in note_entries:
+                if note_entry.is_symlink():
+                    raise RuntimeError("protected daily note path contains a symlink")
+                if not note_entry.is_file(follow_symlinks=False) or Path(note_entry.name).suffix.lower() != ".md":
+                    continue
+                relative = f"{daily_dir}/{date_entry.name}/{note_entry.name}"
+                raw = self._read_owned_note(relative)
+                try:
+                    post = frontmatter.loads(raw.decode("utf-8"))
+                except (UnicodeError, ValueError, TypeError) as exc:
+                    raise RuntimeError("protected daily note is unreadable") from exc
+                marker = post.metadata.get(_OPTION_B_MARKER)
+                if marker is None:
+                    continue
+                if not isinstance(marker, dict):
+                    raise RuntimeError("protected note marker is malformed")
+                if marker.get("request_id") != request_id:
+                    continue
+                self._validate_existing_marker(
+                    post,
+                    relative=relative,
+                    session_id=session_id,
+                    source_hash=None,
+                    agent_scope=agent_scope,
+                )
+                if marker.get("fingerprint") != fingerprint:
+                    raise RuntimeError("protected note marker does not match the request")
+                matches.append((relative, raw, marker))
+
+        if len(matches) > 1:
+            raise RuntimeError("multiple protected note markers match the request")
+        return matches[0] if matches else None
 
     def _provenance_enabled(self) -> bool:
         """Limit trusted transcript provenance to the Fermes AgentScope step."""
@@ -608,6 +662,44 @@ class AutoMemoryStep(BaseStep):
         fingerprint = self.context.get("_option_b_fingerprint")
         if not isinstance(request_id, str) or not isinstance(fingerprint, str):
             raise TypeError("protected memory commit requires request_id fingerprint state")
+
+        cross_day = self._find_cross_day_option_b_marker(
+            request_id=request_id,
+            fingerprint=fingerprint,
+            session_id=session_id,
+            agent_scope=self._option_b_scope(),
+        )
+        if cross_day is not None:
+            relative, _, _ = cross_day
+            provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+            _, committed_raw, committed_marker = self._read_commit_note(
+                relative,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                session_id=session_id,
+                source_hash=provenance["source_hash"],
+                agent_scope=self._option_b_scope(),
+            )
+            committed_day = Path(relative).parts[-2]
+            index_payload = await refresh_day_index(
+                self.file_store,
+                committed_day,
+                self.config_value("daily_dir"),
+            )
+            self.context["changes"] = [
+                {"change": "added" if committed_marker["created"] else "modified", "path": relative},
+            ]
+            await self._publish_option_b_index()
+            self._option_b_response(
+                marker=committed_marker,
+                day=committed_day,
+                session_id=session_id,
+                n_messages=len(messages),
+                answer="Recovered durable memory commit without model replay",
+            )
+            self.context.response.metadata["index"] = index_payload
+            self.context.response.metadata["note_sha256"] = hashlib.sha256(committed_raw).hexdigest()
+            return True
 
         note = await self._list_session_note(day, session_id)
         if not note:
@@ -1164,22 +1256,22 @@ class AutoMemoryStep(BaseStep):
             for msg in existing:
                 by_id[msg.id] = msg
             incoming = [_sanitize_msg_for_save(msg) for msg in messages]
-            existing_by_turn: dict[str, list[Msg]] = {}
-            for msg in existing:
-                existing_by_turn.setdefault(_source_turn_key(msg), []).append(msg)
-            protected = self._option_b_enabled()
             new_messages = []
             for msg in incoming:
                 if msg.id in by_id:
                     by_id[msg.id] = msg
-                elif protected and (matches := existing_by_turn.get(_source_turn_key(msg))):
-                    # Hermes may reconstruct the same turn with a fresh ID and
-                    # timestamp on every retry. Preserve the durable row's
-                    # identity instead of appending a duplicate.
-                    matches.pop(0)
                 else:
                     new_messages.append(msg)
             merged = sorted([*by_id.values(), *new_messages], key=lambda m: m.created_at)
+
+            if self._option_b_enabled():
+                serialized = "".join(f"{message.model_dump_json()}\n" for message in merged)
+                await write_file_durable(path, serialized)
+                self.logger.info(
+                    f"[{self.name}] save session durably session_id={session_id!r} "
+                    f"existing={len(existing)} total={len(merged)}",
+                )
+                return
 
             can_append = 0 < len(existing) <= len(merged) and all(
                 merged[i].id == existing[i].id for i in range(len(existing))
