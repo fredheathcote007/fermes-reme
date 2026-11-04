@@ -217,6 +217,83 @@ async def test_application_run_job_replays_real_receipt_without_repeating_side_e
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("messages", "tamper", "expected"),
+    [
+        (
+            [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+            "response-object",
+            "response is malformed",
+        ),
+        (
+            [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+            "commit-object",
+            "does not contain a successful commit",
+        ),
+        (
+            [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+            "response-false",
+            "does not contain a matching successful commit",
+        ),
+        ([], "noop-commit", "no-op receipt contains commit evidence"),
+        ([], "noop-response", "no-op receipt response is malformed"),
+        ([], "noop-false", "no-op receipt response is malformed"),
+    ],
+)
+async def test_application_run_job_rejects_tampered_protected_receipt(
+    tmp_path,
+    monkeypatch,
+    messages,
+    tamper,
+    expected,
+):
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/tamper-proof.md",
+                    "name": "tamper-proof",
+                    "description": "A deterministic protected fact.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {"session_id": "tamper-session", "messages": messages, "date": "2026-10-21"}
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="tamper-request", **request)
+        assert first.success
+        receipt_path = next((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if tamper == "response-object":
+            receipt["response"] = []
+        elif tamper == "commit-object":
+            receipt["commit"] = []
+        elif tamper == "response-false":
+            receipt["response"]["success"] = False
+        elif tamper == "noop-commit":
+            receipt["commit"] = {"forged": True}
+        elif tamper == "noop-response":
+            receipt["response"] = []
+        else:
+            receipt["response"]["success"] = False
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        replay = await app.run_job("auto_memory", request_id="tamper-request", **request)
+
+    assert not replay.success
+    assert expected in replay.answer
+
+
+@pytest.mark.asyncio
 async def test_concurrent_duplicate_waits_for_the_original_request(tmp_path):
     first, duplicate = _step(tmp_path), _step(tmp_path)
     started, release = asyncio.Event(), asyncio.Event()
@@ -453,14 +530,15 @@ async def test_option_b_create_collision_allocates_unique_note_without_replay(tm
     config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
     calls = []
+    proposed_name = "shared-" + ("n" * 242)
 
     async def proposal_reply(_self, _inputs, **_kwargs):
         calls.append(1)
         return {
             "result": json.dumps(
                 {
-                    "path": "daily/2026-10-21/shared-name.md",
-                    "name": "shared-name",
+                    "path": f"daily/2026-10-21/{proposed_name}.md",
+                    "name": proposed_name,
                     "description": "A shared-name test note.",
                     "content": f"Protected fact {len(calls)}.",
                 },
@@ -475,14 +553,20 @@ async def test_option_b_create_collision_allocates_unique_note_without_replay(tm
     }
 
     async with Application(**config) as app:
-        first = await app.run_job("auto_memory", request_id="collision-a", session_id="collision-session-a", **request)
-        second = await app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request)
+        first, second = await asyncio.gather(
+            app.run_job("auto_memory", request_id="collision-a", session_id="collision-session-a", **request),
+            app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request),
+        )
         replay = await app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request)
 
     assert first.success and second.success and replay.success
-    assert first.metadata["path"] == "daily/2026-10-21/shared-name.md"
-    assert second.metadata["path"].startswith("daily/2026-10-21/shared-name--")
+    base_path = f"daily/2026-10-21/{proposed_name}.md"
+    assert base_path in {first.metadata["path"], second.metadata["path"]}
+    suffixed_path = next(path for path in (first.metadata["path"], second.metadata["path"]) if path != base_path)
+    assert suffixed_path.startswith("daily/2026-10-21/shared-")
+    assert second.metadata["path"] in {base_path, suffixed_path}
     assert second.metadata["path"] != first.metadata["path"]
+    assert len(Path(suffixed_path).name.encode("utf-8")) <= 255
     assert replay.metadata["path"] == second.metadata["path"]
     assert len(calls) == 2
     assert (

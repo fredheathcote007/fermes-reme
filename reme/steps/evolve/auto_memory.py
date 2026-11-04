@@ -83,6 +83,11 @@ def _checked_write_path(workspace: Path, relative: str, allowed_paths) -> Path:
     return target
 
 
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """Keep a generated filename component within common POSIX NAME_MAX limits."""
+    return value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def _check_existing_image(target: Path) -> bool:
     if target.is_file():
         return True
@@ -1025,7 +1030,9 @@ class AutoMemoryStep(BaseStep):
         candidate_names = [name]
         if created:
             request_suffix = hashlib.sha256(f"{session_id}\0{request_id}".encode("utf-8")).hexdigest()[:8]
-            suffixed_name = f"{name}--{request_suffix}"
+            # Leave room for ``.md`` and the largest numeric collision suffix.
+            base_limit = 255 - len(".md") - len(f"--{request_suffix}-100".encode("utf-8"))
+            suffixed_name = f"{_truncate_utf8(name, base_limit)}--{request_suffix}"
             candidate_names.extend(
                 [suffixed_name, *(f"{suffixed_name}-{index}" for index in range(2, 101))],
             )

@@ -400,6 +400,62 @@ def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_
     assert b'"valid"' not in remaining
 
 
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        {"session_id": "", "messages": []},
+        {"session_id": "../../evil", "messages": []},
+        {
+            "session_id": "safe-session",
+            "messages": [{"id": "m", "name": "user", "role": "banana", "content": "bad"}],
+        },
+    ],
+)
+def test_provider_skips_invalid_session_or_role_and_runs_following_record(monkeypatch, tmp_path, bad_payload):
+    backend = FakeBackend()
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    pending = tmp_path / "reme" / "pending-writes.jsonl"
+    pending.parent.mkdir()
+    poison = (json.dumps({"id": "bad", "attempts": 0, "payload": bad_payload}) + "\n").encode()
+    valid = {"id": "valid", "attempts": 0, "payload": {"session_id": "safe-session", "messages": []}}
+    pending.write_bytes(poison + (json.dumps(valid) + "\n").encode())
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    deadline = time.monotonic() + 1
+    while backend.request_ids != ["valid"] and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    assert backend.request_ids == ["valid"]
+    assert poison in pending.read_bytes()
+    assert b'"valid"' not in pending.read_bytes()
+
+
+def test_stage1_legacy_spool_upgrades_missing_created_at_without_data_loss(tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._pending_path.parent.mkdir()
+    legacy = {
+        "id": "legacy",
+        "attempts": 2,
+        "payload": {
+            "session_id": "legacy-session",
+            "messages": [{"id": "m", "name": "user", "role": "user", "content": "old turn"}],
+        },
+    }
+    poison = b"not-json\n"
+    provider._pending_path.write_bytes(poison + (json.dumps(legacy) + "\n").encode())
+
+    records = provider._read_pending_writes()
+
+    assert records[0]["payload"]["messages"][0]["created_at"]
+    persisted = json.loads(provider._pending_path.read_bytes().splitlines()[1])
+    assert persisted["payload"]["messages"][0]["created_at"] == records[0]["payload"]["messages"][0]["created_at"]
+    assert poison in provider._pending_path.read_bytes()
+
+
 def test_startup_recovers_valid_record_after_invalid_utf8_poison_line(monkeypatch, tmp_path):
     backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))

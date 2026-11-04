@@ -25,6 +25,13 @@ _PERMANENT_RECEIPT_ERRORS = frozenset(
 
 def is_permanent_write_failure(error: BaseException) -> bool:
     """Recognize application refusals that cannot improve by replaying unchanged input."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, OSError):
+            return False
+        seen.add(id(current))
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
     detail = str(error).strip().lower()
     if detail.startswith("error:"):
         detail = detail[6:].strip()
@@ -46,9 +53,13 @@ def is_permanent_write_failure(error: BaseException) -> bool:
             "protected receipt has no note path",
             "protected receipt has an unknown outcome",
             "protected receipt does not match",
+            "protected receipt does not contain a successful commit",
+            "protected receipt response is malformed",
             "protected receipt response is not bound",
             "protected receipt request does not match",
             "protected prior commit has no durable receipt",
+            "protected prior commit receipt is malformed",
+            "protected no-op receipt",
             "protected note body digest",
             "protected note is unreadable",
             "protected daily note is unreadable",

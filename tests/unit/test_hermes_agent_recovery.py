@@ -65,6 +65,7 @@ def test_protected_identity_mismatch_remains_permanent(detail):
         ("protected no-op receipt contains commit evidence", True),
         ("protected no-op receipt response is malformed", True),
         ("protected prior commit receipt is malformed", True),
+        (OSError("protected receipt response is malformed"), False),
         ("protected receipt storage error: [Errno 13] Permission denied", False),
         ("protected receipt storage error: [Errno 24] Too many open files", False),
         ("protected prior commit receipt storage error", False),
@@ -364,6 +365,49 @@ def test_permanent_refusal_does_not_cooldown_following_record(monkeypatch, tmp_p
     assert provider._read_pending_writes() == []
     quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
     assert len(quarantine.read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Error: protected receipt replay refused: protected receipt response is malformed",
+        "Error: protected receipt replay refused: protected receipt does not contain a successful commit",
+        "Error: protected receipt replay refused: protected no-op receipt contains commit evidence",
+        "RuntimeError: protected prior commit receipt is malformed <- JSONDecodeError: bad receipt",
+    ],
+)
+def test_wrapped_receipt_corruption_quarantines_r1_and_runs_r2(monkeypatch, tmp_path, detail):
+    backend = _FakeBackend()
+
+    def auto_memory(_session_id, _messages, *, timeout, request_id=None):
+        del timeout
+        backend.request_ids.append(request_id)
+        if request_id == "r1":
+            raise ReMeBackendError(detail)
+        return {"success": True}
+
+    backend.auto_memory = auto_memory
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=60))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
+    pending.parent.mkdir()
+    records = [
+        {"id": "r1", "attempts": 0, "payload": {"session_id": "s", "messages": []}},
+        {"id": "r2", "attempts": 0, "payload": {"session_id": "s", "messages": []}},
+    ]
+    pending.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    deadline = time.monotonic() + 1
+    while backend.request_ids != ["r1", "r2"] and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    assert backend.request_ids == ["r1", "r2"]
+    assert pending.read_text(encoding="utf-8") == ""
+    quarantine = pending.parent / "quarantined-writes.jsonl"
+    assert json.loads(quarantine.read_text(encoding="utf-8"))["id"] == "r1"
 
 
 def test_retryable_error_prefix_remains_durable_and_is_not_quarantined(monkeypatch, tmp_path):

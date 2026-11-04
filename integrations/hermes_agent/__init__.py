@@ -32,6 +32,8 @@ from .embedded_backend import EmbeddedReMeBackend
 from .http_backend import HttpReMeBackend
 from .retry_policy import is_permanent_write_failure as _is_permanent_write_failure
 from .turn_payload import build_turn_payload as _build_turn_payload
+from .turn_payload import upgrade_legacy_payload as _upgrade_legacy_payload
+from .turn_payload import valid_pending_payload as _valid_pending_payload
 from .turn_payload import scoped_session_id
 from .write_queue import RetryWakeup, rebuild_write_queue_locked
 from .durability import (
@@ -58,19 +60,6 @@ _QUARANTINE_QUEUE_FILENAME = "quarantined-writes.jsonl"
 _PROFILE_LOCK_FILENAME = ".writer.lock"
 _WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
 _WORKSPACE_OWNER_TEMP_PREFIX = f".{_WORKSPACE_OWNER_FILENAME}."
-
-
-def _valid_pending_payload(payload: object) -> bool:
-    """Validate the durable turn shape before it can enter the FIFO."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("session_id"), str):
-        return False
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return False
-    required = ("id", "name", "role", "content", "created_at")
-    return all(
-        isinstance(message, dict) and all(isinstance(message.get(key), str) for key in required) for message in messages
-    )
 
 
 def _is_windows_platform() -> bool:
@@ -1126,6 +1115,10 @@ class ReMeMemoryProvider(MemoryProvider):
         with self._pending_lock:
             try:
                 lines = path.read_bytes().splitlines()
+                historical_created_at = time.strftime(
+                    "%Y-%m-%dT%H:%M:%S+00:00",
+                    time.gmtime(path.stat().st_mtime),
+                )
             except OSError as exc:
                 logger.error(
                     "ReMe could not read its durable write queue %s: %s",
@@ -1133,6 +1126,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     exc,
                 )
                 return []
+        legacy_records = []
         for line_number, raw_line in enumerate(lines, start=1):
             try:
                 line = raw_line.decode("utf-8")
@@ -1151,7 +1145,16 @@ class ReMeMemoryProvider(MemoryProvider):
                     exc,
                 )
                 continue
-            records.append(record)
+            upgraded = _upgrade_legacy_payload(record, historical_created_at)
+            records.append(upgraded)
+            if upgraded is not record:
+                legacy_records.append(upgraded)
+        for record in legacy_records:
+            if not self._update_pending_write(record):
+                logger.error(
+                    "ReMe could not persist legacy timestamp upgrade for durable write %s",
+                    record.get("id", "unknown"),
+                )
         return records
 
     def _remove_pending_write(self, record_id: str) -> bool:
