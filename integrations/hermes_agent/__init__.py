@@ -18,16 +18,6 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - exercised on Windows
-    fcntl = None
-
-try:
-    import msvcrt
-except ImportError:  # pragma: no cover - exercised on POSIX
-    msvcrt = None
-
 from agent.memory_provider import MemoryProvider, RecallStatus
 
 from .backend import ReMeBackend, ReMeBackendError, spawn_profile_thread
@@ -45,6 +35,7 @@ from .turn_payload import build_turn_payload as _build_turn_payload
 from .turn_payload import scoped_session_id
 from .write_queue import RetryWakeup, rebuild_write_queue_locked
 from .durability import (
+    ProfileWriterLock as _ProfileWriterLock,
     _fsync_directory as _durability_fsync_directory,
     _fsync_file as _durability_fsync_file,
     _is_reparse_point as _durability_is_reparse_point,
@@ -67,8 +58,6 @@ _QUARANTINE_QUEUE_FILENAME = "quarantined-writes.jsonl"
 _PROFILE_LOCK_FILENAME = ".writer.lock"
 _WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
 _WORKSPACE_OWNER_TEMP_PREFIX = f".{_WORKSPACE_OWNER_FILENAME}."
-_HELD_PROFILE_LOCKS: set[str] = set()
-_HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
 
 def _is_windows_platform() -> bool:
@@ -86,65 +75,6 @@ _same_file_identity = _durability_same_file_identity
 _set_private_file_mode = _durability_set_private_file_mode
 _verify_private_file_identity = _durability_verify_private_file_identity
 _configure_durability_runtime(globals())
-
-
-class _ProfileWriterLock:
-    """Own one Hermes profile's ReMe spool for the lifetime of a provider.
-
-    The lock file is intentionally retained after release.  Ownership is the
-    OS lock, not the presence or age of this file, so a killed process cannot
-    leave a stale marker that blocks future recovery.
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._fd: int | None = None
-        self._key = os.path.normcase(str(path.resolve(strict=False)))
-
-    def acquire(self) -> None:
-        """Acquire exclusive process and OS ownership of this profile journal."""
-        with _HELD_PROFILE_LOCKS_LOCK:
-            if self._key in _HELD_PROFILE_LOCKS:
-                raise OSError("profile writer is already owned by this process")
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.parent.is_symlink() or self.path.is_symlink():
-                raise OSError(f"Refusing unsafe profile writer lock path: {self.path}")
-            flags = os.O_RDWR | os.O_CREAT
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            fd = os.open(self.path, flags, 0o600)
-            try:
-                _set_private_file_mode(self.path, fd)
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                elif msvcrt is not None:
-                    if os.fstat(fd).st_size == 0:
-                        os.write(fd, b"\0")
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:  # pragma: no cover - no supported platform has neither
-                    raise OSError("no supported OS file-lock implementation")
-            except Exception:
-                os.close(fd)
-                raise
-            self._fd = fd
-            _HELD_PROFILE_LOCKS.add(self._key)
-
-    def release(self) -> None:
-        """Release the operating-system lock and local ownership registration."""
-        fd, self._fd = self._fd, None
-        if fd is None:
-            return
-        try:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            elif msvcrt is not None:
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        finally:
-            os.close(fd)
-            with _HELD_PROFILE_LOCKS_LOCK:
-                _HELD_PROFILE_LOCKS.discard(self._key)
 
 
 class _WorkspaceOwnerConflict(OSError):
@@ -970,16 +900,15 @@ class ReMeMemoryProvider(MemoryProvider):
                 return
             self._writer_starting = True
             generation = self._pending_generation
-        records = self._read_pending_writes()
-        with self._write_thread_lock:
-            if self._shutdown_started:
-                self._writer_starting = False
-                return
-            if generation != self._pending_generation:
-                self._writer_starting = False
-                self._start_writer_if_needed()
-                return
-            try:
+        try:
+            records = self._read_pending_writes()
+            with self._write_thread_lock:
+                if self._shutdown_started:
+                    return
+                if generation != self._pending_generation:
+                    self._writer_starting = False
+                    self._start_writer_if_needed()
+                    return
                 rebuild_write_queue_locked(self, records)
                 if self._write_queue.empty():
                     self._retry_wakeup_pending = False
@@ -993,7 +922,8 @@ class ReMeMemoryProvider(MemoryProvider):
                 self._retry_wakeup_pending = False
                 self._retry_wakeup.cancel_locked()
                 self._write_thread.start()
-            finally:
+        finally:
+            with self._write_thread_lock:
                 self._writer_starting = False
 
     def _queue_pending_records(
@@ -1062,25 +992,30 @@ class ReMeMemoryProvider(MemoryProvider):
             return False
         with self._pending_lock:
             try:
-                lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-                updated: list[str] = []
+                lines = path.read_bytes().splitlines(keepends=True)
+                updated: list[bytes] = []
                 found = False
-                for line in lines:
+                for raw_line in lines:
+                    try:
+                        line = raw_line.decode("utf-8")
+                    except UnicodeDecodeError:
+                        updated.append(raw_line)
+                        continue
                     try:
                         current = json.loads(line)
-                    except json.JSONDecodeError:
-                        updated.append(line)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        updated.append(raw_line)
                         continue
                     if isinstance(current, dict) and current.get("id") == record.get("id"):
                         current = record
                         found = True
-                    updated.append(json.dumps(current, ensure_ascii=False, sort_keys=True) + "\n")
+                    updated.append((json.dumps(current, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
                 if not found:
                     return False
                 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
                 try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                        handle.writelines(updated)
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(b"".join(updated))
                         handle.flush()
                         _fsync_file(handle.fileno())
                     os.chmod(temp_name, 0o600)
@@ -1170,7 +1105,7 @@ class ReMeMemoryProvider(MemoryProvider):
         records = []
         with self._pending_lock:
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                lines = path.read_bytes().splitlines()
             except OSError as exc:
                 logger.error(
                     "ReMe could not read its durable write queue %s: %s",
@@ -1178,8 +1113,9 @@ class ReMeMemoryProvider(MemoryProvider):
                     exc,
                 )
                 return []
-        for line_number, line in enumerate(lines, start=1):
+        for line_number, raw_line in enumerate(lines, start=1):
             try:
+                line = raw_line.decode("utf-8")
                 record = json.loads(line)
                 if (
                     not isinstance(record, dict)
@@ -1187,7 +1123,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     or not isinstance(record.get("payload"), dict)
                 ):
                     raise TypeError("record must contain string id and object payload")
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 logger.error(
                     "ReMe durable write queue %s line %d is retained but invalid: %s",
                     path,
@@ -1208,19 +1144,24 @@ class ReMeMemoryProvider(MemoryProvider):
             return False
         with self._pending_lock:
             try:
-                lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-                kept = []
+                lines = path.read_bytes().splitlines(keepends=True)
+                kept: list[bytes] = []
                 removed = False
-                for line in lines:
+                for raw_line in lines:
+                    try:
+                        line = raw_line.decode("utf-8")
+                    except UnicodeDecodeError:
+                        kept.append(raw_line)
+                        continue
                     try:
                         record = json.loads(line)
-                    except json.JSONDecodeError:
-                        kept.append(line)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        kept.append(raw_line)
                         continue
                     if isinstance(record, dict) and record.get("id") == record_id:
                         removed = True
                     else:
-                        kept.append(line)
+                        kept.append(raw_line)
                 if not removed:
                     return True
                 fd, temp_name = tempfile.mkstemp(
@@ -1228,8 +1169,8 @@ class ReMeMemoryProvider(MemoryProvider):
                     dir=path.parent,
                 )
                 try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                        handle.writelines(kept)
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(b"".join(kept))
                         handle.flush()
                         _fsync_file(handle.fileno())
                     os.chmod(temp_name, 0o600)

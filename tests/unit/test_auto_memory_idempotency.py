@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import frontmatter
 import pytest
+import yaml
 from agentscope.message import Msg
 
 from reme.application import Application
@@ -48,6 +49,45 @@ def test_option_b_body_digest_matches_canonical_stored_body(body):
     canonical = frontmatter.loads(frontmatter.dumps(frontmatter.Post(body))).content
     expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     assert AutoMemoryStep._body_digest(body) == expected
+
+
+def test_option_b_invalid_yaml_marker_is_a_protected_note_refusal(tmp_path):
+    raw = "---\n_reme_commit: [\nrequest_id: marker-request\n---\nprotected body\n"
+    with pytest.raises(yaml.YAMLError):
+        frontmatter.loads(raw)
+    note = tmp_path / "daily/2026-10-21/broken.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(raw, encoding="utf-8")
+
+    step = _step(tmp_path)
+    with pytest.raises(ValueError, match="protected note is unreadable"):
+        step._read_commit_note(
+            "daily/2026-10-21/broken.md",
+            request_id="marker-request",
+            fingerprint="fingerprint",
+            session_id="session-1",
+            source_hash=None,
+            agent_scope="test-scope",
+        )
+
+
+def test_option_b_cross_day_invalid_yaml_marker_fails_closed(tmp_path):
+    raw = "---\n_reme_commit: [\nrequest_id: cross-day-request\n---\nprotected body\n"
+    with pytest.raises(yaml.YAMLError):
+        frontmatter.loads(raw)
+    note = tmp_path / "daily/2026-10-20/broken.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(raw, encoding="utf-8")
+
+    step = _step(tmp_path)
+    step.config_value = lambda key: "daily" if key == "daily_dir" else None
+    with pytest.raises(RuntimeError, match="protected daily note is unreadable"):
+        step._find_cross_day_option_b_marker(
+            request_id="cross-day-request",
+            fingerprint="fingerprint",
+            session_id="session-1",
+            agent_scope="test-scope",
+        )
 
 
 @pytest.mark.asyncio

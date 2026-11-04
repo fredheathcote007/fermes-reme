@@ -47,6 +47,9 @@ def test_transient_text_is_not_a_permanent_write_refusal(detail):
     [
         "existing protected note belongs to a different source session",
         "protected marker source provenance is not an append-only extension",
+        "existing protected note is unreadable",
+        "protected daily note is unreadable",
+        "protected receipt is unreadable",
     ],
 )
 def test_protected_identity_mismatch_remains_permanent(detail):

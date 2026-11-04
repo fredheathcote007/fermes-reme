@@ -382,17 +382,46 @@ def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_
     provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
     provider._pending_path.parent.mkdir()
     valid = {"id": "valid", "payload": {"session_id": "s", "messages": []}}
-    provider._pending_path.write_text(
-        "not-json\n" '{"id": "poison", "payload": "not-an-object"}\n' + json.dumps(valid) + "\n",
-        encoding="utf-8",
+    binary_poison = b'{"id":"binary-poison","payload":\xff}\n'
+    provider._pending_path.write_bytes(
+        binary_poison
+        + b"not-json\n"
+        + b'{"id": "poison", "payload": "not-an-object"}\n'
+        + json.dumps(valid).encode()
+        + b"\n",
     )
 
     assert provider._read_pending_writes() == [valid]
+    assert provider._update_pending_write({**valid, "attempts": 1, "payload": valid["payload"]}) is True
     assert provider._remove_pending_write("valid") is True
-    remaining = provider._pending_path.read_text(encoding="utf-8")
-    assert "not-json" in remaining
-    assert '"poison"' in remaining
-    assert '"valid"' not in remaining
+    remaining = provider._pending_path.read_bytes()
+    assert binary_poison in remaining
+    assert b"not-json" in remaining
+    assert b'"poison"' in remaining
+    assert b'"valid"' not in remaining
+
+
+def test_startup_recovers_valid_record_after_invalid_utf8_poison_line(monkeypatch, tmp_path):
+    backend = FakeBackend()
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    pending = tmp_path / "reme" / "pending-writes.jsonl"
+    pending.parent.mkdir()
+    valid = {"id": "valid", "attempts": 0, "payload": {"session_id": "s", "messages": []}}
+    binary_poison = b'{"id":"binary-poison","payload":\xff}\n'
+    pending.write_bytes(binary_poison + json.dumps(valid).encode() + b"\n")
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    deadline = time.monotonic() + 1
+    while len(backend.request_ids) < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    assert backend.request_ids == ["valid"]
+    assert binary_poison in pending.read_bytes()
+    assert b'"valid"' not in pending.read_bytes()
+    assert provider._writer_starting is False
 
 
 def test_disk_append_failure_does_not_acknowledge_or_queue_turn(monkeypatch, tmp_path, caplog):

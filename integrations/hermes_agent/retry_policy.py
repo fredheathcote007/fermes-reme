@@ -26,5 +26,8 @@ def is_permanent_write_failure(error: BaseException) -> bool:
             "protected receipt request does not match",
             "protected prior commit has no durable receipt",
             "protected note body digest",
+            "protected note is unreadable",
+            "protected daily note is unreadable",
+            "protected receipt is unreadable",
         )
     )

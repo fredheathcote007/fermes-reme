@@ -545,7 +545,7 @@ class AutoMemoryStep(BaseStep):
         assert raw is not None
         try:
             post = frontmatter.loads(raw.decode("utf-8"))
-        except (UnicodeError, ValueError, TypeError) as exc:
+        except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
             raise ValueError("protected note is unreadable") from exc
         marker = self._validate_existing_marker(
             post,
@@ -644,7 +644,7 @@ class AutoMemoryStep(BaseStep):
         """Prove a prior marked revision is complete before allowing supersession."""
         try:
             post = frontmatter.loads(note_raw.decode("utf-8"))
-        except (UnicodeError, ValueError, TypeError) as exc:
+        except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
             raise RuntimeError("existing protected note is unreadable") from exc
         marker = self._validate_existing_marker(
             post,
@@ -745,7 +745,7 @@ class AutoMemoryStep(BaseStep):
             return False
         try:
             post = frontmatter.loads(raw.decode("utf-8"))
-        except (UnicodeError, ValueError, TypeError) as exc:
+        except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
             raise RuntimeError("existing protected note is unreadable") from exc
         marker = post.metadata.get(_OPTION_B_MARKER)
         if marker is None:
@@ -920,7 +920,7 @@ class AutoMemoryStep(BaseStep):
             if current is not None:
                 try:
                     existing = frontmatter.loads(current.decode("utf-8"))
-                except (UnicodeError, ValueError, TypeError) as exc:
+                except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
                     raise RuntimeError("existing protected note is unreadable") from exc
                 if not self._option_b_note_owned_by_session(existing.metadata, provenance):
                     raise RuntimeError("existing protected note belongs to a different source session")
@@ -1022,7 +1022,7 @@ class AutoMemoryStep(BaseStep):
             if current is not None:
                 try:
                     existing = frontmatter.loads(current.decode("utf-8"))
-                except (UnicodeError, ValueError, TypeError) as exc:
+                except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
                     raise RuntimeError("existing protected note is unreadable") from exc
                 if not self._option_b_note_owned_by_session(existing.metadata, provenance):
                     raise RuntimeError("existing protected note belongs to a different source session")
@@ -1802,7 +1802,12 @@ class AutoMemoryStep(BaseStep):
         # or this call updates an image-backed note with images disabled.
         image_sources = []
         if before_note_bytes is not None:
-            previous_sources = frontmatter.loads(before_note_bytes.decode("utf-8")).get("source_images", [])
+            try:
+                previous_sources = frontmatter.loads(before_note_bytes.decode("utf-8")).get("source_images", [])
+            except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
+                if option_b:
+                    raise RuntimeError("existing protected note is unreadable") from exc
+                raise
             if isinstance(previous_sources, list) and all(isinstance(source, str) for source in previous_sources):
                 image_sources = previous_sources
             elif images:

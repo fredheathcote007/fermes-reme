@@ -11,10 +11,23 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import threading
 from pathlib import Path
 from typing import Any, MutableMapping
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX
+    msvcrt = None
+
 _RUNTIME: MutableMapping[str, Any] | None = None
+_HELD_PROFILE_LOCKS: set[str] = set()
+_HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
 
 def configure_runtime(runtime: MutableMapping[str, Any]) -> None:
@@ -172,3 +185,64 @@ def _verify_private_file_identity(
     if not _safe_staging_mode(path_stat.st_mode) or not _safe_staging_mode(fd_stat.st_mode):
         raise OSError("private file target is ambiguous")
     return path_stat
+
+
+class ProfileWriterLock:
+    """Own one Hermes profile's ReMe spool for the lifetime of a provider.
+
+    The lock file is intentionally retained after release. Ownership is the OS
+    lock, not the presence or age of this file, so a killed process cannot
+    leave a stale marker that blocks future recovery.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fd: int | None = None
+        self._key = _runtime_os().path.normcase(str(path.resolve(strict=False)))
+
+    def acquire(self) -> None:
+        """Acquire exclusive process and OS ownership of this profile journal."""
+        runtime_os = _runtime_os()
+        with _HELD_PROFILE_LOCKS_LOCK:
+            if self._key in _HELD_PROFILE_LOCKS:
+                raise OSError("profile writer is already owned by this process")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.parent.is_symlink() or self.path.is_symlink():
+                raise OSError(f"Refusing unsafe profile writer lock path: {self.path}")
+            flags = runtime_os.O_RDWR | runtime_os.O_CREAT
+            if hasattr(runtime_os, "O_NOFOLLOW"):
+                flags |= runtime_os.O_NOFOLLOW
+            fd = runtime_os.open(self.path, flags, 0o600)
+            try:
+                _set_private_file_mode(self.path, fd)
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif msvcrt is not None:
+                    if runtime_os.fstat(fd).st_size == 0:
+                        runtime_os.write(fd, b"\0")
+                    runtime_os.lseek(fd, 0, runtime_os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:  # pragma: no cover - no supported platform has neither
+                    raise OSError("no supported OS file-lock implementation")
+            except Exception:
+                runtime_os.close(fd)
+                raise
+            self._fd = fd
+            _HELD_PROFILE_LOCKS.add(self._key)
+
+    def release(self) -> None:
+        """Release the operating-system lock and local ownership registration."""
+        runtime_os = _runtime_os()
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                runtime_os.lseek(fd, 0, runtime_os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            runtime_os.close(fd)
+            with _HELD_PROFILE_LOCKS_LOCK:
+                _HELD_PROFILE_LOCKS.discard(self._key)
