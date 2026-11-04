@@ -47,6 +47,7 @@ from ..file_io._provenance import (
     session_source_path,
     trusted_provenance,
     verify_note_provenance,
+    verify_source_hash_prefix,
 )
 from ..index import normalize_posix_path
 from ._evolve import agent_reply_result_text, format_history, now
@@ -458,7 +459,7 @@ class AutoMemoryStep(BaseStep):
         request_id: str,
         fingerprint: str,
         session_id: str,
-        source_hash: dict,
+        source_hash: dict | None,
         agent_scope: str,
         expected_body_digest: str | None = None,
     ) -> tuple[frontmatter.Post, bytes, dict]:
@@ -991,12 +992,22 @@ class AutoMemoryStep(BaseStep):
         note_path = marker.get("note_path")
         if not isinstance(note_path, str) or not note_path:
             raise RuntimeError("protected receipt has no note path")
+        source_hash = provenance["source_hash"]
+        if source_hash != marker.get("source_hash") and not verify_source_hash_prefix(
+            self.file_store.workspace_path,
+            self._session_dir(),
+            session_id,
+            marker.get("source_hash"),
+            current_source_hash=source_hash,
+            max_bytes=self.max_file_bytes(),
+        ):
+            raise RuntimeError("protected receipt source provenance is not an append-only extension")
         _, raw, note_marker = self._read_commit_note(
             note_path,
             request_id=str(self.context.get("request_id")),
             fingerprint=fingerprint,
             session_id=session_id,
-            source_hash=provenance["source_hash"],
+            source_hash=source_hash if source_hash == marker.get("source_hash") else None,
             agent_scope=scope,
         )
         if note_marker != marker:

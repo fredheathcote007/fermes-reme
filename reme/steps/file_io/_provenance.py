@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from pathlib import Path
@@ -101,6 +102,84 @@ def source_hash_metadata(source_path: Path) -> dict[str, str]:
     """Hash exact transcript bytes in the explicit, serialized hash format."""
     digest = hashlib.sha256(_read_exact_bytes(source_path)).hexdigest()
     return {"algorithm": SOURCE_HASH_ALGORITHM, "format": SOURCE_HASH_FORMAT, "value": digest}
+
+
+def verify_source_hash_prefix(
+    workspace: Path,
+    session_dir: str,
+    session_id: str,
+    expected_source_hash: object,
+    *,
+    current_source_hash: object,
+    max_bytes: int,
+) -> bool:
+    """Verify an old source digest is a complete-record prefix of one stable transcript snapshot."""
+    if (
+        not isinstance(expected_source_hash, dict)
+        or expected_source_hash.get("algorithm") != SOURCE_HASH_ALGORITHM
+        or expected_source_hash.get("format") != SOURCE_HASH_FORMAT
+        or not isinstance(expected_source_hash.get("value"), str)
+        or len(expected_source_hash["value"]) != 64
+        or any(char not in "0123456789abcdef" for char in expected_source_hash["value"].lower())
+        or not isinstance(current_source_hash, dict)
+        or current_source_hash.get("algorithm") != SOURCE_HASH_ALGORITHM
+        or current_source_hash.get("format") != SOURCE_HASH_FORMAT
+        or not isinstance(current_source_hash.get("value"), str)
+        or len(current_source_hash["value"]) != 64
+        or any(char not in "0123456789abcdef" for char in current_source_hash["value"].lower())
+        or not isinstance(max_bytes, int)
+        or max_bytes <= 0
+    ):
+        return False
+    try:
+        source_path = resolve_session_source(workspace, session_dir, session_id)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(source_path, flags)
+    except (OSError, ProvenanceError):
+        return False
+
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
+            return False
+        digest = hashlib.sha256()
+        pending = bytearray()
+        prefix_match = False
+        total = 0
+        while chunk := os.read(fd, 1024 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                return False
+            pending.extend(chunk)
+            while True:
+                try:
+                    newline = pending.index(10)
+                except ValueError:
+                    break
+                line = bytes(pending[: newline + 1])
+                del pending[: newline + 1]
+                try:
+                    record = json.loads(line[:-1].decode("utf-8"))
+                except (UnicodeError, ValueError, TypeError):
+                    return False
+                if not isinstance(record, dict):
+                    return False
+                digest.update(line)
+                if digest.hexdigest() == expected_source_hash["value"]:
+                    prefix_match = True
+        if pending or not prefix_match or digest.hexdigest() != current_source_hash["value"]:
+            return False
+        current = os.stat(source_path, follow_symlinks=False)
+        return (
+            stat.S_ISREG(current.st_mode)
+            and current.st_dev == opened.st_dev
+            and current.st_ino == opened.st_ino
+            and current.st_size == total
+        )
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def trusted_provenance(workspace: Path, session_dir: str, session_id: str) -> dict:

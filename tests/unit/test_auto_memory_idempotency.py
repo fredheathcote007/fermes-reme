@@ -401,6 +401,116 @@ async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_pa
     assert len(calls) == 2
 
 
+@pytest.mark.asyncio
+async def test_option_b_receipt_replays_after_append_only_source_growth(tmp_path, monkeypatch):
+    """A lost acknowledgement remains replayable after the owned transcript grows."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/growth.md"
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/growth.md",
+                    "name": "growth",
+                    "description": "A deterministic protected fact.",
+                    "content": "The protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "growth-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="growth-request", **request)
+        source = workspace / "session/dialog/growth-session.jsonl"
+        original = source.read_bytes()
+        record = json.loads(original.splitlines()[0])
+        record["id"] = "m2"
+        record["content"][0]["text"] = "later turn"
+        source.write_bytes(original + json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode() + b"\n")
+        note_before_replay = note_path.read_bytes()
+
+        replay = await app.run_job("auto_memory", request_id="growth-request", **request)
+
+    assert first.success
+    assert replay.success
+    assert replay == first
+    assert calls == [1]
+    assert note_path.read_bytes() == note_before_replay
+    assert len(list((workspace / "metadata/auto_memory_requests").rglob("*.json"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_option_b_receipt_rejects_changed_historical_source_prefix(tmp_path, monkeypatch):
+    """A changed historical record is not accepted merely because the file also grew."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    note_path = workspace / "daily/2026-10-21/prefix.md"
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/prefix.md",
+                    "name": "prefix",
+                    "description": "A deterministic protected fact.",
+                    "content": "The protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "prefix-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="prefix-request", **request)
+        source = workspace / "session/dialog/prefix-session.jsonl"
+        original = source.read_bytes()
+        changed = json.loads(original.splitlines()[0])
+        changed["content"][0]["text"] = "tampered historical turn"
+        appended = dict(changed)
+        appended["id"] = "m2"
+        appended["content"] = [{"type": "text", "text": "later turn"}]
+        source.write_bytes(
+            json.dumps(changed, ensure_ascii=False, separators=(",", ":")).encode()
+            + b"\n"
+            + json.dumps(appended, ensure_ascii=False, separators=(",", ":")).encode()
+            + b"\n",
+        )
+        note_before_replay = note_path.read_bytes()
+
+        replay = await app.run_job("auto_memory", request_id="prefix-request", **request)
+
+    assert first.success
+    assert not replay.success
+    assert "replay refused" in replay.answer
+    assert calls == [1]
+    assert note_path.read_bytes() == note_before_replay
+
+
 def test_option_b_system_prompt_renders_literal_json_schema():
     prompt_file = Path(__file__).resolve().parents[2] / "reme/steps/evolve/auto_memory.yaml"
     prompt = (
