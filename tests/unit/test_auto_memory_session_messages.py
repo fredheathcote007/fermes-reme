@@ -225,3 +225,18 @@ async def test_protected_transcript_keeps_identical_distinct_turns(tmp_path, mon
 
     _assert_transcript(step._session_path(_SESSION), ["turn-1", "turn-2"])
     assert len(durable_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_message_id_preserves_original_created_at(step):
+    await step._save_session_messages(_SESSION, [_msg("stable", "2026-10-01T23:59:59")])
+    await step._save_session_messages(_SESSION, [_msg("stable", "2026-10-02T00:00:01")])
+
+    messages = [
+        Msg.model_validate_json(line)
+        for line in step._session_path(_SESSION).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(messages) == 1
+    assert messages[0].id == "stable"
+    assert messages[0].created_at == "2026-10-01T23:59:59"

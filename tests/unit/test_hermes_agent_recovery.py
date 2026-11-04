@@ -31,6 +31,29 @@ from .test_hermes_agent_integration import (
 
 
 @pytest.mark.parametrize(
+    "detail",
+    [
+        "connection reset by foreign host",
+        "model alias superseded, please retry",
+        "source provenance unavailable: backend is temporarily unavailable",
+    ],
+)
+def test_transient_text_is_not_a_permanent_write_refusal(detail):
+    assert PLUGIN_MODULE._is_permanent_write_failure(ReMeBackendError(detail)) is False
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "existing protected note belongs to a different source session",
+        "protected marker source provenance is not an append-only extension",
+    ],
+)
+def test_protected_identity_mismatch_remains_permanent(detail):
+    assert PLUGIN_MODULE._is_permanent_write_failure(ReMeBackendError(detail)) is True
+
+
+@pytest.mark.parametrize(
     ("response", "message"),
     [
         ({"success": False, "error": "memory extraction exploded"}, "memory extraction exploded"),

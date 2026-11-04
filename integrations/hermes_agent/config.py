@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -375,6 +376,10 @@ def save_config(values: dict[str, Any], hermes_home: str | Path) -> ReMeConfig:
     merged.update(
         {key: value for key, value in dict(values or {}).items() if value is not None},
     )
+    if str(merged.get("mode", "")).strip().lower() == "embedded" and sys.platform == "win32":
+        raise ReMeConfigError(
+            "Embedded ReMe Option B requires POSIX durable filesystem primitives; Windows is unsupported",
+        )
     validated = parse_config(merged, hermes_home=home)
 
     current.parent.mkdir(parents=True, exist_ok=True)

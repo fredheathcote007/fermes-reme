@@ -1300,6 +1300,9 @@ class AutoMemoryStep(BaseStep):
             new_messages = []
             for msg in incoming:
                 if msg.id in by_id:
+                    existing_message = by_id[msg.id]
+                    if msg.created_at != existing_message.created_at:
+                        msg = msg.model_copy(update={"created_at": existing_message.created_at})
                     by_id[msg.id] = msg
                 else:
                     new_messages.append(msg)

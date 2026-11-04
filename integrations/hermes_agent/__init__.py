@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import atexit
-import hashlib
 import importlib.util
 import json
 import logging
 import os
 import queue
-import re
 import stat
 import sys
 import tempfile
@@ -43,6 +41,8 @@ from .config import (
 from .embedded_backend import EmbeddedReMeBackend
 from .http_backend import HttpReMeBackend
 from .retry_policy import is_permanent_write_failure as _is_permanent_write_failure
+from .turn_payload import build_turn_payload as _build_turn_payload
+from .turn_payload import scoped_session_id
 from .durability import (
     _fsync_directory as _durability_fsync_directory,
     _fsync_file as _durability_fsync_file,
@@ -56,8 +56,9 @@ from .durability import (
     configure_runtime as _configure_durability_runtime,
 )
 
+_scoped_session_id = scoped_session_id
+
 logger = logging.getLogger(__name__)
-_NON_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _SDK_INSTALL_HINT = 'Embedded ReMe mode requires the SDK. Install it with: pip install "reme-ai[core]"'
 _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
@@ -381,19 +382,6 @@ class _WorkspaceOwnerMarker:
         self._owned = False
 
 
-def _slug(value: str, fallback: str, *, limit: int) -> str:
-    value = _NON_FILENAME_CHARS.sub("-", str(value or "").strip()).strip("-._")
-    return (value or fallback)[:limit]
-
-
-def _scoped_session_id(profile_id: str, session_id: str) -> str:
-    """Create a readable, filename-safe ID without allowing scope collisions."""
-    profile = str(profile_id or "default")
-    session = str(session_id or "session")
-    digest = hashlib.sha256(f"{profile}\0{session}".encode()).hexdigest()[:12]
-    return f"hermes-{_slug(profile, 'default', limit=32)}-{_slug(session, 'session', limit=64)}-{digest}"
-
-
 def _backend_for(config: ReMeConfig) -> ReMeBackend:
     if config.mode == "embedded":
         return EmbeddedReMeBackend(
@@ -696,8 +684,17 @@ class ReMeMemoryProvider(MemoryProvider):
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         """Validate and save terminal-wizard settings."""
         candidate = dict(values or {})
+        requested_mode = str(candidate.get("mode", "") or "").strip().lower()
+        if requested_mode == "embedded" and _is_windows_platform():
+            raise ReMeConfigError(
+                "Embedded ReMe Option B requires POSIX durable filesystem primitives; Windows is unsupported",
+            )
         current = load_config(hermes_home)
         mode = str(candidate.get("mode", current.mode) or current.mode).strip().lower()
+        if mode == "embedded" and _is_windows_platform():
+            raise ReMeConfigError(
+                "Embedded ReMe Option B requires POSIX durable filesystem primitives; Windows is unsupported",
+            )
         if mode == "http":
             endpoint = str(
                 candidate.get("endpoint", current.endpoint) or current.endpoint,
@@ -811,19 +808,12 @@ class ReMeMemoryProvider(MemoryProvider):
                 "ReMe skipped a completed turn because Hermes supplied no session id",
             )
             return
-        turn_id = uuid.uuid4().hex
-        payload = {
-            "session_id": _scoped_session_id(self._profile_id, routed_session),
-            "messages": [
-                {"id": f"{turn_id}:user", "name": "user", "role": "user", "content": user},
-                {"id": f"{turn_id}:assistant", "name": "assistant", "role": "assistant", "content": assistant},
-            ],
-        }
+        payload = _build_turn_payload(self._profile_id, routed_session, user, assistant)
         if not self._enqueue_write(payload):
             logger.warning(
                 "ReMe did not record session %s because the provider is unavailable: %s",
                 payload["session_id"],
-                self._unavailable_reason or "shutting down",
+                self._unavailable_reason or ("shutting down" if self._shutdown_started else "spool write failed"),
             )
 
     def on_session_switch(
@@ -965,6 +955,8 @@ class ReMeMemoryProvider(MemoryProvider):
     def _start_writer_if_needed(self) -> None:
         with self._write_thread_lock:
             if self._write_thread is not None and self._write_thread.is_alive():
+                return
+            if time.monotonic() < self._next_write_attempt:
                 return
             self._queue_pending_records()
             if self._write_queue.empty():
@@ -1239,7 +1231,7 @@ class ReMeMemoryProvider(MemoryProvider):
                         if not self._record_payload(
                             payload["payload"],
                             request_id=payload["id"],
-                            respect_cooldown=False,
+                            respect_cooldown=True,
                         ):
                             retry = True
                         elif not self._remove_pending_write(payload["id"]):
@@ -1276,6 +1268,7 @@ class ReMeMemoryProvider(MemoryProvider):
                             payload["attempts"],
                         )
                         self._schedule_retry(payload)
+                        return
                 finally:
                     if payload is not None:
                         with self._write_thread_lock:
@@ -1350,7 +1343,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._next_write_attempt = max(self._next_write_attempt, self._next_health_probe, retry_at)
 
     def _schedule_retry(self, record: dict[str, Any]) -> None:
-        """Retry one failed record later without blocking unrelated queued records."""
+        """Retry the failed record first, preserving the durable queue order."""
         delay = max(0.01, self._next_write_attempt - time.monotonic())
         timer: threading.Timer
 
@@ -1359,8 +1352,22 @@ class ReMeMemoryProvider(MemoryProvider):
                 self._retry_timers.discard(timer)
                 if self._shutdown_started:
                     return
+                queued: list[dict[str, Any]] = []
+                while True:
+                    try:
+                        queued_record = self._write_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        if queued_record is not None and queued_record.get("id") != record["id"]:
+                            queued.append(queued_record)
+                    finally:
+                        self._write_queue.task_done()
                 self._queued_record_ids.discard(record["id"])
-                self._queue_pending_records((record,))
+                self._queued_record_ids.add(record["id"])
+                self._write_queue.put(record)
+                for queued_record in queued:
+                    self._write_queue.put(queued_record)
                 self._start_writer_if_needed()
 
         timer = threading.Timer(delay, enqueue)

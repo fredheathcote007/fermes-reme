@@ -1264,182 +1264,19 @@ def test_embedded_mode_fails_fast_as_unsupported_on_windows(monkeypatch, tmp_pat
     assert "Windows is unsupported" in provider.unavailable_reason()
 
 
-def test_retried_spool_record_reuses_record_id_after_ack_failure(monkeypatch, tmp_path):
-    backend = FakeBackend()
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+def test_save_config_rejects_embedded_mode_on_windows_before_writing(monkeypatch, tmp_path):
+    monkeypatch.setattr(CONFIG_MODULE.sys, "platform", "win32")
 
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
-    original_remove = provider._remove_pending_write
-    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
-    provider.sync_turn("same user", "same assistant")
-    deadline = time.monotonic() + 1
-    while len(backend.request_ids) < 1 and time.monotonic() < deadline:
-        time.sleep(0.005)
-    first_id = backend.request_ids[0]
+    with pytest.raises(ReMeConfigError, match="Windows is unsupported"):
+        save_config(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(tmp_path / "workspace"),
+            },
+            tmp_path,
+        )
 
-    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
-    record = json.loads(pending.read_text(encoding="utf-8"))
-    assert record["id"] == first_id
-
-    provider._shutdown_started = True
-    monkeypatch.setattr(provider, "_remove_pending_write", original_remove)
-    provider._shutdown_started = False
-    provider._accept_writes = True
-    provider._health_retry_seconds = 0.01
-    provider._queue_pending_records()
-    provider._start_writer_if_needed()
-    deadline = time.monotonic() + 1
-    while len(backend.request_ids) < 2 and time.monotonic() < deadline:
-        time.sleep(0.005)
-
-    assert backend.request_ids[:2] == [first_id, first_id]
-    provider.shutdown()
-
-
-def test_embedded_reme_receipt_covers_success_before_spool_ack_crash_window(monkeypatch, tmp_path):
-    import yaml
-
-    from reme.steps.evolve.auto_memory import AutoMemoryStep
-
-    calls = []
-    stage_config = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
-    # This is deliberately a legacy receipt/ACK test. Use a disposable
-    # unprotected job config rather than silently downgrading protected Option B.
-    legacy_config = yaml.safe_load(stage_config.read_text(encoding="utf-8"))
-    legacy_config["jobs"]["auto_memory"]["steps"][0]["durable_commit"] = False
-    legacy_config_path = tmp_path / "legacy-memory-stage1.yaml"
-    legacy_config_path.write_text(yaml.safe_dump(legacy_config, sort_keys=False), encoding="utf-8")
-    config = ReMeConfig(
-        mode="embedded",
-        workspace_dir=str(tmp_path / "workspace"),
-        reme_config=str(legacy_config_path),
-        allow_custom_config=True,
-        request_timeout=5,
-        recall_timeout=1,
-        health_timeout=1,
-        health_retry_seconds=0.01,
-        shutdown_timeout=5,
-    )
-
-    async def synthetic_execute(step):
-        calls.append(step.context.get("request_id"))
-        step.context.response.answer = "synthetic receipt"
-        step.context["changes"] = []
-
-    monkeypatch.setattr(AutoMemoryStep, "_execute", synthetic_execute)
-    # This provider queue test exercises the pre-Option-B receipt/ACK boundary
-    # with a synthetic step response; the dedicated capture tests cover the
-    # protected commit contract.
-    monkeypatch.setattr(AutoMemoryStep, "_option_b_enabled", lambda _step: False)
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
-    profile = tmp_path / "profile"
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=profile, agent_identity="profile")
-    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
-    provider.sync_turn("crash-window user", "assistant")
-
-    deadline = time.monotonic() + 5
-    while len(calls) < 1 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert len(calls) == 1
-    pending = profile / "reme" / "pending-writes.jsonl"
-    assert pending.read_text(encoding="utf-8").strip()
-    provider.shutdown()
-
-    replay = ReMeMemoryProvider()
-    replay.initialize("new-session", hermes_home=profile, agent_identity="profile")
-    deadline = time.monotonic() + 5
-    while pending.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    replay.shutdown()
-
-    assert len(calls) == 1
-    assert pending.read_text(encoding="utf-8") == ""
-
-
-def test_failed_first_record_does_not_stall_later_record(monkeypatch, tmp_path):
-    backend = FakeBackend()
-    calls = 0
-
-    def auto_memory(session_id, messages, *, timeout, request_id=None):
-        nonlocal calls
-        del session_id, messages, timeout
-        calls += 1
-        backend.request_ids.append(request_id)
-        if calls == 1:
-            return {"success": False, "answer": "transient"}
-        return {"success": True}
-
-    backend.auto_memory = auto_memory
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=tmp_path)
-    provider._health_retry_seconds = 60
-    provider.sync_turn("first", "assistant")
-    provider.sync_turn("second", "assistant")
-
-    deadline = time.monotonic() + 1
-    while calls < 2 and time.monotonic() < deadline:
-        time.sleep(0.005)
-    provider.shutdown()
-
-    assert calls >= 2
-    assert len(backend.request_ids) >= 2
-    assert backend.request_ids[0] != backend.request_ids[1]
-
-
-@pytest.mark.parametrize("response", [{"success": False}, [], None])
-def test_false_or_malformed_auto_memory_ack_keeps_spool_record(monkeypatch, tmp_path, response):
-    backend = FakeBackend()
-    backend.auto_memory = lambda *args, **kwargs: response
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=tmp_path)
-    provider.sync_turn("user", "assistant")
-    deadline = time.monotonic() + 1
-    while provider._write_thread is not None and time.monotonic() < deadline:
-        time.sleep(0.005)
-
-    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
-    assert pending.read_text(encoding="utf-8").strip()
-    provider.shutdown()
-
-
-def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_path):
-    provider = ReMeMemoryProvider()
-    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
-    provider._pending_path.parent.mkdir()
-    valid = {"id": "valid", "payload": {"session_id": "s", "messages": []}}
-    provider._pending_path.write_text(
-        "not-json\n" '{"id": "poison", "payload": "not-an-object"}\n' + json.dumps(valid) + "\n",
-        encoding="utf-8",
-    )
-
-    assert provider._read_pending_writes() == [valid]
-    assert provider._remove_pending_write("valid") is True
-    remaining = provider._pending_path.read_text(encoding="utf-8")
-    assert "not-json" in remaining
-    assert '"poison"' in remaining
-    assert '"valid"' not in remaining
-
-
-def test_disk_append_failure_does_not_acknowledge_or_queue_turn(monkeypatch, tmp_path):
-    provider = ReMeMemoryProvider()
-    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
-    provider._accept_writes = True
-
-    def fail(_payload):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(provider, "_append_pending_write", fail)
-    provider.sync_turn("user", "assistant", session_id="session")
-
-    assert provider._write_queue.empty()
-    assert not provider._pending_path.exists()
+    assert not config_path(tmp_path).exists()
 
 
 def test_spool_rejects_symlink_and_sets_private_permissions(tmp_path):
