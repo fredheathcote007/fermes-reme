@@ -42,6 +42,18 @@ from .config import (
 )
 from .embedded_backend import EmbeddedReMeBackend
 from .http_backend import HttpReMeBackend
+from .durability import (
+    _fsync_directory as _durability_fsync_directory,
+    _fsync_file as _durability_fsync_file,
+    _is_reparse_point as _durability_is_reparse_point,
+    _is_unsafe_link as _durability_is_unsafe_link,
+    _owned_by_current_user as _durability_owned_by_current_user,
+    _safe_staging_mode as _durability_safe_staging_mode,
+    _same_file_identity as _durability_same_file_identity,
+    _set_private_file_mode as _durability_set_private_file_mode,
+    _verify_private_file_identity as _durability_verify_private_file_identity,
+    configure_runtime as _configure_durability_runtime,
+)
 
 logger = logging.getLogger(__name__)
 _NON_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
@@ -57,26 +69,21 @@ _HELD_PROFILE_LOCKS: set[str] = set()
 _HELD_PROFILE_LOCKS_LOCK = threading.Lock()
 
 
-def _fsync_directory(path: Path) -> None:
-    """Flush a directory entry after creating or replacing the profile spool."""
-    if os.name == "nt":
-        # Windows does not expose a portable fsync-able directory handle.
-        # The file itself is flushed before publication; never substitute an
-        # unsafe rename when directory metadata cannot be flushed.
-        return
-    fsync = getattr(os, "fsync", None)
-    if fsync is None:
-        raise OSError("directory fsync is unsupported")
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def _is_windows_platform() -> bool:
     """Return the platform family used for filesystem mode interpretation."""
     return sys.platform == "win32"
+
+
+_fsync_directory = _durability_fsync_directory
+_fsync_file = _durability_fsync_file
+_is_reparse_point = _durability_is_reparse_point
+_is_unsafe_link = _durability_is_unsafe_link
+_owned_by_current_user = _durability_owned_by_current_user
+_safe_staging_mode = _durability_safe_staging_mode
+_same_file_identity = _durability_same_file_identity
+_set_private_file_mode = _durability_set_private_file_mode
+_verify_private_file_identity = _durability_verify_private_file_identity
+_configure_durability_runtime(globals())
 
 
 def _is_permanent_write_failure(error: BaseException) -> bool:
@@ -95,110 +102,6 @@ def _is_permanent_write_failure(error: BaseException) -> bool:
             "frontmatter key collision",
         )
     )
-
-
-def _safe_staging_mode(mode: int) -> bool:
-    """Accept only private marker modes, including Windows' reduced mode semantics."""
-    mode_bits = stat.S_IMODE(mode)
-    if not _is_windows_platform():
-        return mode_bits == 0o600
-    # Windows may report the mkstemp file as normal/read-only (0666/0444),
-    # while 0600 is also produced by Python builds that expose POSIX modes.
-    return mode_bits in {0o444, 0o600, 0o666}
-
-
-def _set_private_file_mode(path: Path, fd: int) -> None:
-    """Apply the strongest portable private-file mode for the current platform."""
-    if _is_windows_platform():
-        chmod = getattr(os, "chmod", None)
-        if chmod is None:
-            raise OSError("private file mode is unsupported on Windows")
-        try:
-            # Python 3.11's Windows chmod does not implement follow_symlinks.
-            # The descriptor is retained from mkstemp/exclusive creation while
-            # the path-based operation is guarded by identity and reparse checks.
-            before = _verify_private_file_identity(path, fd, require_single_link=True)
-            chmod(path, stat.S_IREAD | stat.S_IWRITE)
-            _verify_private_file_identity(path, fd, expected_stat=before)
-        except (NotImplementedError, OSError, TypeError) as exc:
-            raise OSError("private file mode is unsupported on Windows") from exc
-        return
-    fchmod = getattr(os, "fchmod", None)
-    if fchmod is None:
-        raise OSError("private file mode is unsupported")
-    try:
-        fchmod(fd, 0o600)
-    except (NotImplementedError, OSError) as exc:
-        raise OSError("private file mode could not be applied") from exc
-
-
-def _fsync_file(fd: int) -> None:
-    """Flush an open file or fail closed when file durability is unavailable."""
-    fsync = getattr(os, "fsync", None)
-    if fsync is None:
-        raise OSError("file fsync is unsupported")
-    fsync(fd)
-
-
-def _is_reparse_point(path: Path, file_stat: os.stat_result) -> bool:
-    """Detect Windows reparse points even on Python versions without is_junction."""
-    if not _is_windows_platform():
-        return False
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    if getattr(file_stat, "st_file_attributes", 0) & reparse_flag:
-        return True
-    is_junction = getattr(path, "is_junction", None)
-    if is_junction is None:
-        return False
-    try:
-        return bool(is_junction())
-    except OSError:
-        return True
-
-
-def _is_unsafe_link(path: Path, file_stat: os.stat_result) -> bool:
-    """Return whether a path entry is a symlink or Windows reparse point."""
-    return stat.S_ISLNK(file_stat.st_mode) or _is_reparse_point(path, file_stat)
-
-
-def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
-    """Return whether two stat results identify the same device and inode."""
-    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
-
-
-def _owned_by_current_user(file_stat: os.stat_result, current_uid: int | None) -> bool:
-    """Return whether a stat result belongs to the current user when supported."""
-    return current_uid is None or file_stat.st_uid == current_uid
-
-
-def _verify_private_file_identity(
-    path: Path,
-    fd: int,
-    *,
-    expected_stat: os.stat_result | None = None,
-    require_single_link: bool = False,
-) -> os.stat_result:
-    """Verify that a path and open descriptor still name the same private file."""
-    path_stat = path.lstat()
-    fd_stat = os.fstat(fd)
-    current_uid = os.getuid() if hasattr(os, "getuid") else None
-    if _is_unsafe_link(path, path_stat) or _is_unsafe_link(path, fd_stat):
-        raise OSError("private file target is ambiguous")
-    if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(fd_stat.st_mode):
-        raise OSError("private file target is ambiguous")
-    if not _same_file_identity(path_stat, fd_stat):
-        raise OSError("private file target is ambiguous")
-    if expected_stat is not None and not _same_file_identity(path_stat, expected_stat):
-        raise OSError("private file target is ambiguous")
-    if expected_stat is not None and not _same_file_identity(fd_stat, expected_stat):
-        raise OSError("private file target is ambiguous")
-    if require_single_link and path_stat.st_nlink != 1:
-        raise OSError("private file target is ambiguous")
-    if not _owned_by_current_user(path_stat, current_uid) or not _owned_by_current_user(fd_stat, current_uid):
-        raise OSError("private file target is ambiguous")
-    if not _safe_staging_mode(path_stat.st_mode) or not _safe_staging_mode(fd_stat.st_mode):
-        raise OSError("private file target is ambiguous")
-    return path_stat
 
 
 class _ProfileWriterLock:
