@@ -443,6 +443,15 @@ async def test_option_b_recovery_scans_prior_daily_directory_before_appending(tm
 
     async with Application(**config) as app:
         first = await app.run_job("auto_memory", request_id="cross-midnight-request", **request)
+        source = workspace / "session/dialog/cross-midnight-session.jsonl"
+        original = source.read_bytes()
+        appended = json.loads(original.splitlines()[0])
+        appended["id"] = "m2"
+        appended["content"][0]["text"] = "later turn"
+        source.write_bytes(original + json.dumps(appended, ensure_ascii=False, separators=(",", ":")).encode() + b"\n")
+        unrelated = workspace / "daily/2026-10-20/unrelated.md"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_bytes(b"---\nnot: [valid\xff\n---\nnot a candidate\n")
         second = await app.run_job("auto_memory", request_id="cross-midnight-request", **request)
 
     assert first.success and second.success

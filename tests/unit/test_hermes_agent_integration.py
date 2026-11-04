@@ -1233,6 +1233,108 @@ def test_permanent_refusal_is_quarantined_instead_of_retried_forever(monkeypatch
     assert pending.read_text(encoding="utf-8") == ""
 
 
+def test_retryable_error_prefix_remains_durable_and_is_not_quarantined(monkeypatch, tmp_path):
+    backend = _FakeBackend()
+    retry_invocations = []
+    retry_started = threading.Event()
+
+    def retryable_auto_memory(*args, **kwargs):
+        del args, kwargs
+        retry_invocations.append(None)
+        retry_started.set()
+        raise ReMeBackendError("Error: durable memory write failed; request remains eligible for retry")
+
+    backend.auto_memory = retryable_auto_memory
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    provider.sync_turn("retryable user", "assistant")
+    deadline = time.monotonic() + 0.3
+    retry_started.wait(timeout=max(0, deadline - time.monotonic()))
+    while len(retry_invocations) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
+    quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
+    assert len(retry_invocations) >= 2
+    assert pending.read_text(encoding="utf-8").strip()
+    assert not quarantine.exists()
+
+
+def test_backend_unavailable_cycles_keep_spool_until_health_recovers(monkeypatch, tmp_path):
+    class FlakyHealthBackend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.health_failures = 7
+
+        def health(self, *, timeout):
+            del timeout
+            if self.health_failures:
+                self.health_failures -= 1
+                raise ReMeBackendError("connection refused")
+            return super().health(timeout=1)
+
+    backend = FlakyHealthBackend()
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    provider.sync_turn("outage user", "assistant")
+    deadline = time.monotonic() + 2
+    while not backend.writes and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
+    quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
+    assert backend.writes
+    assert not quarantine.exists()
+    assert pending.read_text(encoding="utf-8") == ""
+
+
+def test_backend_unavailable_result_is_backed_off_without_attempt_budget(monkeypatch, tmp_path):
+    backend = _FakeBackend()
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._accept_writes = True
+    provider._health_retry_seconds = 0.01
+    outcomes = iter([False] * 7 + [True])
+    monkeypatch.setattr(provider, "_ensure_backend", lambda **_kwargs: next(outcomes))
+    provider._backend = backend
+
+    provider._enqueue_write({"session_id": "s", "messages": []})
+    deadline = time.monotonic() + 2
+    while not backend.writes and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    pending = provider._pending_path
+    assert backend.writes
+    assert not (pending.parent / "quarantined-writes.jsonl").exists()
+    assert pending.read_text(encoding="utf-8") == ""
+
+
+def test_quarantine_repairs_torn_line_and_does_not_duplicate_after_cleanup_failure(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    record = provider._append_pending_write({"session_id": "s", "messages": []})
+    quarantine = provider._pending_path.parent / "quarantined-writes.jsonl"
+    quarantine.parent.mkdir(parents=True, exist_ok=True)
+    quarantine.write_text('{"id":"older","reason":"permanent_refusal"}', encoding="utf-8")
+    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
+
+    assert provider._quarantine_pending_write(record, "permanent_refusal") is True
+    assert provider._quarantine_pending_write(record, "permanent_refusal") is True
+    entries = [json.loads(line) for line in quarantine.read_text(encoding="utf-8").splitlines()]
+    assert entries[0]["id"] == "older"
+    assert [entry["id"] for entry in entries].count(record["id"]) == 1
+    assert provider._pending_path.read_text(encoding="utf-8").strip()
+
+
 def test_embedded_mode_fails_fast_as_unsupported_on_windows(monkeypatch, tmp_path):
     config = ReMeConfig(mode="embedded", workspace_dir=str(tmp_path / "workspace"))
     monkeypatch.setattr(PLUGIN_MODULE.sys, "platform", "win32")
@@ -1249,7 +1351,7 @@ def test_embedded_mode_fails_fast_as_unsupported_on_windows(monkeypatch, tmp_pat
 
 def test_retried_spool_record_reuses_record_id_after_ack_failure(monkeypatch, tmp_path):
     backend = _FakeBackend()
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
 
     provider = ReMeMemoryProvider()

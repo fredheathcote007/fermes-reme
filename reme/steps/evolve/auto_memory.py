@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import aiofiles
 import frontmatter
+import yaml
 from agentscope.agent import ContextConfig
 from agentscope.message import DataBlock, Msg, TextBlock, UserMsg
 
@@ -344,6 +345,8 @@ class AutoMemoryStep(BaseStep):
             raise RuntimeError("protected daily path is unreadable") from exc
 
         matches: list[tuple[str, bytes, dict]] = []
+        marker_token = _OPTION_B_MARKER.encode("utf-8")
+        request_token = request_id.encode("utf-8")
         for date_entry in date_entries:
             if date_entry.is_symlink():
                 raise RuntimeError("protected daily path contains a symlink")
@@ -360,9 +363,16 @@ class AutoMemoryStep(BaseStep):
                     continue
                 relative = f"{daily_dir}/{date_entry.name}/{note_entry.name}"
                 raw = self._read_owned_note(relative)
+                # User-authored notes can be unreadable or contain arbitrary
+                # YAML.  Only a note that names both this protected marker and
+                # request is a matching candidate; unrelated notes are never
+                # parsed and therefore cannot block recovery or leak parser
+                # details into the response.
+                if marker_token not in raw or request_token not in raw:
+                    continue
                 try:
                     post = frontmatter.loads(raw.decode("utf-8"))
-                except (UnicodeError, ValueError, TypeError) as exc:
+                except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
                     raise RuntimeError("protected daily note is unreadable") from exc
                 marker = post.metadata.get(_OPTION_B_MARKER)
                 if marker is None:
@@ -385,6 +395,19 @@ class AutoMemoryStep(BaseStep):
         if len(matches) > 1:
             raise RuntimeError("multiple protected note markers match the request")
         return matches[0] if matches else None
+
+    def _validate_marker_source_provenance(self, marker: dict, *, session_id: str, current: dict) -> bool:
+        """Accept the marker's exact source or a validated append-only extension."""
+        if marker.get("source_hash") == current:
+            return True
+        return verify_source_hash_prefix(
+            self.file_store.workspace_path,
+            self._session_dir(),
+            session_id,
+            marker.get("source_hash"),
+            current_source_hash=current,
+            max_bytes=self.max_file_bytes(),
+        )
 
     def _provenance_enabled(self) -> bool:
         """Limit trusted transcript provenance to the Fermes AgentScope step."""
@@ -670,14 +693,24 @@ class AutoMemoryStep(BaseStep):
             agent_scope=self._option_b_scope(),
         )
         if cross_day is not None:
-            relative, _, _ = cross_day
+            relative, _, committed_marker = cross_day
             provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+            if not self._validate_marker_source_provenance(
+                committed_marker,
+                session_id=session_id,
+                current=provenance["source_hash"],
+            ):
+                raise RuntimeError("protected marker source provenance is not an append-only extension")
             _, committed_raw, committed_marker = self._read_commit_note(
                 relative,
                 request_id=request_id,
                 fingerprint=fingerprint,
                 session_id=session_id,
-                source_hash=provenance["source_hash"],
+                source_hash=(
+                    provenance["source_hash"]
+                    if committed_marker.get("source_hash") == provenance["source_hash"]
+                    else None
+                ),
                 agent_scope=self._option_b_scope(),
             )
             committed_day = Path(relative).parts[-2]
@@ -722,12 +755,20 @@ class AutoMemoryStep(BaseStep):
 
         if marker.get("request_id") == request_id:
             provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
+            if not self._validate_marker_source_provenance(
+                marker,
+                session_id=session_id,
+                current=provenance["source_hash"],
+            ):
+                raise RuntimeError("protected marker source provenance is not an append-only extension")
             _, committed_raw, committed_marker = self._read_commit_note(
                 relative,
                 request_id=request_id,
                 fingerprint=fingerprint,
                 session_id=session_id,
-                source_hash=provenance["source_hash"],
+                source_hash=(
+                    provenance["source_hash"] if marker.get("source_hash") == provenance["source_hash"] else None
+                ),
                 agent_scope=self._option_b_scope(),
             )
             index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))

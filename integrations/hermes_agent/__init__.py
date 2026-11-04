@@ -61,7 +61,6 @@ _SDK_INSTALL_HINT = 'Embedded ReMe mode requires the SDK. Install it with: pip i
 _PENDING_QUEUE_DIRECTORY = "reme"
 _PENDING_QUEUE_FILENAME = "pending-writes.jsonl"
 _QUARANTINE_QUEUE_FILENAME = "quarantined-writes.jsonl"
-_MAX_WRITE_ATTEMPTS = 5
 _PROFILE_LOCK_FILENAME = ".writer.lock"
 _WORKSPACE_OWNER_FILENAME = ".hermes-reme-owner.json"
 _WORKSPACE_OWNER_TEMP_PREFIX = f".{_WORKSPACE_OWNER_FILENAME}."
@@ -89,17 +88,26 @@ _configure_durability_runtime(globals())
 def _is_permanent_write_failure(error: BaseException) -> bool:
     """Recognize application refusals that cannot improve by replaying unchanged input."""
     detail = str(error).strip().lower()
-    return detail.startswith("error:") or any(
+    return any(
         marker in detail
         for marker in (
             "request_id was already used for different input",
-            "protected receipt replay refused",
             "protected note marker",
             "protected note belongs to",
             "source provenance",
             "superseded",
             "foreign",
             "frontmatter key collision",
+            "protected receipt is malformed",
+            "protected receipt is not a ",
+            "protected receipt fingerprint does not match",
+            "protected receipt has no note path",
+            "protected receipt has an unknown outcome",
+            "protected receipt does not match",
+            "protected receipt response is not bound",
+            "protected receipt request does not match",
+            "protected prior commit has no durable receipt",
+            "protected note body digest",
         )
     )
 
@@ -1109,25 +1117,54 @@ class ReMeMemoryProvider(MemoryProvider):
         }
         with self._pending_lock:
             try:
-                flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                fd = os.open(quarantine, flags, 0o600)
-                try:
-                    _set_private_file_mode(quarantine, fd)
-                    with os.fdopen(fd, "a", encoding="utf-8") as handle:
-                        fd = -1
-                        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
-                        handle.flush()
-                        _fsync_file(handle.fileno())
-                finally:
-                    if fd >= 0:
-                        os.close(fd)
-                _fsync_directory(quarantine.parent)
+                if quarantine.exists() and quarantine.stat().st_size:
+                    with quarantine.open("rb") as existing:
+                        existing.seek(-1, os.SEEK_END)
+                        if existing.read(1) != b"\n":
+                            repair_fd = os.open(
+                                quarantine,
+                                os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            try:
+                                os.write(repair_fd, b"\n")
+                                _fsync_file(repair_fd)
+                            finally:
+                                os.close(repair_fd)
+                already_quarantined = False
+                if quarantine.exists():
+                    for line in quarantine.read_bytes().splitlines():
+                        try:
+                            existing = json.loads(line)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            continue
+                        if isinstance(existing, dict) and existing.get("id") == record.get("id"):
+                            already_quarantined = True
+                            break
+                if not already_quarantined:
+                    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    fd = os.open(quarantine, flags, 0o600)
+                    try:
+                        _set_private_file_mode(quarantine, fd)
+                        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                            fd = -1
+                            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+                            handle.flush()
+                            _fsync_file(handle.fileno())
+                    finally:
+                        if fd >= 0:
+                            os.close(fd)
+                    _fsync_directory(quarantine.parent)
             except (OSError, TypeError, ValueError) as exc:
                 logger.error("ReMe could not quarantine durable write: %s", exc)
                 return False
-        return self._remove_pending_write(str(record.get("id", "")))
+        # The quarantine record is durable even if cleanup of the active queue
+        # is temporarily unavailable.  The next provider start will retry only
+        # that cleanup; do not issue another backend write or duplicate the
+        # quarantine entry in this process.
+        self._remove_pending_write(str(record.get("id", "")))
+        return True
 
     def _read_pending_writes(self) -> list[dict[str, Any]]:
         path = self._pending_path
@@ -1233,12 +1270,14 @@ class ReMeMemoryProvider(MemoryProvider):
                             retry = True
                         elif not self._remove_pending_write(payload["id"]):
                             self._last_write_failure_kind = "ack_failure"
+                            self._defer_write_retry()
                             retry = True
                     except Exception:
                         logger.exception(
                             "Unexpected ReMe recording failure; durable write remains queued",
                         )
                         self._last_write_failure_kind = "retryable"
+                        self._defer_write_retry()
                         retry = True
                     if retry:
                         try:
@@ -1247,10 +1286,8 @@ class ReMeMemoryProvider(MemoryProvider):
                             prior_attempts = 0
                         payload["attempts"] = max(0, prior_attempts) + 1
                         failure_kind = self._last_write_failure_kind or "retryable"
-                        if failure_kind == "permanent" or payload["attempts"] >= _MAX_WRITE_ATTEMPTS:
-                            quarantine_reason = (
-                                "permanent_refusal" if failure_kind == "permanent" else "retry_limit_exhausted"
-                            )
+                        if failure_kind == "permanent":
+                            quarantine_reason = "permanent_refusal"
                             if self._quarantine_pending_write(payload, quarantine_reason):
                                 logger.error(
                                     "ReMe durable write %s was quarantined (%s)",
@@ -1294,6 +1331,8 @@ class ReMeMemoryProvider(MemoryProvider):
             return False
         with self._backend_lock:
             if not self._ensure_backend(allow_shutdown=True):
+                self._last_write_failure_kind = "unavailable"
+                self._defer_write_retry()
                 logger.warning(
                     "ReMe write for session %s skipped because backend is unavailable",
                     payload["session_id"],
@@ -1321,7 +1360,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 return True
             except ReMeBackendError as exc:
                 self._last_write_failure_kind = "permanent" if _is_permanent_write_failure(exc) else "retryable"
-                self._next_write_attempt = time.monotonic() + self._health_retry_seconds
+                self._defer_write_retry()
                 logger.warning(
                     "ReMe recording failed at %s (%s)",
                     self._backend_label,
@@ -1330,6 +1369,11 @@ class ReMeMemoryProvider(MemoryProvider):
             finally:
                 self._close_backend_if_shutdown_locked()
         return False
+
+    def _defer_write_retry(self) -> None:
+        """Apply the backend health cooldown to every operational retry path."""
+        retry_at = time.monotonic() + self._health_retry_seconds
+        self._next_write_attempt = max(self._next_write_attempt, self._next_health_probe, retry_at)
 
     def _schedule_retry(self, record: dict[str, Any]) -> None:
         """Retry one failed record later without blocking unrelated queued records."""
