@@ -104,6 +104,63 @@ def source_hash_metadata(source_path: Path) -> dict[str, str]:
     return {"algorithm": SOURCE_HASH_ALGORITHM, "format": SOURCE_HASH_FORMAT, "value": digest}
 
 
+def _valid_source_hash_metadata(metadata: object) -> bool:
+    """Return whether metadata uses the complete, lowercase-or-uppercase hex digest format."""
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("algorithm") != SOURCE_HASH_ALGORITHM:
+        return False
+    if metadata.get("format") != SOURCE_HASH_FORMAT:
+        return False
+    value = metadata.get("value")
+    if not isinstance(value, str):
+        return False
+    if len(value) != 64:
+        return False
+    return all(char in "0123456789abcdef" for char in value.lower())
+
+
+def _stream_source_prefix(
+    fd: int,
+    expected_value: str,
+    current_value: str,
+    max_bytes: int,
+) -> tuple[bool, int]:
+    """Validate JSONL records while hashing one bounded transcript snapshot."""
+    digest = hashlib.sha256()
+    pending = bytearray()
+    prefix_match = False
+    valid = True
+    total = 0
+    while valid and (chunk := os.read(fd, 1024 * 1024)):
+        total += len(chunk)
+        if total > max_bytes:
+            valid = False
+            break
+        pending.extend(chunk)
+        while valid:
+            try:
+                newline = pending.index(10)
+            except ValueError:
+                break
+            line = bytes(pending[: newline + 1])
+            del pending[: newline + 1]
+            try:
+                record = json.loads(line[:-1].decode("utf-8"))
+            except (UnicodeError, ValueError, TypeError):
+                valid = False
+                break
+            if not isinstance(record, dict):
+                valid = False
+                break
+            digest.update(line)
+            if digest.hexdigest() == expected_value:
+                prefix_match = True
+    if pending or not prefix_match or digest.hexdigest() != current_value:
+        valid = False
+    return valid, total
+
+
 def verify_source_hash_prefix(
     workspace: Path,
     session_dir: str,
@@ -115,18 +172,8 @@ def verify_source_hash_prefix(
 ) -> bool:
     """Verify an old source digest is a complete-record prefix of one stable transcript snapshot."""
     if (
-        not isinstance(expected_source_hash, dict)
-        or expected_source_hash.get("algorithm") != SOURCE_HASH_ALGORITHM
-        or expected_source_hash.get("format") != SOURCE_HASH_FORMAT
-        or not isinstance(expected_source_hash.get("value"), str)
-        or len(expected_source_hash["value"]) != 64
-        or any(char not in "0123456789abcdef" for char in expected_source_hash["value"].lower())
-        or not isinstance(current_source_hash, dict)
-        or current_source_hash.get("algorithm") != SOURCE_HASH_ALGORITHM
-        or current_source_hash.get("format") != SOURCE_HASH_FORMAT
-        or not isinstance(current_source_hash.get("value"), str)
-        or len(current_source_hash["value"]) != 64
-        or any(char not in "0123456789abcdef" for char in current_source_hash["value"].lower())
+        not _valid_source_hash_metadata(expected_source_hash)
+        or not _valid_source_hash_metadata(current_source_hash)
         or not isinstance(max_bytes, int)
         or max_bytes <= 0
     ):
@@ -142,32 +189,13 @@ def verify_source_hash_prefix(
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
             return False
-        digest = hashlib.sha256()
-        pending = bytearray()
-        prefix_match = False
-        total = 0
-        while chunk := os.read(fd, 1024 * 1024):
-            total += len(chunk)
-            if total > max_bytes:
-                return False
-            pending.extend(chunk)
-            while True:
-                try:
-                    newline = pending.index(10)
-                except ValueError:
-                    break
-                line = bytes(pending[: newline + 1])
-                del pending[: newline + 1]
-                try:
-                    record = json.loads(line[:-1].decode("utf-8"))
-                except (UnicodeError, ValueError, TypeError):
-                    return False
-                if not isinstance(record, dict):
-                    return False
-                digest.update(line)
-                if digest.hexdigest() == expected_source_hash["value"]:
-                    prefix_match = True
-        if pending or not prefix_match or digest.hexdigest() != current_source_hash["value"]:
+        valid, total = _stream_source_prefix(
+            fd,
+            expected_source_hash["value"],
+            current_source_hash["value"],
+            max_bytes,
+        )
+        if not valid:
             return False
         current = os.stat(source_path, follow_symlinks=False)
         return (
