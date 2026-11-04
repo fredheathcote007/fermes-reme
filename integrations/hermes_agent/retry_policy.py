@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 _PERMANENT_RECEIPT_ERRORS = frozenset(
     {
         "protected receipt is malformed",
@@ -22,17 +24,54 @@ _PERMANENT_RECEIPT_ERRORS = frozenset(
     },
 )
 
+_MAX_NESTED_ERROR_DEPTH = 16
+_MAX_NESTED_ERROR_NODES = 128
+
+
+def _contains_os_error(error: BaseException) -> bool:
+    """Find a typed storage error in a bounded exception/argument graph."""
+    seen: set[int] = set()
+    visited = 0
+
+    def visit(value: object, depth: int) -> bool:
+        nonlocal visited
+        found = False
+        if depth <= _MAX_NESTED_ERROR_DEPTH and visited < _MAX_NESTED_ERROR_NODES:
+            if isinstance(value, OSError):
+                found = True
+            elif isinstance(value, BaseException):
+                identity = id(value)
+                if identity not in seen:
+                    seen.add(identity)
+                    visited += 1
+                    found = visit(value.__cause__, depth + 1) or visit(value.__context__, depth + 1)
+                    if not found:
+                        found = any(visit(argument, depth + 1) for argument in value.args)
+            elif isinstance(value, Mapping):
+                identity = id(value)
+                if identity not in seen:
+                    seen.add(identity)
+                    visited += 1
+                    found = any(visit(nested, depth + 1) for item in value.items() for nested in item)
+            elif isinstance(value, (tuple, list, set, frozenset)):
+                identity = id(value)
+                if identity not in seen:
+                    seen.add(identity)
+                    visited += 1
+                    found = any(visit(nested, depth + 1) for nested in value)
+        return found
+
+    return visit(error, 0)
+
 
 def is_permanent_write_failure(error: BaseException) -> bool:
     """Recognize application refusals that cannot improve by replaying unchanged input."""
-    current: BaseException | None = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        if isinstance(current, OSError):
-            return False
-        seen.add(id(current))
-        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
-    detail = str(error).strip().lower()
+    if _contains_os_error(error):
+        return False
+    try:
+        detail = str(error).strip().lower()
+    except RecursionError:
+        return False
     if detail.startswith("error:"):
         detail = detail[6:].strip()
     if detail in _PERMANENT_RECEIPT_ERRORS:

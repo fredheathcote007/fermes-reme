@@ -76,6 +76,51 @@ def test_receipt_corruption_is_permanent_but_storage_errors_retry(detail, perman
 
 
 @pytest.mark.parametrize(
+    "error",
+    [
+        OSError("protected receipt response is malformed"),
+        ReMeBackendError(OSError("protected receipt response is malformed")),
+    ],
+)
+def test_nested_storage_errors_are_retryable_before_text_classification(error):
+    assert PLUGIN_MODULE._is_permanent_write_failure(error) is False
+
+
+def test_nested_storage_errors_in_chains_and_structured_args_are_retryable():
+    try:
+        try:
+            raise OSError("protected receipt response is malformed")
+        except OSError as storage_error:
+            raise ReMeBackendError("protected receipt response is malformed") from storage_error
+    except ReMeBackendError as chained_error:
+        assert PLUGIN_MODULE._is_permanent_write_failure(chained_error) is False
+
+    try:
+        try:
+            raise OSError("protected receipt response is malformed")
+        except OSError as storage_error:
+            raise ReMeBackendError("protected receipt response is malformed") from storage_error
+    except ReMeBackendError as contextual_error:
+        assert PLUGIN_MODULE._is_permanent_write_failure(contextual_error) is False
+
+    structured_error = ReMeBackendError(
+        {"message": "protected receipt response is malformed", "underlying": OSError("permission denied")},
+    )
+    assert PLUGIN_MODULE._is_permanent_write_failure(structured_error) is False
+
+
+def test_text_only_wrapped_receipt_corruption_remains_permanent():
+    error = ReMeBackendError("Error: protected receipt replay refused: protected receipt response is malformed")
+    assert PLUGIN_MODULE._is_permanent_write_failure(error) is True
+
+
+def test_nested_exception_cycles_are_bounded():
+    error = ReMeBackendError("protected receipt response is malformed")
+    error.args = (error,)
+    assert PLUGIN_MODULE._is_permanent_write_failure(error) is False
+
+
+@pytest.mark.parametrize(
     ("response", "message"),
     [
         ({"success": False, "error": "memory extraction exploded"}, "memory extraction exploded"),
