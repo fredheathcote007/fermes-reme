@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
 from datetime import datetime, timezone
@@ -50,35 +51,85 @@ def build_turn_payload(profile_id: str, session_id: str, user: str, assistant: s
 
 
 _VALID_MESSAGE_ROLES = frozenset({"user", "assistant", "system"})
+_MAX_SESSION_ID_BYTES = 249
+_MAX_RECORD_ID_LENGTH = 128
 
 
-def valid_pending_payload(payload: object) -> bool:
-    """Validate the provider's durable turn shape, including legacy timestamps."""
-    session_id = payload.get("session_id") if isinstance(payload, dict) else None
+def _is_utf8_text(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
+
+
+def _is_json_safe(value: object) -> bool:
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, RecursionError, UnicodeError):
+        return False
+    return True
+
+
+def _valid_session_id(session_id: object) -> bool:
     if not isinstance(session_id, str) or not session_id or session_id != session_id.strip():
         return False
-    if session_id in {".", ".."} or session_id.endswith("."):
+    try:
+        valid_utf8_length = len(session_id.encode("utf-8")) <= _MAX_SESSION_ID_BYTES
+    except UnicodeError:
         return False
-    if any(char in '<>:"/\\|?*' or ord(char) < 32 for char in session_id):
-        return False
-    if session_id.split(".", 1)[0].upper() in {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        *(f"COM{index}" for index in range(1, 10)),
-        *(f"LPT{index}" for index in range(1, 10)),
-    }:
-        return False
-    messages = payload.get("messages")
+    return (
+        valid_utf8_length
+        and session_id not in {".", ".."}
+        and not session_id.endswith(".")
+        and not any(char in '<>:"/\\|?*' or ord(char) < 32 for char in session_id)
+        and session_id.split(".", 1)[0].upper()
+        not in {
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            *(f"COM{index}" for index in range(1, 10)),
+            *(f"LPT{index}" for index in range(1, 10)),
+        }
+    )
+
+
+def _valid_message(message: object) -> bool:
     required = ("id", "name", "role", "content")
-    return isinstance(messages, list) and all(
+    return (
         isinstance(message, dict)
         and message.get("role") in _VALID_MESSAGE_ROLES
         and all(isinstance(message.get(key), str) for key in required)
         and ("created_at" not in message or isinstance(message["created_at"], str))
-        for message in messages
+        and ("metadata" not in message or isinstance(message["metadata"], dict))
+        and all(_is_utf8_text(message[key]) for key in required)
+        and ("created_at" not in message or _is_utf8_text(message["created_at"]))
     )
+
+
+def valid_pending_payload(payload: object) -> bool:
+    """Validate the provider's durable turn shape, including legacy timestamps."""
+    if not isinstance(payload, dict):
+        return False
+    if not _valid_session_id(payload.get("session_id")):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not all(_valid_message(message) for message in messages):
+        return False
+    return _is_json_safe(payload)
+
+
+def valid_pending_record(record: object) -> bool:
+    """Validate the durable record envelope before it enters the FIFO."""
+    if not isinstance(record, dict):
+        return False
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or not record_id or len(record_id) > _MAX_RECORD_ID_LENGTH:
+        return False
+    if not _is_utf8_text(record_id):
+        return False
+    return valid_pending_payload(record.get("payload"))
 
 
 def upgrade_legacy_payload(record: dict[str, Any], historical_created_at: str) -> dict[str, Any]:

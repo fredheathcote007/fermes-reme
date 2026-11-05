@@ -1,11 +1,12 @@
 """Completed automatic-memory requests can be replayed after a client timeout."""
 
-# pylint: disable=protected-access,missing-function-docstring
+# pylint: disable=protected-access,missing-function-docstring,too-many-lines
 
 import asyncio
-from datetime import datetime
 import hashlib
 import json
+import os
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,8 +19,10 @@ from reme.application import Application
 from reme.components.agent_wrapper.base_agent_wrapper import BaseAgentWrapper
 from reme.components.prompt_handler import PromptHandler
 from reme.components.runtime_context import RuntimeContext
-from reme.steps.evolve.auto_memory import AutoMemoryStep
 from reme.steps.evolve import auto_memory as auto_memory_module
+from reme.steps.evolve.auto_memory import AutoMemoryStep
+
+from .test_hermes_agent_integration import PLUGIN_MODULE, ReMeBackendError
 
 
 class _SecurityTestWrapper(BaseAgentWrapper):
@@ -49,6 +52,132 @@ def test_option_b_body_digest_matches_canonical_stored_body(body):
     canonical = frontmatter.loads(frontmatter.dumps(frontmatter.Post(body))).content
     expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     assert AutoMemoryStep._body_digest(body) == expected
+
+
+@pytest.mark.skipif(os.name != "posix", reason="direct os.link publication test requires POSIX semantics")
+@pytest.mark.asyncio
+async def test_option_b_new_file_does_not_overwrite_existing_target_or_leave_temp(tmp_path, monkeypatch):
+    target = tmp_path / "existing.md"
+    original = b"original note bytes"
+    target.write_bytes(original)
+
+    async def durable_stub(path, content, _encoding="utf-8"):
+        path.write_bytes(content if isinstance(content, bytes) else content.encode(_encoding))
+
+    async def inline(func, *args):
+        return func(*args)
+
+    monkeypatch.setattr(auto_memory_module, "write_file_durable", durable_stub)
+    monkeypatch.setattr(auto_memory_module, "complete_in_thread", inline)
+    published = await auto_memory_module._write_new_file_durable(target, b"replacement note bytes")
+
+    assert published is False
+    assert target.read_bytes() == original
+    assert not list(tmp_path.glob(".reme-*.create.tmp"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "note_path",
+    [
+        "../x.md",
+        "daily/2026-10-21/x.txt",
+        "daily/2026-10-21/invalid\ud800.md",
+        f"daily/{'x' * 256}.md",
+    ],
+)
+async def test_option_b_receipt_note_path_is_rejected_before_storage_lookup(tmp_path, monkeypatch, note_path):
+    step = _step(tmp_path, request_id="replay-request")
+    step.kwargs["agent_scope"] = "test-scope"
+    monkeypatch.setattr(
+        auto_memory_module,
+        "trusted_provenance",
+        lambda *_args, **_kwargs: pytest.fail("invalid receipt path reached filesystem lookup"),
+    )
+
+    with pytest.raises(ValueError, match="invalid protected note path"):
+        await step._replay_option_b_receipt(
+            {
+                "version": 1,
+                "fingerprint": "fingerprint",
+                "outcome": "commit",
+                "commit": {"note_path": note_path},
+            },
+            fingerprint="fingerprint",
+            session_id="session-1",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("note_path", "permanent", "filesystem_setup"),
+    [
+        ("../x.md", True, None),
+        ("daily/2026-10-21/x.txt", True, None),
+        ("daily/2026-10-21/invalid\ud800.md", True, None),
+        (f"daily/2026-10-21/{'x' * 256}.md", True, None),
+        ("daily/2026-10-21/gone.md", False, None),
+        ("daily/2026-10-21/path component cleanup.md", False, None),
+        ("daily/2026-10-21/protected note marker.md", False, None),
+        ("daily/2026-10-21/protected note body digest.md", False, None),
+        ("daily/2026-10-21/frontmatter key collision.md", False, None),
+        ("daily/2026-10-21/unreadable.md", False, "directory"),
+        ("daily/2026-10-21/symlink.md", False, "symlink"),
+    ],
+)
+async def test_tampered_receipt_replay_answer_drives_retry_classifier(
+    tmp_path,
+    monkeypatch,
+    note_path,
+    permanent,
+    filesystem_setup,
+):
+    """Classify the real replay answer, including structural and transient path failures."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/tamper-proof.md",
+                    "name": "tamper-proof",
+                    "description": "A deterministic protected fact.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "tamper-path-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", request_id="tamper-path-request", **request)
+        assert first.success
+        receipt_path = next((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["commit"]["note_path"] = note_path
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        if filesystem_setup == "directory":
+            (workspace / note_path).mkdir()
+        elif filesystem_setup == "symlink":
+            (workspace / note_path).symlink_to(workspace / first.metadata["path"])
+
+        replay = await app.run_job("auto_memory", request_id="tamper-path-request", **request)
+
+    assert not replay.success
+    assert PLUGIN_MODULE._is_permanent_write_failure(ReMeBackendError(replay.answer)) is permanent
+    if permanent:
+        assert replay.answer == "Error: protected receipt replay refused: invalid protected note path"
 
 
 def test_option_b_invalid_yaml_marker_is_a_protected_note_refusal(tmp_path):
@@ -517,6 +646,7 @@ async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_pa
 
     assert not tampered.success
     assert "protected" in tampered.answer.lower()
+    assert PLUGIN_MODULE._is_permanent_write_failure(ReMeBackendError(tampered.answer)) is True
     assert len(calls) == 2
 
 
@@ -532,15 +662,21 @@ async def test_option_b_create_collision_allocates_unique_note_without_replay(tm
     calls = []
     proposed_name = "shared-" + ("n" * 242)
 
-    async def proposal_reply(_self, _inputs, **_kwargs):
+    async def proposal_reply(_self, inputs, **_kwargs):
         calls.append(1)
+        prompt = str(inputs)
+        if "Session ID: collision-session-a" in prompt:
+            body = "Protected fact 1."
+        else:
+            assert "Session ID: collision-session-b" in prompt
+            body = "Protected fact 2."
         return {
             "result": json.dumps(
                 {
                     "path": f"daily/2026-10-21/{proposed_name}.md",
                     "name": proposed_name,
                     "description": "A shared-name test note.",
-                    "content": f"Protected fact {len(calls)}.",
+                    "content": body,
                 },
             ),
             "tool_execution": [],
@@ -557,9 +693,12 @@ async def test_option_b_create_collision_allocates_unique_note_without_replay(tm
             app.run_job("auto_memory", request_id="collision-a", session_id="collision-session-a", **request),
             app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request),
         )
-        replay = await app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request)
+        replay_a, replay_b = await asyncio.gather(
+            app.run_job("auto_memory", request_id="collision-a", session_id="collision-session-a", **request),
+            app.run_job("auto_memory", request_id="collision-b", session_id="collision-session-b", **request),
+        )
 
-    assert first.success and second.success and replay.success
+    assert first.success and second.success and replay_a.success and replay_b.success
     base_path = f"daily/2026-10-21/{proposed_name}.md"
     assert base_path in {first.metadata["path"], second.metadata["path"]}
     suffixed_path = next(path for path in (first.metadata["path"], second.metadata["path"]) if path != base_path)
@@ -567,19 +706,14 @@ async def test_option_b_create_collision_allocates_unique_note_without_replay(tm
     assert second.metadata["path"] in {base_path, suffixed_path}
     assert second.metadata["path"] != first.metadata["path"]
     assert len(Path(suffixed_path).name.encode("utf-8")) <= 255
-    assert replay.metadata["path"] == second.metadata["path"]
+    assert replay_a.metadata["path"] == first.metadata["path"]
+    assert replay_b.metadata["path"] == second.metadata["path"]
     assert len(calls) == 2
-    assert (
+    assert frontmatter.loads((workspace / first.metadata["path"]).read_text(encoding="utf-8")).content.strip() == (
         "Protected fact 1."
-        in frontmatter.loads(
-            (workspace / first.metadata["path"]).read_text(encoding="utf-8"),
-        ).content
     )
-    assert (
+    assert frontmatter.loads((workspace / second.metadata["path"]).read_text(encoding="utf-8")).content.strip() == (
         "Protected fact 2."
-        in frontmatter.loads(
-            (workspace / second.metadata["path"]).read_text(encoding="utf-8"),
-        ).content
     )
 
 

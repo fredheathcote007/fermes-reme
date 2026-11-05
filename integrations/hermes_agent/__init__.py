@@ -33,7 +33,7 @@ from .http_backend import HttpReMeBackend
 from .retry_policy import is_permanent_write_failure as _is_permanent_write_failure
 from .turn_payload import build_turn_payload as _build_turn_payload
 from .turn_payload import upgrade_legacy_payload as _upgrade_legacy_payload
-from .turn_payload import valid_pending_payload as _valid_pending_payload
+from .turn_payload import valid_pending_record as _valid_pending_record
 from .turn_payload import scoped_session_id
 from .write_queue import RetryWakeup, rebuild_write_queue_locked
 from .durability import (
@@ -1000,18 +1000,18 @@ class ReMeMemoryProvider(MemoryProvider):
                 for raw_line in lines:
                     try:
                         line = raw_line.decode("utf-8")
-                    except UnicodeDecodeError:
+                    except UnicodeError:
                         updated.append(raw_line)
                         continue
                     try:
                         current = json.loads(line)
-                    except (json.JSONDecodeError, TypeError, ValueError):
+                    except (json.JSONDecodeError, RecursionError, TypeError, UnicodeError, ValueError):
                         updated.append(raw_line)
                         continue
                     if (
                         isinstance(current, dict)
                         and current.get("id") == record.get("id")
-                        and _valid_pending_payload(current.get("payload"))
+                        and _valid_pending_record(current)
                     ):
                         updated.append((json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
                         found = True
@@ -1033,7 +1033,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 finally:
                     if os.path.exists(temp_name):
                         os.unlink(temp_name)
-            except OSError as exc:
+            except (OSError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
                 logger.error("ReMe could not persist durable write retry state: %s", exc)
                 return False
         return True
@@ -1073,7 +1073,7 @@ class ReMeMemoryProvider(MemoryProvider):
                     for line in quarantine.read_bytes().splitlines():
                         try:
                             existing = json.loads(line)
-                        except (json.JSONDecodeError, TypeError, ValueError):
+                        except (json.JSONDecodeError, RecursionError, TypeError, UnicodeError, ValueError):
                             continue
                         if isinstance(existing, dict) and existing.get("id") == record.get("id"):
                             already_quarantined = True
@@ -1094,7 +1094,7 @@ class ReMeMemoryProvider(MemoryProvider):
                         if fd >= 0:
                             os.close(fd)
                     _fsync_directory(quarantine.parent)
-            except (OSError, TypeError, ValueError) as exc:
+            except (OSError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
                 logger.error("ReMe could not quarantine durable write: %s", exc)
                 return False
         # The quarantine record is durable even if cleanup of the active queue
@@ -1131,13 +1131,9 @@ class ReMeMemoryProvider(MemoryProvider):
             try:
                 line = raw_line.decode("utf-8")
                 record = json.loads(line)
-                if (
-                    not isinstance(record, dict)
-                    or not isinstance(record.get("id"), str)
-                    or not _valid_pending_payload(record.get("payload"))
-                ):
+                if not isinstance(record, dict) or not _valid_pending_record(record):
                     raise TypeError("record does not contain a valid durable turn payload")
-            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            except (UnicodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
                 logger.error(
                     "ReMe durable write queue %s line %d is retained but invalid: %s",
                     path,
@@ -1145,7 +1141,16 @@ class ReMeMemoryProvider(MemoryProvider):
                     exc,
                 )
                 continue
-            upgraded = _upgrade_legacy_payload(record, historical_created_at)
+            try:
+                upgraded = _upgrade_legacy_payload(record, historical_created_at)
+            except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
+                logger.error(
+                    "ReMe durable write queue %s line %d could not be upgraded: %s",
+                    path,
+                    line_number,
+                    exc,
+                )
+                continue
             records.append(upgraded)
             if upgraded is not record:
                 legacy_records.append(upgraded)
@@ -1173,19 +1178,15 @@ class ReMeMemoryProvider(MemoryProvider):
                 for raw_line in lines:
                     try:
                         line = raw_line.decode("utf-8")
-                    except UnicodeDecodeError:
+                    except UnicodeError:
                         kept.append(raw_line)
                         continue
                     try:
                         record = json.loads(line)
-                    except (json.JSONDecodeError, TypeError, ValueError):
+                    except (json.JSONDecodeError, RecursionError, TypeError, UnicodeError, ValueError):
                         kept.append(raw_line)
                         continue
-                    if (
-                        isinstance(record, dict)
-                        and record.get("id") == record_id
-                        and _valid_pending_payload(record.get("payload"))
-                    ):
+                    if isinstance(record, dict) and record.get("id") == record_id and _valid_pending_record(record):
                         removed = True
                     else:
                         kept.append(raw_line)
@@ -1206,7 +1207,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 finally:
                     if os.path.exists(temp_name):
                         os.unlink(temp_name)
-            except OSError as exc:
+            except (OSError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
                 logger.error(
                     "ReMe could not acknowledge durable write %s: %s",
                     record_id,

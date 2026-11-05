@@ -26,6 +26,7 @@ from agentscope.message import DataBlock, Msg, TextBlock, UserMsg
 
 from ...components import R
 from ...schema import Response
+from ...utils.async_utils import complete_in_thread
 from ...utils.wikilink_handler import WikilinkHandler
 from ..base_step import BaseStep
 from ..file_io import (
@@ -71,6 +72,7 @@ _OPTION_B_RESERVED_METADATA = frozenset(
         _OPTION_B_MARKER,
     },
 )
+_OPTION_B_MAX_NOTE_COMPONENT_BYTES = 255
 
 
 def _checked_write_path(workspace: Path, relative: str, allowed_paths) -> Path:
@@ -81,6 +83,28 @@ def _checked_write_path(workspace: Path, relative: str, allowed_paths) -> Path:
     if not _check_path_permission(workspace, target, allowed_paths):
         raise PermissionError(f"No permission to write {relative}")
     return target
+
+
+def _validate_option_b_receipt_note_path(relative: str) -> None:
+    """Reject malformed receipt paths before any filesystem lookup occurs."""
+    try:
+        relative.encode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError("invalid protected note path") from exc
+    if any(component in {"", ".", ".."} for component in relative.split("/")):
+        raise ValueError("invalid protected note path")
+    path = Path(relative)
+    if path.is_absolute() or path.suffix.lower() != ".md":
+        raise ValueError("invalid protected note path")
+    for component in path.parts:
+        try:
+            component_bytes = len(component.encode("utf-8"))
+        except UnicodeError as exc:
+            raise ValueError("invalid protected note path") from exc
+        if component_bytes > _OPTION_B_MAX_NOTE_COMPONENT_BYTES:
+            raise ValueError("invalid protected note path")
+        if validate_filename_component(component, kind="path component"):
+            raise ValueError("invalid protected note path")
 
 
 def _truncate_utf8(value: str, max_bytes: int) -> str:
@@ -109,6 +133,47 @@ def _read_exact_owned_file(path: Path) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+async def _write_new_file_durable(file_path: Path, content: str | bytes, encoding: str = "utf-8") -> bool:
+    """Publish a new file without replacing a file created by another writer.
+
+    ``write_file_durable`` is intentionally replace-oriented for normal updates.
+    Creates need a no-overwrite commit point, so first durable-write a private
+    sibling and then atomically link it into the requested name.  ``False``
+    means another writer won the name; the caller may allocate its next name.
+    """
+    temporary = file_path.with_name(f".reme-{uuid4().hex}.create.tmp")
+    await write_file_durable(temporary, content, encoding)
+
+    def publish() -> bool:
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise OSError("durable local POSIX file commits are unavailable on this platform")
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        parts = temporary.parent.absolute().parts
+        parent_fd = os.open(parts[0] or os.sep, parent_flags)
+        try:
+            for part in parts[1:]:
+                next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            try:
+                os.link(
+                    temporary.name,
+                    file_path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                return False
+            os.fsync(parent_fd)
+            return True
+        finally:
+            os.close(parent_fd)
+            temporary.unlink(missing_ok=True)
+
+    return await complete_in_thread(publish)
 
 
 def _has_lexical_symlink(workspace: Path, path: Path) -> bool:
@@ -679,7 +744,7 @@ class AutoMemoryStep(BaseStep):
             raise RuntimeError("protected prior commit has no durable receipt") from exc
         except OSError as exc:
             raise RuntimeError("protected prior commit receipt storage error") from exc
-        except (UnicodeError, ValueError, TypeError) as exc:
+        except (RecursionError, UnicodeError, ValueError, TypeError) as exc:
             raise RuntimeError("protected prior commit receipt is malformed") from exc
         self._validate_option_b_receipt_record(
             record,
@@ -1047,6 +1112,8 @@ class AutoMemoryStep(BaseStep):
                 if created and target.exists():
                     continue
                 current = self._read_owned_note(candidate_path, missing_ok=True)
+                if created and current is not None:
+                    continue
                 if current != before_note_bytes:
                     raise RuntimeError("protected note changed while the model prepared its revision")
                 if current is not None:
@@ -1098,7 +1165,11 @@ class AutoMemoryStep(BaseStep):
                 )
                 post = frontmatter.Post(body, **metadata)
                 serialized = frontmatter.dumps(post)
-                await write_file_durable(target, serialized)
+                if created:
+                    if not await _write_new_file_durable(target, serialized):
+                        continue
+                else:
+                    await write_file_durable(target, serialized)
                 committed, raw, committed_marker = self._read_commit_note(
                     candidate_path,
                     request_id=request_id,
@@ -1157,11 +1228,12 @@ class AutoMemoryStep(BaseStep):
         marker = record.get("commit")
         if not isinstance(marker, dict):
             raise TypeError("protected receipt does not contain a successful commit")
-        provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
         scope = self._option_b_scope()
         note_path = marker.get("note_path")
         if not isinstance(note_path, str) or not note_path:
             raise RuntimeError("protected receipt has no note path")
+        _validate_option_b_receipt_note_path(note_path)
+        provenance = trusted_provenance(self.file_store.workspace_path, self._session_dir(), session_id)
         source_hash = provenance["source_hash"]
         if source_hash != marker.get("source_hash") and not verify_source_hash_prefix(
             self.file_store.workspace_path,
@@ -1660,7 +1732,7 @@ class AutoMemoryStep(BaseStep):
                         self.context.response.success = False
                         self.context.response.answer = f"Error: protected receipt storage error: {exc}"
                         return
-                    except (UnicodeError, ValueError, TypeError):
+                    except (RecursionError, UnicodeError, ValueError, TypeError):
                         self.context.response.success = False
                         self.context.response.answer = "Error: protected receipt is malformed"
                         return
@@ -1675,7 +1747,15 @@ class AutoMemoryStep(BaseStep):
                             fingerprint=fingerprint,
                             session_id=str(payload["session_id"]),
                         )
-                    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    except (
+                        KeyError,
+                        OSError,
+                        RecursionError,
+                        RuntimeError,
+                        TypeError,
+                        UnicodeError,
+                        ValueError,
+                    ) as exc:
                         self.context.response.success = False
                         self.context.response.answer = f"Error: protected receipt replay refused: {exc}"
                     return

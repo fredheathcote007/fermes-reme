@@ -14,12 +14,15 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import frontmatter
 import pytest
 import yaml
 from agentscope.message import TextBlock
 from agentscope.model import ChatResponse
+
+from reme.schema.application_config import ApplicationConfig
 
 from .test_hermes_agent_integration import (
     ReMeMemoryProvider,
@@ -231,8 +234,11 @@ def test_sigkill_after_note_before_receipt_replays_same_request_id(tmp_path, mon
         )
     from agentscope.model import OpenAIChatModel
 
-    day = datetime.now(UTC).date().isoformat()
     config_path = _write_test_config(tmp_path)
+    configured_timezone = ApplicationConfig.model_validate(
+        yaml.safe_load(config_path.read_text(encoding="utf-8")),
+    ).timezone
+    day = datetime.now(ZoneInfo(configured_timezone) if configured_timezone else None).date().isoformat()
     hermes_home = tmp_path / "hermes-home"
     workspace = tmp_path / "reme-workspace"
     hermes_home.mkdir()

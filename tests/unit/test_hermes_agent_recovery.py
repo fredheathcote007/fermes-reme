@@ -120,6 +120,53 @@ def test_nested_exception_cycles_are_bounded():
     assert PLUGIN_MODULE._is_permanent_write_failure(error) is False
 
 
+def test_deep_nested_storage_fault_remains_retryable():
+    nested: object = OSError("permission denied")
+    for _ in range(17):
+        nested = (nested,)
+    error = ReMeBackendError("protected receipt is malformed", nested)
+
+    assert PLUGIN_MODULE._is_permanent_write_failure(error) is False
+
+
+def test_unscoped_deep_recursion_is_retryable_without_storage_fault():
+    error = ReMeBackendError("maximum recursion depth exceeded while decoding a JSON object")
+
+    assert PLUGIN_MODULE._is_permanent_write_failure(error) is False
+
+
+@pytest.mark.parametrize(
+    ("answer", "permanent"),
+    [
+        ("Error: protected receipt replay refused: protected receipt response is malformed", True),
+        ("Error: protected receipt replay refused: invalid protected note path", True),
+        ("Error: protected receipt replay refused: protected note path contains a symlink", False),
+        ("Error: path component contains invalid characters", False),
+        ("Error: RecursionError: maximum recursion depth exceeded", False),
+    ],
+)
+def test_actual_receipt_answers_only_quarantine_structural_replay_refusals(answer, permanent):
+    assert PLUGIN_MODULE._is_permanent_write_failure(ReMeBackendError(answer)) is permanent
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "protected note marker.md",
+        "protected note body digest.md",
+        "frontmatter key collision.md",
+    ],
+)
+@pytest.mark.parametrize("errno", [2, 13])
+def test_replay_storage_errors_with_marker_filenames_remain_retryable(filename, errno):
+    answer = (
+        "Error: protected receipt replay refused: "
+        f"[Errno {errno}] {'No such file or directory' if errno == 2 else 'Permission denied'}: "
+        f"'/workspace/daily/2026-10-21/{filename}'"
+    )
+    assert PLUGIN_MODULE._is_permanent_write_failure(ReMeBackendError(answer)) is False
+
+
 @pytest.mark.parametrize(
     ("response", "message"),
     [
@@ -453,6 +500,46 @@ def test_wrapped_receipt_corruption_quarantines_r1_and_runs_r2(monkeypatch, tmp_
     assert pending.read_text(encoding="utf-8") == ""
     quarantine = pending.parent / "quarantined-writes.jsonl"
     assert json.loads(quarantine.read_text(encoding="utf-8"))["id"] == "r1"
+
+
+def test_wrapped_false_response_quarantines_r1_and_runs_r2(monkeypatch, tmp_path):
+    backend = _FakeBackend()
+
+    def auto_memory(_session_id, _messages, *, timeout, request_id=None):
+        del timeout
+        backend.request_ids.append(request_id)
+        if request_id == "r1":
+            return {
+                "success": False,
+                "answer": "Error: protected receipt replay refused: "
+                "protected receipt does not contain a matching successful commit",
+            }
+        return {"success": True}
+
+    backend.auto_memory = auto_memory
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=60))
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
+    pending.parent.mkdir()
+    records = [
+        {"id": "r1", "attempts": 0, "payload": {"session_id": "s", "messages": []}},
+        {"id": "r2", "attempts": 0, "payload": {"session_id": "s", "messages": []}},
+    ]
+    pending.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    provider = ReMeMemoryProvider()
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+    deadline = time.monotonic() + 1
+    while backend.request_ids != ["r1", "r2"] and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    assert backend.request_ids == ["r1", "r2"]
+    assert pending.read_text(encoding="utf-8") == ""
+    quarantine = pending.parent / "quarantined-writes.jsonl"
+    quarantined = json.loads(quarantine.read_text(encoding="utf-8"))
+    assert quarantined["id"] == "r1"
+    assert quarantined["payload"] == records[0]["payload"]
 
 
 def test_retryable_error_prefix_remains_durable_and_is_not_quarantined(monkeypatch, tmp_path):

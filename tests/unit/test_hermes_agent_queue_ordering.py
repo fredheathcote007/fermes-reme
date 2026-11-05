@@ -401,6 +401,75 @@ def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_
 
 
 @pytest.mark.parametrize(
+    "poison",
+    [
+        b"[" * 200000 + b"\n",
+        b'{"id":"unicode","payload":{"session_id":"\\ud800","messages":[]}}\n',
+        b'{"id":"metadata","payload":{"session_id":"s","messages":[{"id":"m","name":"user",'
+        b'"role":"user","content":"x","metadata":5}]}}\n',
+    ],
+)
+def test_deep_or_unicode_poison_line_does_not_block_following_record(tmp_path, poison):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._pending_path.parent.mkdir()
+    valid = {"id": "valid", "attempts": 0, "payload": {"session_id": "s", "messages": []}}
+    provider._pending_path.write_bytes(poison + json.dumps(valid).encode() + b"\n")
+
+    assert provider._read_pending_writes() == [valid]
+    assert poison in provider._pending_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("session_id", "expected"),
+    [("a" * 249, True), ("a" * 250, False), ("é" * 124, True), ("é" * 125, False), ("\ud800", False)],
+)
+def test_pending_payload_enforces_utf8_session_id_limit(session_id, expected):
+    assert TURN_PAYLOAD_MODULE.valid_pending_payload({"session_id": session_id, "messages": []}) is expected
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [({"safe": "value"}, True), ({"safe": "\ud800"}, False), ({"\ud800": "value"}, False)],
+)
+def test_pending_payload_rejects_nested_surrogate_metadata(metadata, expected):
+    payload = {
+        "session_id": "safe-session",
+        "messages": [{"id": "m", "name": "user", "role": "user", "content": "x", "metadata": metadata}],
+    }
+    assert TURN_PAYLOAD_MODULE.valid_pending_payload(payload) is expected
+
+
+@pytest.mark.parametrize("record_id", ["", "x" * 129, "\ud800"])
+def test_pending_record_rejects_invalid_record_id(record_id):
+    record = {"id": record_id, "payload": {"session_id": "s", "messages": []}}
+    assert TURN_PAYLOAD_MODULE.valid_pending_record(record) is False
+
+
+def test_sync_turn_rejects_unencodable_message_without_raising(tmp_path, monkeypatch):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._accept_writes = True
+    monkeypatch.setattr(provider, "_start_writer_if_needed", lambda: None)
+
+    provider.sync_turn("\ud800", "assistant", session_id="session")
+
+    assert not provider._read_pending_writes()
+
+
+def test_journal_rewrite_rejects_unencodable_retry_record_without_losing_bytes(tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._pending_path.parent.mkdir()
+    valid = {"id": "valid", "attempts": 0, "payload": {"session_id": "s", "messages": []}}
+    provider._pending_path.write_text(json.dumps(valid) + "\n", encoding="utf-8")
+    malformed = {**valid, "attempts": 1, "payload": {"session_id": "\ud800", "messages": []}}
+
+    assert provider._update_pending_write(malformed) is False
+    assert provider._pending_path.read_text(encoding="utf-8") == json.dumps(valid) + "\n"
+
+
+@pytest.mark.parametrize(
     "bad_payload",
     [
         {"session_id": "", "messages": []},
