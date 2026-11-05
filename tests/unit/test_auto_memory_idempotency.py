@@ -3,6 +3,7 @@
 # pylint: disable=protected-access,missing-function-docstring,too-many-lines
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -98,6 +99,98 @@ async def test_option_b_new_file_cleans_temp_when_staging_fails(tmp_path, monkey
         await auto_memory_module._write_new_file_durable(target, b"new note bytes")
 
     assert not list(tmp_path.glob(".reme-*.create.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_new_file_does_not_reallocate_after_post_commit_cleanup_failure(tmp_path, monkeypatch):
+    """A post-commit long-path cleanup failure cannot turn one note into two."""
+    target = tmp_path / "new.md"
+    real_unlink = Path.unlink
+
+    def fail_long_create_temp(path, missing_ok=False):
+        if path.name.startswith(".reme-") and path.name.endswith(".create.tmp"):
+            raise OSError(errno.ENAMETOOLONG, "synthetic absolute cleanup path too long")
+        return real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_long_create_temp)
+    result = await auto_memory_module._write_new_file_durable(target, b"new note bytes")
+
+    assert result is True
+    assert target.read_bytes() == b"new note bytes"
+    assert not list(tmp_path.glob(".reme-*.create.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_option_b_new_file_swallows_post_commit_relative_cleanup_failure(tmp_path, monkeypatch):
+    """A failure from relative cleanup after fsync still returns the committed result."""
+    target = tmp_path / "new.md"
+    real_os = auto_memory_module.os
+    cleanup_calls = []
+
+    class CleanupFailureOS:
+        """Proxy ``os`` while forcing the relative temporary-file cleanup to fail."""
+
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def unlink(self, path, *args, **kwargs):
+            if kwargs.get("dir_fd") is not None and str(path).startswith(".reme-"):
+                cleanup_calls.append(path)
+                raise OSError(errno.ENAMETOOLONG, "synthetic relative cleanup failure")
+            return real_os.unlink(path, *args, **kwargs)
+
+    async def durable_stub(path, content, _encoding="utf-8"):
+        path.write_bytes(content if isinstance(content, bytes) else content.encode(_encoding))
+
+    async def inline(func, *args):
+        return func(*args)
+
+    monkeypatch.setattr(auto_memory_module, "os", CleanupFailureOS())
+    monkeypatch.setattr(auto_memory_module, "write_file_durable", durable_stub)
+    monkeypatch.setattr(auto_memory_module, "complete_in_thread", inline)
+
+    result = await auto_memory_module._write_new_file_durable(target, b"new note bytes")
+
+    assert result is True
+    assert target.read_bytes() == b"new note bytes"
+    assert len(cleanup_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_option_b_new_file_preserves_post_link_fsync_failure(tmp_path, monkeypatch):
+    """Cleanup errors after linking cannot mask a failed directory fsync."""
+    target = tmp_path / "new.md"
+    real_os = auto_memory_module.os
+
+    class FsyncFailureOS:
+        """Proxy ``os`` while failing publication durability and cleanup."""
+
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def fsync(self, _fd):
+            raise OSError(errno.EIO, "synthetic directory fsync failure")
+
+        def unlink(self, path, *args, **kwargs):
+            if kwargs.get("dir_fd") is not None and str(path).startswith(".reme-"):
+                raise OSError(errno.ENAMETOOLONG, "synthetic relative cleanup failure")
+            return real_os.unlink(path, *args, **kwargs)
+
+    async def durable_stub(path, content, _encoding="utf-8"):
+        path.write_bytes(content if isinstance(content, bytes) else content.encode(_encoding))
+
+    async def inline(func, *args):
+        return func(*args)
+
+    monkeypatch.setattr(auto_memory_module, "os", FsyncFailureOS())
+    monkeypatch.setattr(auto_memory_module, "write_file_durable", durable_stub)
+    monkeypatch.setattr(auto_memory_module, "complete_in_thread", inline)
+
+    with pytest.raises(OSError) as raised:
+        await auto_memory_module._write_new_file_durable(target, b"new note bytes")
+
+    assert raised.value.errno == errno.EIO
+    assert target.read_bytes() == b"new note bytes"
 
 
 @pytest.mark.asyncio
@@ -783,6 +876,59 @@ async def test_option_b_create_enametoolong_allocates_capped_suffix(tmp_path, mo
     max_prefix_bytes = 255 - len(".md") - len(f"--{request_suffix}-100".encode("utf-8"))
     assert note_name == f"{'o' * max_prefix_bytes}--{request_suffix}.md"
     assert len(note_name.encode("utf-8")) <= 255
+
+
+@pytest.mark.asyncio
+async def test_option_b_create_post_commit_cleanup_failure_does_not_allocate_again(tmp_path, monkeypatch):
+    """A cleanup-only ENAMETOOLONG leaves one committed candidate and no suffix note."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    proposed_name = "cleanup-boundary"
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": f"daily/2026-10-21/{proposed_name}.md",
+                    "name": proposed_name,
+                    "description": "A cleanup-boundary test note.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    real_unlink = Path.unlink
+
+    def fail_long_create_temp(path, missing_ok=False):
+        if path.name.startswith(".reme-") and path.name.endswith(".create.tmp"):
+            raise OSError(errno.ENAMETOOLONG, "synthetic absolute cleanup path too long")
+        return real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    monkeypatch.setattr(Path, "unlink", fail_long_create_temp)
+
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="cleanup-boundary-request",
+            session_id="cleanup-boundary-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+            date="2026-10-21",
+        )
+
+    note_dir = workspace / "daily/2026-10-21"
+    assert response.success
+    assert response.metadata["path"] == f"daily/2026-10-21/{proposed_name}.md"
+    assert calls == [1]
+    assert [path.name for path in note_dir.glob("*.md")] == [f"{proposed_name}.md"]
+    assert not list(note_dir.glob(".reme-*.create.tmp"))
 
 
 @pytest.mark.asyncio

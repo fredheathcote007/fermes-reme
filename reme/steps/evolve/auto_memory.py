@@ -145,20 +145,42 @@ async def _write_new_file_durable(file_path: Path, content: str | bytes, encodin
     means another writer won the name; the caller may allocate its next name.
     """
     temporary = file_path.with_name(f".reme-{uuid4().hex}.create.tmp")
+
+    def open_parent() -> int:
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise OSError("durable local POSIX file commits are unavailable on this platform")
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        parts = temporary.parent.absolute().parts
+        parent_fd = os.open(parts[0] or os.sep, parent_flags)
+        try:
+            for part in parts[1:]:
+                next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+        except BaseException:
+            os.close(parent_fd)
+            raise
+        return parent_fd
+
+    def cleanup_without_parent() -> None:
+        parent_fd = open_parent()
+        try:
+            try:
+                os.unlink(temporary.name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(parent_fd)
+
+    cleanup_attempted = False
     try:
         await write_file_durable(temporary, content, encoding)
 
         def publish() -> bool:
-            if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
-                raise OSError("durable local POSIX file commits are unavailable on this platform")
-            parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            parts = temporary.parent.absolute().parts
-            parent_fd = os.open(parts[0] or os.sep, parent_flags)
+            nonlocal cleanup_attempted
+            parent_fd = open_parent()
+            linked = False
             try:
-                for part in parts[1:]:
-                    next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
-                    os.close(parent_fd)
-                    parent_fd = next_fd
                 try:
                     os.link(
                         temporary.name,
@@ -167,16 +189,37 @@ async def _write_new_file_durable(file_path: Path, content: str | bytes, encodin
                         dst_dir_fd=parent_fd,
                         follow_symlinks=False,
                     )
+                    linked = True
                 except FileExistsError:
                     return False
                 os.fsync(parent_fd)
                 return True
             finally:
-                os.close(parent_fd)
+                cleanup_attempted = True
+                try:
+                    try:
+                        os.unlink(temporary.name, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        # The name is already published.  Cleanup is best
+                        # effort at this point and must not look like a
+                        # pre-commit ENAMETOOLONG collision to the caller.
+                        if not linked:
+                            raise
+                finally:
+                    os.close(parent_fd)
 
         return await complete_in_thread(publish)
-    finally:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
+        if not cleanup_attempted:
+            try:
+                # This is only an error-path fallback.  Keep it independent of
+                # the scheduler that may itself have failed.
+                cleanup_without_parent()
+            except OSError:
+                pass
+        raise
 
 
 def _has_lexical_symlink(workspace: Path, path: Path) -> bool:
