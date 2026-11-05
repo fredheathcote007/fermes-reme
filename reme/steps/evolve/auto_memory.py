@@ -8,6 +8,7 @@
 import base64
 import binascii
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -144,36 +145,38 @@ async def _write_new_file_durable(file_path: Path, content: str | bytes, encodin
     means another writer won the name; the caller may allocate its next name.
     """
     temporary = file_path.with_name(f".reme-{uuid4().hex}.create.tmp")
-    await write_file_durable(temporary, content, encoding)
+    try:
+        await write_file_durable(temporary, content, encoding)
 
-    def publish() -> bool:
-        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
-            raise OSError("durable local POSIX file commits are unavailable on this platform")
-        parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        parts = temporary.parent.absolute().parts
-        parent_fd = os.open(parts[0] or os.sep, parent_flags)
-        try:
-            for part in parts[1:]:
-                next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
-                os.close(parent_fd)
-                parent_fd = next_fd
+        def publish() -> bool:
+            if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+                raise OSError("durable local POSIX file commits are unavailable on this platform")
+            parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            parts = temporary.parent.absolute().parts
+            parent_fd = os.open(parts[0] or os.sep, parent_flags)
             try:
-                os.link(
-                    temporary.name,
-                    file_path.name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                return False
-            os.fsync(parent_fd)
-            return True
-        finally:
-            os.close(parent_fd)
-            temporary.unlink(missing_ok=True)
+                for part in parts[1:]:
+                    next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
+                    os.close(parent_fd)
+                    parent_fd = next_fd
+                try:
+                    os.link(
+                        temporary.name,
+                        file_path.name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    return False
+                os.fsync(parent_fd)
+                return True
+            finally:
+                os.close(parent_fd)
 
-    return await complete_in_thread(publish)
+        return await complete_in_thread(publish)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _has_lexical_symlink(workspace: Path, path: Path) -> bool:
@@ -526,6 +529,15 @@ class AutoMemoryStep(BaseStep):
         if not _check_path_permission(workspace, target, self.context.get("_allowed_paths")):
             raise PermissionError(f"No permission to write {relative}")
         return target
+
+    def _option_b_candidate_target(self, relative: str, created: bool) -> Path | None:
+        """Resolve a create candidate, skipping names that exceed filesystem limits."""
+        try:
+            return self._owned_note_target(relative)
+        except OSError as exc:
+            if created and exc.errno == errno.ENAMETOOLONG:
+                return None
+            raise
 
     def _read_owned_note(self, relative: str, *, missing_ok: bool = False) -> bytes | None:
         target = self._owned_note_target(relative)
@@ -966,6 +978,69 @@ class AutoMemoryStep(BaseStep):
                 results[call_id] = (name, state)
         return set(calls) == set(results) and all(state in _SUCCESSFUL_TOOL_STATES for _, state in results.values())
 
+    async def _recover_or_validate_option_b_note(
+        self,
+        *,
+        day: str,
+        session_id: str,
+        messages: list[Msg],
+        note_path: str,
+        request_id: str,
+        fingerprint: str,
+        provenance: dict,
+        agent_scope: str,
+    ) -> bool:
+        """Recover a matching note commit or validate a note for supersession."""
+        current = self._read_owned_note(note_path, missing_ok=True)
+        existing_marker = None
+        if current is not None:
+            try:
+                existing = frontmatter.loads(current.decode("utf-8"))
+            except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
+                raise RuntimeError("existing protected note is unreadable") from exc
+            if not self._option_b_note_owned_by_session(existing.metadata, provenance):
+                raise RuntimeError("existing protected note belongs to a different source session")
+            existing_marker = existing.metadata.get(_OPTION_B_MARKER)
+            if existing_marker is not None and not isinstance(existing_marker, dict):
+                raise RuntimeError("protected note marker is malformed")
+        if existing_marker is not None and existing_marker.get("request_id") == request_id:
+            # Same-ID mismatches are corruption or input reuse and must
+            # never fall through to another model mutation.
+            _, raw, marker = self._read_commit_note(
+                note_path,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                session_id=session_id,
+                source_hash=provenance["source_hash"],
+                agent_scope=agent_scope,
+            )
+            index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+            self.context["changes"] = [
+                {
+                    "change": "added" if marker["created"] else "modified",
+                    "path": note_path,
+                },
+            ]
+            await self._publish_option_b_index()
+            self._option_b_response(
+                marker=marker,
+                day=day,
+                session_id=session_id,
+                n_messages=len(messages),
+                answer="Recovered durable memory commit without model replay",
+            )
+            self.context.response.metadata["index"] = index_payload
+            self.context.response.metadata["note_sha256"] = hashlib.sha256(raw).hexdigest()
+            return True
+        if existing_marker is not None:
+            self._validate_superseded_option_b_revision(
+                relative=note_path,
+                note_raw=current,
+                session_id=session_id,
+                agent_scope=agent_scope,
+            )
+        return False
+
     async def _execute_option_b(
         self,
         *,
@@ -993,54 +1068,17 @@ class AutoMemoryStep(BaseStep):
         # a distinct request may have appended new source turns since this
         # marker was committed.
         if note_path:
-            current = self._read_owned_note(note_path, missing_ok=True)
-            existing_marker = None
-            if current is not None:
-                try:
-                    existing = frontmatter.loads(current.decode("utf-8"))
-                except (UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
-                    raise RuntimeError("existing protected note is unreadable") from exc
-                if not self._option_b_note_owned_by_session(existing.metadata, provenance):
-                    raise RuntimeError("existing protected note belongs to a different source session")
-                existing_marker = existing.metadata.get(_OPTION_B_MARKER)
-                if existing_marker is not None and not isinstance(existing_marker, dict):
-                    raise RuntimeError("protected note marker is malformed")
-            if existing_marker is not None and existing_marker.get("request_id") == request_id:
-                # Same-ID mismatches are corruption or input reuse and must
-                # never fall through to another model mutation.
-                _, raw, marker = self._read_commit_note(
-                    note_path,
-                    request_id=request_id,
-                    fingerprint=fingerprint,
-                    session_id=session_id,
-                    source_hash=provenance["source_hash"],
-                    agent_scope=agent_scope,
-                )
-                index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
-                self.context["changes"] = [
-                    {
-                        "change": "added" if marker["created"] else "modified",
-                        "path": note_path,
-                    },
-                ]
-                await self._publish_option_b_index()
-                self._option_b_response(
-                    marker=marker,
-                    day=day,
-                    session_id=session_id,
-                    n_messages=len(messages),
-                    answer="Recovered durable memory commit without model replay",
-                )
-                self.context.response.metadata["index"] = index_payload
-                self.context.response.metadata["note_sha256"] = hashlib.sha256(raw).hexdigest()
+            if await self._recover_or_validate_option_b_note(
+                day=day,
+                session_id=session_id,
+                messages=messages,
+                note_path=note_path,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                provenance=provenance,
+                agent_scope=agent_scope,
+            ):
                 return True
-            if existing_marker is not None:
-                self._validate_superseded_option_b_revision(
-                    relative=note_path,
-                    note_raw=current,
-                    session_id=session_id,
-                    agent_scope=agent_scope,
-                )
 
         expected_path = note_path
         if created:
@@ -1105,13 +1143,25 @@ class AutoMemoryStep(BaseStep):
         committed = raw = committed_marker = None
         for candidate_name in candidate_names:
             candidate_path = self._daily_note_path(day, candidate_name) if created else expected_path
-            target = self._owned_note_target(candidate_path)
+            target = self._option_b_candidate_target(candidate_path, created)
+            if target is None:
+                continue
             async with await get_path_lock(target):
                 # A create-path collision belongs to another invocation. It is
                 # not an update race and must not cause another model call.
-                if created and target.exists():
-                    continue
-                current = self._read_owned_note(candidate_path, missing_ok=True)
+                try:
+                    if created and target.exists():
+                        continue
+                    current = self._read_owned_note(candidate_path, missing_ok=True)
+                except OSError as exc:
+                    if created and exc.errno == errno.ENAMETOOLONG:
+                        continue
+                    raise
+                except ValueError as exc:
+                    cause = exc.__cause__
+                    if created and isinstance(cause, OSError) and cause.errno == errno.ENAMETOOLONG:
+                        continue
+                    raise
                 if created and current is not None:
                     continue
                 if current != before_note_bytes:
@@ -1166,7 +1216,13 @@ class AutoMemoryStep(BaseStep):
                 post = frontmatter.Post(body, **metadata)
                 serialized = frontmatter.dumps(post)
                 if created:
-                    if not await _write_new_file_durable(target, serialized):
+                    try:
+                        published = await _write_new_file_durable(target, serialized)
+                    except OSError as exc:
+                        if exc.errno != errno.ENAMETOOLONG:
+                            raise
+                        continue
+                    if not published:
                         continue
                 else:
                     await write_file_durable(target, serialized)

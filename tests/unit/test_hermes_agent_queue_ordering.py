@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import threading
 import time
@@ -523,6 +524,29 @@ def test_stage1_legacy_spool_upgrades_missing_created_at_without_data_loss(tmp_p
     persisted = json.loads(provider._pending_path.read_bytes().splitlines()[1])
     assert persisted["payload"]["messages"][0]["created_at"] == records[0]["payload"]["messages"][0]["created_at"]
     assert poison in provider._pending_path.read_bytes()
+
+
+def test_failed_legacy_upgrade_keeps_timestamp_stable_across_reread(monkeypatch, tmp_path):
+    """A retry must not change the protected request fingerprint via queue mtime drift."""
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._pending_path.parent.mkdir()
+    legacy = {
+        "id": "legacy-stable",
+        "attempts": 0,
+        "payload": {
+            "session_id": "legacy-session",
+            "messages": [{"id": "m", "name": "user", "role": "user", "content": "old turn"}],
+        },
+    }
+    provider._pending_path.write_bytes((json.dumps(legacy) + "\n").encode())
+    monkeypatch.setattr(provider, "_update_pending_write", lambda _record: False)
+
+    first = provider._read_pending_writes()[0]
+    os.utime(provider._pending_path, (1_800_000_000, 1_800_000_000))
+    second = provider._read_pending_writes()[0]
+
+    assert first["payload"]["messages"][0]["created_at"] == second["payload"]["messages"][0]["created_at"]
 
 
 def test_startup_recovers_valid_record_after_invalid_utf8_poison_line(monkeypatch, tmp_path):

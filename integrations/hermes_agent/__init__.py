@@ -357,6 +357,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._retry_wakeup = RetryWakeup(self)
         self._retry_wakeup_pending, self._writer_starting, self._pending_generation = False, False, 0
         self._pending_path: Path | None = None
+        self._legacy_created_at_by_record: dict[tuple[Path, str], str] = {}
         self._profile_lock: _ProfileWriterLock | None = None
         self._workspace_owner: _WorkspaceOwnerMarker | None = None
         self._profile_lock_required = False
@@ -459,7 +460,10 @@ class ReMeMemoryProvider(MemoryProvider):
             logger.warning("ReMe embedded configuration is invalid: %s", exc)
             return
         self._config = config
-        self._pending_path = profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
+        pending_path = profile_home / _PENDING_QUEUE_DIRECTORY / _PENDING_QUEUE_FILENAME
+        if self._pending_path is not None and self._pending_path != pending_path:
+            self._legacy_created_at_by_record.clear()
+        self._pending_path = pending_path
         self._profile_lock_required = True
         try:
             profile_lock = _ProfileWriterLock(profile_home / _PENDING_QUEUE_DIRECTORY / _PROFILE_LOCK_FILENAME)
@@ -1115,7 +1119,7 @@ class ReMeMemoryProvider(MemoryProvider):
         with self._pending_lock:
             try:
                 lines = path.read_bytes().splitlines()
-                historical_created_at = time.strftime(
+                default_historical_created_at = time.strftime(
                     "%Y-%m-%dT%H:%M:%S+00:00",
                     time.gmtime(path.stat().st_mtime),
                 )
@@ -1142,6 +1146,11 @@ class ReMeMemoryProvider(MemoryProvider):
                 )
                 continue
             try:
+                record_key = (path, record["id"])
+                historical_created_at = self._legacy_created_at_by_record.get(
+                    record_key,
+                    default_historical_created_at,
+                )
                 upgraded = _upgrade_legacy_payload(record, historical_created_at)
             except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
                 logger.error(
@@ -1153,6 +1162,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 continue
             records.append(upgraded)
             if upgraded is not record:
+                self._legacy_created_at_by_record.setdefault(record_key, historical_created_at)
                 legacy_records.append(upgraded)
         for record in legacy_records:
             if not self._update_pending_write(record):
@@ -1160,6 +1170,8 @@ class ReMeMemoryProvider(MemoryProvider):
                     "ReMe could not persist legacy timestamp upgrade for durable write %s",
                     record.get("id", "unknown"),
                 )
+            else:
+                self._legacy_created_at_by_record.pop((path, record["id"]), None)
         return records
 
     def _remove_pending_write(self, record_id: str) -> bool:

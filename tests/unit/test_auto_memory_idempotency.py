@@ -77,6 +77,30 @@ async def test_option_b_new_file_does_not_overwrite_existing_target_or_leave_tem
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["write", "scheduler"])
+async def test_option_b_new_file_cleans_temp_when_staging_fails(tmp_path, monkeypatch, failure):
+    """All failures after temp allocation must remove the private staging file."""
+    target = tmp_path / "new.md"
+
+    async def durable_stub(path, content, _encoding="utf-8"):
+        path.write_bytes(content if isinstance(content, bytes) else content.encode(_encoding))
+        if failure == "write":
+            raise OSError("synthetic staging failure")
+
+    async def scheduler_stub(_func, *_args):
+        raise RuntimeError("synthetic scheduler failure")
+
+    monkeypatch.setattr(auto_memory_module, "write_file_durable", durable_stub)
+    if failure == "scheduler":
+        monkeypatch.setattr(auto_memory_module, "complete_in_thread", scheduler_stub)
+
+    with pytest.raises((OSError, RuntimeError)):
+        await auto_memory_module._write_new_file_durable(target, b"new note bytes")
+
+    assert not list(tmp_path.glob(".reme-*.create.tmp"))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "note_path",
     [
@@ -715,6 +739,50 @@ async def test_option_b_create_collision_allocates_unique_note_without_replay(tm
     assert frontmatter.loads((workspace / second.metadata["path"]).read_text(encoding="utf-8")).content.strip() == (
         "Protected fact 2."
     )
+
+
+@pytest.mark.asyncio
+async def test_option_b_create_enametoolong_allocates_capped_suffix(tmp_path, monkeypatch):
+    """An overlong original target advances to the bounded protected suffix."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    proposed_name = "o" * 253
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        return {
+            "result": json.dumps(
+                {
+                    "path": f"daily/2026-10-21/{proposed_name}.md",
+                    "name": proposed_name,
+                    "description": "An ENAMETOOLONG test note.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="enametoolong-request",
+            session_id="enametoolong-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+            date="2026-10-21",
+        )
+
+    assert response.success
+    note_name = Path(response.metadata["path"]).name
+    assert note_name != f"{proposed_name}.md"
+    request_suffix = hashlib.sha256(b"enametoolong-session\0enametoolong-request").hexdigest()[:8]
+    max_prefix_bytes = 255 - len(".md") - len(f"--{request_suffix}-100".encode("utf-8"))
+    assert note_name == f"{'o' * max_prefix_bytes}--{request_suffix}.md"
+    assert len(note_name.encode("utf-8")) <= 255
 
 
 @pytest.mark.asyncio
