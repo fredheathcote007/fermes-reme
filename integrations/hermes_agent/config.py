@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import tempfile
-
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,7 @@ CONFIG_FILENAME = "config.json"
 LEGACY_CONFIG_FILENAME = "reme.json"
 VALID_MODES = {"http", "embedded"}
 STAGE1_CONFIG_NAME = "fermes-hermes-stage1"
+_STAGE1_AGENT_SCOPE = "fermes-hermes-stage1-optionb"
 _STAGE1_JOBS = {
     "index_update_loop",
     "health_check",
@@ -37,7 +38,7 @@ _STAGE1_JOBS = {
 _STAGE1_STEPS = {
     "health_check": ("health_check_step",),
     "search": ("search_step",),
-    "auto_memory": ("auto_memory_step", "auto_tag_step"),
+    "auto_memory": ("auto_memory_step",),
     "daily_list": ("daily_list_step",),
     "daily_write": ("daily_write_step",),
     "read": ("read_step",),
@@ -252,6 +253,14 @@ def _validate_stage1_config(value: str) -> None:
                 raise ReMeConfigError("Embedded Hermes Stage 1 contains unapproved index dispatch")
         elif tuple(step.get("backend") for step in steps) != _STAGE1_STEPS[name]:
             raise ReMeConfigError("Embedded Hermes Stage 1 contains unapproved job steps")
+        elif name == "auto_memory":
+            auto_memory_step = steps[0]
+            if auto_memory_step.get("durable_commit") is not True:
+                raise ReMeConfigError("Embedded Hermes Stage 1 auto_memory requires durable_commit=true")
+            if auto_memory_step.get("agent_scope") != _STAGE1_AGENT_SCOPE:
+                raise ReMeConfigError(
+                    "Embedded Hermes Stage 1 auto_memory requires the protected agent_scope",
+                )
 
     components = loaded.get("components")
     if not isinstance(components, dict) or set(components) != set(_STAGE1_COMPONENTS):
@@ -367,6 +376,10 @@ def save_config(values: dict[str, Any], hermes_home: str | Path) -> ReMeConfig:
     merged.update(
         {key: value for key, value in dict(values or {}).items() if value is not None},
     )
+    if str(merged.get("mode", "")).strip().lower() == "embedded" and sys.platform == "win32":
+        raise ReMeConfigError(
+            "Embedded ReMe Option B requires POSIX durable filesystem primitives; Windows is unsupported",
+        )
     validated = parse_config(merged, hermes_home=home)
 
     current.parent.mkdir(parents=True, exist_ok=True)

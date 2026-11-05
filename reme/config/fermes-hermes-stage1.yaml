@@ -62,8 +62,12 @@ jobs:
         date: {type: string, default: ""}
       required: [messages]
     steps:
+      # Explicit FHM-007 Option B opt-in: application-owned note commit and
+      # durable receipt. Auto-tag is a separate mutating effect and remains
+      # disabled until it has its own deterministic transaction contract.
       - backend: auto_memory_step
-      - backend: auto_tag_step
+        durable_commit: true
+        agent_scope: fermes-hermes-stage1-optionb
 
   daily_list:
     backend: base

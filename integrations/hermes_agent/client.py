@@ -6,13 +6,28 @@ import json
 import socket
 import urllib.error
 import urllib.request
-
 from typing import Any
 from urllib.parse import urlsplit
 
 
 class ReMeServiceError(RuntimeError):
     """Raised when a ReMe action cannot be completed successfully."""
+
+
+def _failure_detail(result: dict[str, Any]) -> str:
+    """Return trusted detail from a failed response without exposing arbitrary fields."""
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        return error
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+
+    answer = result.get("answer")
+    if answer:
+        return str(answer)
+    return "ReMe action did not report success"
 
 
 def normalize_http_endpoint(endpoint: str) -> str:
@@ -63,8 +78,13 @@ class ReMeHttpClient:
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            raise ReMeServiceError(f"HTTP {exc.code}: {detail or exc.reason}") from exc
+            # Error bodies can echo prompts, tool arguments, or conversation
+            # text.  Keep transport diagnostics bounded to status metadata.
+            try:
+                exc.close()
+            except OSError:
+                pass
+            raise ReMeServiceError(f"HTTP {exc.code}: {exc.reason}") from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise ReMeServiceError(str(reason)) from exc
@@ -76,9 +96,7 @@ class ReMeHttpClient:
         if not isinstance(result, dict):
             raise ReMeServiceError("ReMe returned a non-object response")
         if result.get("success") is not True:
-            raise ReMeServiceError(
-                str(result.get("answer") or "ReMe action did not report success"),
-            )
+            raise ReMeServiceError(_failure_detail(result))
         return result
 
     def health(self, *, timeout: float) -> dict[str, Any]:

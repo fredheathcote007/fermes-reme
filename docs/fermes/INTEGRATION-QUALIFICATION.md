@@ -54,7 +54,7 @@ endpoint, or changes to the Hermes checkout.
 | Same-profile writer ownership | A profile-local OS advisory lock is held for the provider lifetime; a second provider in the same process or another process fails closed. The lock file is not used as a stale marker. | PASS in focused tests; Windows-specific CI evidence UNKNOWN until rerun |
 | Embedded lifecycle | Fake `reme.Application` tests cover start, health, jobs, close, and bounded failure cleanup. | PASS in the recorded host suite; rerun this second pass in the disposable qualification environment. |
 | Recall timeout | Backend lock, startup, health, and search share the configured recall deadline. | PASS in focused tests |
-| Accepted-write semantics | Completed turns are JSONL-spooled and `fsync`ed before enqueue. The spool UUID is forwarded as ReMe's existing `auto_memory(request_id)`. Successful responses remove one record atomically; false/malformed responses, backend errors, shutdown timeout, or process loss retain it. | PASS in focused regression coverage; shared-profile writes are fail-closed |
+| Accepted-write semantics | Completed turns are JSONL-spooled and `fsync`ed before enqueue. The spool UUID is forwarded as ReMe's existing `auto_memory(request_id)`. Successful responses remove one record atomically; transient failures retry with a durable attempt bound, while permanent refusals/exhaustion are quarantined. | PASS in focused regression coverage; shared-profile writes are fail-closed |
 | ReMe receipt idempotency | Model-free tests exercise real `Application.run_job` with synthetic `_execute` instrumentation, receipt replay and conflicting input rejection. | PASS in authorised host focused tests and GitHub CI; this does not prove arbitrary partial LLM side effects are exactly once |
 | Queue poisoning and disk failure | Malformed/poison records do not hide a later valid record or get silently discarded; append failure does not enqueue or acknowledge a turn. | PASS in focused tests |
 | Restart recovery | A failed first backend leaves one record; a fresh provider using the same profile replays and clears it. | PASS |
@@ -87,8 +87,9 @@ arbitrary backend side effects. If the spool cannot be written, `sync_turn`
 logs an error and does not report the turn as accepted by the provider.
 
 The background writer is bounded by Hermes/provider shutdown timeouts. A failed
-record is retained and scheduled for delayed retry without preventing later
-accepted records from being attempted. Unattended Dream is absent from the
+record is retained and scheduled for bounded delayed retry without preventing
+later accepted records from being attempted. Permanent refusals and exhausted
+records are durably quarantined for review. Unattended Dream is absent from the
 dedicated Stage 1 config; the upstream `default` config remains unchanged.
 
 ## Review-needed issues and next step

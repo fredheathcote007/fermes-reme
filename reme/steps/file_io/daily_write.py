@@ -1,12 +1,14 @@
 """Write a daily markdown note by dispatching the generic ``write`` step."""
 
+import yaml
+
+from ...components import R
+from ...steps.evolve import now
+from ..index import normalize_posix_path
 from ._base import _FileIOStep
 from ._daily_index import parse_daily_date, refresh_day_index, validate_session_id
 from ._path import resolve_path, validate_filename_component
-from ._provenance import ProvenanceError, trusted_provenance
-from ..index import normalize_posix_path
-from ...components import R
-from ...steps.evolve import now
+from ._provenance import ProvenanceError, note_owned_by_session, trusted_provenance
 
 _RESERVED_METADATA_KEYS = {"name", "description", "session_id", "source_conversation", "source_hash"}
 
@@ -98,14 +100,10 @@ class DailyWriteStep(_FileIOStep):
                 import frontmatter
 
                 existing = frontmatter.loads(target.read_text(encoding="utf-8"))
-                existing_owner = existing.metadata.get("source_conversation") or existing.metadata.get("session_id")
-                if existing_owner and existing_owner not in {
-                    provenance["source_conversation"],
-                    provenance["session_id"],
-                }:
+                if not note_owned_by_session(existing.metadata, provenance):
                     self._fail("daily note belongs to a different source session", path=path)
                     return self.context.response
-            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            except (OSError, UnicodeError, ValueError, TypeError, yaml.YAMLError) as exc:
                 self._fail(f"existing daily note cannot be verified: {type(exc).__name__}", path=path)
                 return self.context.response
 

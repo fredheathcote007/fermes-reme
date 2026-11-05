@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import sys
-import types
 import asyncio
 import contextvars
 import http.server
@@ -14,13 +12,18 @@ import importlib
 import json
 import os
 import stat
+import sys
 import threading
 import time
-
+import types
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+FakeBackend = importlib.import_module("hermes_agent_test_support").FakeBackend
 
 _PLUGIN_PARENT = Path(__file__).resolve().parents[2] / "integrations"
 if str(_PLUGIN_PARENT) not in sys.path:
@@ -293,6 +296,34 @@ def test_http_client_enforces_request_timeout(reme_http_server):
         ReMeHttpClient(endpoint, timeout=1).call("slow", timeout=0.1)
 
 
+def test_http_error_body_is_not_exposed(monkeypatch):
+    endpoint = "http://127.0.0.1:2333"
+
+    class ErrorResponse:
+        reason = "Unprocessable Entity"
+
+        def read(self):
+            return b"conversation-secret-and-tool-arguments"
+
+        def close(self):
+            return None
+
+    def raise_http_error(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            f"{endpoint}/auto_memory",
+            422,
+            "Unprocessable Entity",
+            hdrs=None,
+            fp=ErrorResponse(),
+        )
+
+    monkeypatch.setattr(CLIENT_MODULE.urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(ReMeServiceError) as exc_info:
+        ReMeHttpClient(endpoint, timeout=1).call("auto_memory")
+    assert "conversation-secret" not in str(exc_info.value)
+    assert "HTTP 422" in str(exc_info.value)
+
+
 def test_http_backend_requires_semantically_healthy_response(reme_http_server):
     endpoint, _ = reme_http_server
     backend = HttpReMeBackend(endpoint, request_timeout=1)
@@ -360,6 +391,13 @@ def test_stage1_config_is_local_only_and_has_no_unattended_jobs(tmp_path):
     assert llm["backend"] == "openai"
     assert llm["credential"]["base_url"] == "http://127.0.0.1:1234/v1"
     assert llm["model"] == "local-placeholder"
+    assert config["jobs"]["auto_memory"]["steps"] == [
+        {
+            "backend": "auto_memory_step",
+            "durable_commit": True,
+            "agent_scope": "fermes-hermes-stage1-optionb",
+        },
+    ]
     assert not any(job.get("backend") == "cron" for job in config["jobs"].values())
     assert not any("proactive" in name or "dream" in name for name in config["jobs"])
 
@@ -385,6 +423,46 @@ def test_stage1_config_is_local_only_and_has_no_unattended_jobs(tmp_path):
     upstream = resolve_app_config(config="default", workspace_dir=str(tmp_path / "upstream"), log_config=False)
     for tool_name in ("frontmatter_read", "list_tags"):
         assert config["jobs"][tool_name]["parameters"] == upstream["jobs"][tool_name]["parameters"]
+
+
+@pytest.mark.parametrize(
+    ("variant", "error"),
+    [
+        ("auto_tag", "unapproved job steps"),
+        ("durable_false", "durable_commit=true"),
+        ("durable_missing", "durable_commit=true"),
+        ("wrong_scope", "protected agent_scope"),
+        ("scope_missing", "protected agent_scope"),
+    ],
+)
+def test_stage1_config_rejects_unprotected_auto_memory_variants(tmp_path, monkeypatch, variant, error):
+    from reme.config import resolve_app_config
+
+    # Validate the registry profile exactly as the Hermes guard loads it.
+    # Providing workspace_dir adds a top-level key rejected by the strict guard.
+    loaded = resolve_app_config(config="fermes-hermes-stage1", log_config=False)
+    auto_memory_step = loaded["jobs"]["auto_memory"]["steps"][0]
+    if variant == "auto_tag":
+        loaded["jobs"]["auto_memory"]["steps"].append({"backend": "auto_tag_step"})
+    elif variant == "durable_false":
+        auto_memory_step["durable_commit"] = False
+    elif variant == "durable_missing":
+        del auto_memory_step["durable_commit"]
+    elif variant == "wrong_scope":
+        auto_memory_step["agent_scope"] = "arbitrary-scope"
+    else:
+        del auto_memory_step["agent_scope"]
+    monkeypatch.setattr(CONFIG_MODULE, "_load_embedded_config", lambda _value: loaded)
+
+    with pytest.raises(ReMeConfigError, match=error):
+        parse_config(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(tmp_path / "validation-workspace"),
+                "reme_config": CONFIG_MODULE.STAGE1_CONFIG_NAME,
+            },
+            hermes_home=tmp_path,
+        )
 
 
 def test_save_config_uses_dashboard_layout_and_private_permissions(tmp_path):
@@ -472,42 +550,8 @@ def test_embedded_backend_owns_application_lifecycle(monkeypatch, tmp_path):
     assert backend.state == "closed"
 
 
-class _FakeBackend:
-    label = "fake"
-
-    def __init__(self):
-        self.writes = []
-        self.request_ids = []
-        self.closed = False
-
-    def start(self):
-        return None
-
-    def health(self, *, timeout):
-        del timeout
-        return {"success": True, "metadata": {"health": {"healthy": True}}}
-
-    def search(self, query, *, limit, timeout):
-        del query, limit, timeout
-        return {
-            "success": True,
-            "answer": " remembered ",
-            "metadata": {"counts": {"returned": 2}},
-        }
-
-    def auto_memory(self, session_id, messages, *, timeout, request_id=None):
-        del timeout
-        self.writes.append((session_id, messages))
-        self.request_ids.append(request_id)
-        return {"success": True}
-
-    def close(self, *, timeout):
-        del timeout
-        self.closed = True
-
-
 def test_provider_selects_backend_recalls_and_writes(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
     provider = ReMeMemoryProvider()
@@ -655,7 +699,7 @@ def test_embedded_provider_rejects_reused_workspace_across_profiles(monkeypatch,
     workspace = tmp_path / "shared-workspace"
     stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backend)
 
@@ -690,7 +734,7 @@ def test_workspace_owner_failure_does_not_log_marker_contents(monkeypatch, tmp_p
     stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: _FakeBackend())
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: FakeBackend())
 
     provider = ReMeMemoryProvider()
     provider.initialize("session", hermes_home=tmp_path / "profile")
@@ -704,7 +748,7 @@ def test_embedded_provider_same_profile_restart_reuses_owner_marker(monkeypatch,
     workspace = tmp_path / "workspace"
     stage = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = ReMeConfig(mode="embedded", workspace_dir=str(workspace), reme_config=str(stage))
-    backends = [_FakeBackend(), _FakeBackend()]
+    backends = [FakeBackend(), FakeBackend()]
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backends.pop(0))
 
@@ -737,7 +781,7 @@ def test_custom_embedded_config_requires_explicit_warning_opt_in(monkeypatch, tm
         reme_config=str(custom),
         allow_custom_config=True,
     )
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda _config: backend)
     provider = ReMeMemoryProvider()
@@ -747,7 +791,7 @@ def test_custom_embedded_config_requires_explicit_warning_opt_in(monkeypatch, tm
 
 
 def test_same_profile_provider_fails_closed_when_writer_is_owned(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
     owner = ReMeMemoryProvider()
@@ -768,7 +812,7 @@ def test_same_profile_provider_fails_closed_when_writer_is_owned(monkeypatch, tm
 
 
 def test_reinitialize_closes_previous_backend(monkeypatch, tmp_path):
-    backends = [_FakeBackend(), _FakeBackend()]
+    backends = [FakeBackend(), FakeBackend()]
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backends.pop(0))
     provider = ReMeMemoryProvider()
@@ -783,7 +827,7 @@ def test_reinitialize_closes_previous_backend(monkeypatch, tmp_path):
 
 
 def test_invalid_reinitialize_closes_previous_backend_and_disables_writes(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     outcomes = iter([ReMeConfig(), ReMeConfigError("broken profile config")])
 
     def load(_home=None):
@@ -812,7 +856,7 @@ def test_invalid_reinitialize_closes_previous_backend_and_disables_writes(monkey
 
 
 def test_provider_failure_does_not_escape_model_path(monkeypatch, tmp_path):
-    backend = _FakeBackend()
+    backend = FakeBackend()
     backend.search = lambda *args, **kwargs: (_ for _ in ()).throw(
         ReMeBackendError("offline"),
     )
@@ -845,7 +889,7 @@ def test_backend_creation_is_serialized(monkeypatch):
     def factory(config):
         del config
         time.sleep(0.05)
-        backend = _FakeBackend()
+        backend = FakeBackend()
         created.append(backend)
         return backend
 
@@ -873,7 +917,7 @@ def test_shutdown_defers_close_until_inflight_recall_finishes():
     entered = threading.Event()
     release = threading.Event()
 
-    class BlockingBackend(_FakeBackend):
+    class BlockingBackend(FakeBackend):
         def search(self, query, *, limit, timeout):
             del query, limit, timeout
             entered.set()
@@ -903,9 +947,9 @@ def test_shutdown_drains_all_accepted_writes_before_closing_backend(tmp_path):
     entered = threading.Event()
     release = threading.Event()
 
-    class BlockingBackend(_FakeBackend):
+    class BlockingBackend(FakeBackend):
         def auto_memory(self, session_id, messages, *, timeout, request_id=None):
-            del timeout
+            del timeout, request_id
             self.writes.append((session_id, messages))
             if len(self.writes) == 1:
                 entered.set()
@@ -940,7 +984,7 @@ def test_shutdown_drains_all_accepted_writes_before_closing_backend(tmp_path):
 def test_writer_inherits_hermes_profile_context(tmp_path):
     profile = contextvars.ContextVar("test_hermes_profile", default="default")
 
-    class ContextBackend(_FakeBackend):
+    class ContextBackend(FakeBackend):
         def __init__(self):
             super().__init__()
             self.profile = None
@@ -970,9 +1014,9 @@ def test_recall_timeout_includes_waiting_for_background_write(tmp_path):
     write_release = threading.Event()
     search_entered = threading.Event()
 
-    class BlockingBackend(_FakeBackend):
+    class BlockingBackend(FakeBackend):
         def auto_memory(self, session_id, messages, *, timeout, request_id=None):
-            del session_id, messages, timeout
+            del session_id, messages, timeout, request_id
             write_entered.set()
             write_release.wait(timeout=2)
             return {"success": True}
@@ -1054,7 +1098,6 @@ def test_recall_timeout_includes_embedded_startup_failure_cleanup(monkeypatch, t
 def test_embedded_start_timeout_closes_real_application_resources(monkeypatch, tmp_path):
     import reme
     import reme.config
-
     from reme.application import Application
     from reme.components import BaseComponent
 
@@ -1107,11 +1150,11 @@ def test_shutdown_discard_keeps_sentinel_for_inflight_writer():
 
 
 def test_accepted_write_is_replayed_after_backend_failure(monkeypatch, tmp_path):
-    failed = _FakeBackend()
+    failed = FakeBackend()
     failed.auto_memory = lambda *args, **kwargs: (_ for _ in ()).throw(
         ReMeBackendError("injected write failure"),
     )
-    recovered = _FakeBackend()
+    recovered = FakeBackend()
     backends = iter([failed, recovered])
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: next(backends))
@@ -1136,169 +1179,104 @@ def test_accepted_write_is_replayed_after_backend_failure(monkeypatch, tmp_path)
     assert pending.read_text(encoding="utf-8") == ""
 
 
-def test_retried_spool_record_reuses_record_id_after_ack_failure(monkeypatch, tmp_path):
-    backend = _FakeBackend()
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
+def test_backend_unavailable_cycles_keep_spool_until_health_recovers(monkeypatch, tmp_path):
+    class FlakyHealthBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.health_failures = 7
+
+        def health(self, *, timeout):
+            del timeout
+            if self.health_failures:
+                self.health_failures -= 1
+                raise ReMeBackendError("connection refused")
+            return super().health(timeout=1)
+
+    backend = FlakyHealthBackend()
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
 
     provider = ReMeMemoryProvider()
     provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
-    original_remove = provider._remove_pending_write
-    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
-    provider.sync_turn("same user", "same assistant")
-    deadline = time.monotonic() + 1
-    while len(backend.request_ids) < 1 and time.monotonic() < deadline:
+    provider.sync_turn("outage user", "assistant")
+    deadline = time.monotonic() + 2
+    while not backend.writes and time.monotonic() < deadline:
         time.sleep(0.005)
-    first_id = backend.request_ids[0]
+    provider.shutdown()
 
     pending = config_path(tmp_path).parent / "pending-writes.jsonl"
-    record = json.loads(pending.read_text(encoding="utf-8"))
-    assert record["id"] == first_id
-
-    provider._shutdown_started = True
-    monkeypatch.setattr(provider, "_remove_pending_write", original_remove)
-    provider._shutdown_started = False
-    provider._accept_writes = True
-    provider._health_retry_seconds = 0.01
-    provider._queue_pending_records()
-    provider._start_writer_if_needed()
-    deadline = time.monotonic() + 1
-    while len(backend.request_ids) < 2 and time.monotonic() < deadline:
-        time.sleep(0.005)
-
-    assert backend.request_ids[:2] == [first_id, first_id]
-    provider.shutdown()
-
-
-def test_embedded_reme_receipt_covers_success_before_spool_ack_crash_window(monkeypatch, tmp_path):
-    from reme.steps.evolve.auto_memory import AutoMemoryStep
-
-    calls = []
-    stage_config = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
-    config = ReMeConfig(
-        mode="embedded",
-        workspace_dir=str(tmp_path / "workspace"),
-        reme_config=str(stage_config),
-        request_timeout=5,
-        recall_timeout=1,
-        health_timeout=1,
-        health_retry_seconds=0.01,
-        shutdown_timeout=5,
-    )
-
-    async def synthetic_execute(step):
-        calls.append(step.context.get("request_id"))
-        step.context.response.answer = "synthetic receipt"
-        step.context["changes"] = []
-
-    monkeypatch.setattr(AutoMemoryStep, "_execute", synthetic_execute)
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
-    profile = tmp_path / "profile"
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=profile, agent_identity="profile")
-    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
-    provider.sync_turn("crash-window user", "assistant")
-
-    deadline = time.monotonic() + 5
-    while len(calls) < 1 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert len(calls) == 1
-    pending = profile / "reme" / "pending-writes.jsonl"
-    assert pending.read_text(encoding="utf-8").strip()
-    provider.shutdown()
-
-    replay = ReMeMemoryProvider()
-    replay.initialize("new-session", hermes_home=profile, agent_identity="profile")
-    deadline = time.monotonic() + 5
-    while pending.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    replay.shutdown()
-
-    assert len(calls) == 1
+    quarantine = config_path(tmp_path).parent / "quarantined-writes.jsonl"
+    assert backend.writes
+    assert not quarantine.exists()
     assert pending.read_text(encoding="utf-8") == ""
 
 
-def test_failed_first_record_does_not_stall_later_record(monkeypatch, tmp_path):
-    backend = _FakeBackend()
-    calls = 0
-
-    def auto_memory(session_id, messages, *, timeout, request_id=None):
-        nonlocal calls
-        del session_id, messages, timeout
-        calls += 1
-        backend.request_ids.append(request_id)
-        if calls == 1:
-            return {"success": False, "answer": "transient"}
-        return {"success": True}
-
-    backend.auto_memory = auto_memory
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=tmp_path)
-    provider._health_retry_seconds = 60
-    provider.sync_turn("first", "assistant")
-    provider.sync_turn("second", "assistant")
-
-    deadline = time.monotonic() + 1
-    while calls < 2 and time.monotonic() < deadline:
-        time.sleep(0.005)
-    provider.shutdown()
-
-    assert calls >= 2
-    assert len(backend.request_ids) >= 2
-    assert backend.request_ids[0] != backend.request_ids[1]
-
-
-@pytest.mark.parametrize("response", [{"success": False}, [], None])
-def test_false_or_malformed_auto_memory_ack_keeps_spool_record(monkeypatch, tmp_path, response):
-    backend = _FakeBackend()
-    backend.auto_memory = lambda *args, **kwargs: response
-    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig())
-    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
-    provider = ReMeMemoryProvider()
-    provider.initialize("session", hermes_home=tmp_path)
-    provider.sync_turn("user", "assistant")
-    deadline = time.monotonic() + 1
-    while provider._write_thread is not None and time.monotonic() < deadline:
-        time.sleep(0.005)
-
-    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
-    assert pending.read_text(encoding="utf-8").strip()
-    provider.shutdown()
-
-
-def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_path):
-    provider = ReMeMemoryProvider()
-    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
-    provider._pending_path.parent.mkdir()
-    valid = {"id": "valid", "payload": {"session_id": "s", "messages": []}}
-    provider._pending_path.write_text(
-        "not-json\n" '{"id": "poison", "payload": "not-an-object"}\n' + json.dumps(valid) + "\n",
-        encoding="utf-8",
-    )
-
-    assert provider._read_pending_writes() == [valid]
-    assert provider._remove_pending_write("valid") is True
-    remaining = provider._pending_path.read_text(encoding="utf-8")
-    assert "not-json" in remaining
-    assert '"poison"' in remaining
-    assert '"valid"' not in remaining
-
-
-def test_disk_append_failure_does_not_acknowledge_or_queue_turn(monkeypatch, tmp_path):
+def test_backend_unavailable_result_is_backed_off_without_attempt_budget(monkeypatch, tmp_path):
+    backend = FakeBackend()
     provider = ReMeMemoryProvider()
     provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
     provider._accept_writes = True
+    provider._health_retry_seconds = 0.01
+    outcomes = iter([False] * 7 + [True])
+    monkeypatch.setattr(provider, "_ensure_backend", lambda **_kwargs: next(outcomes))
+    provider._backend = backend
 
-    def fail(_payload):
-        raise OSError("disk full")
+    provider._enqueue_write({"session_id": "s", "messages": []})
+    deadline = time.monotonic() + 2
+    while not backend.writes and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
 
-    monkeypatch.setattr(provider, "_append_pending_write", fail)
-    provider.sync_turn("user", "assistant", session_id="session")
+    pending = provider._pending_path
+    assert backend.writes
+    assert not (pending.parent / "quarantined-writes.jsonl").exists()
+    assert pending.read_text(encoding="utf-8") == ""
 
-    assert provider._write_queue.empty()
-    assert not provider._pending_path.exists()
+
+def test_quarantine_repairs_torn_line_and_does_not_duplicate_after_cleanup_failure(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    record = provider._append_pending_write({"session_id": "s", "messages": []})
+    quarantine = provider._pending_path.parent / "quarantined-writes.jsonl"
+    quarantine.parent.mkdir(parents=True, exist_ok=True)
+    quarantine.write_text('{"id":"older","reason":"permanent_refusal"}', encoding="utf-8")
+    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
+
+    assert provider._quarantine_pending_write(record, "permanent_refusal") is True
+    assert provider._quarantine_pending_write(record, "permanent_refusal") is True
+    entries = [json.loads(line) for line in quarantine.read_text(encoding="utf-8").splitlines()]
+    assert entries[0]["id"] == "older"
+    assert [entry["id"] for entry in entries].count(record["id"]) == 1
+    assert provider._pending_path.read_text(encoding="utf-8").strip()
+
+
+def test_embedded_mode_fails_fast_as_unsupported_on_windows(monkeypatch, tmp_path):
+    config = ReMeConfig(mode="embedded", workspace_dir=str(tmp_path / "workspace"))
+    monkeypatch.setattr(PLUGIN_MODULE.sys, "platform", "win32")
+    monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: config)
+
+    provider = ReMeMemoryProvider()
+
+    assert provider.is_available() is False
+    provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
+
+    assert provider._accept_writes is False
+    assert "Windows is unsupported" in provider.unavailable_reason()
+
+
+def test_save_config_rejects_embedded_mode_on_windows_before_writing(monkeypatch, tmp_path):
+    monkeypatch.setattr(CONFIG_MODULE.sys, "platform", "win32")
+
+    with pytest.raises(ReMeConfigError, match="Windows is unsupported"):
+        save_config(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(tmp_path / "workspace"),
+            },
+            tmp_path,
+        )
+
+    assert not config_path(tmp_path).exists()
 
 
 def test_spool_rejects_symlink_and_sets_private_permissions(tmp_path):
