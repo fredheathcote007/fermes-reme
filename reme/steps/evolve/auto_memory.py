@@ -1038,12 +1038,25 @@ class AutoMemoryStep(BaseStep):
         """Reject recognised empty templates, not arbitrary model paraphrases."""
         lines = []
         for raw_line in content.splitlines():
-            if not raw_line.strip():
+            stripped = raw_line.strip()
+            # Structural Markdown can contain ASCII punctuation such as table
+            # alignment colons and empty checkboxes, but not memory facts.
+            if not stripped or (stripped.isascii() and not any(char.isalnum() for char in stripped)):
+                continue
+            # A complete inline fence can contain a real fact: retain its
+            # inner content rather than discard the whole line as a marker.
+            inline_fence = re.fullmatch(r"(`{3,}|~{3,})(.*?)\1", stripped)
+            if inline_fence:
+                stripped = inline_fence.group(2).strip()
+                if not stripped:
+                    continue
+            # Separate opening/closing fences may have language tags or attributes.
+            elif re.fullmatch(r"`{3,}[^`]*|~{3,}[^~]*", stripped):
                 continue
             # Unicode-aware: preserving non-Latin letters and digits avoids
             # treating valid multilingual memories as empty proposals.
-            normalised_line = re.sub(r"[\W_]+", " ", raw_line.casefold()).strip()
-            if re.fullmatch(r"(?:daily )?(?:note|entry)(?: \d{4} \d{1,2} \d{1,2})?", normalised_line):
+            normalised_line = re.sub(r"[\W_]+", " ", stripped.casefold()).strip()
+            if re.fullmatch(r"(?:daily )?(?:notes?|entries|entry)(?: \d{4} \d{1,2} \d{1,2})?", normalised_line):
                 continue
             # A meaningful emoji/symbol-only memory is not an empty template.
             lines.append(normalised_line or raw_line.strip())
@@ -1054,7 +1067,7 @@ class AutoMemoryStep(BaseStep):
             return True
         return bool(
             re.fullmatch(
-                r"(?:this is (?:a|an) )?placeholder for (?:the )?(?:daily|today s) (?:entry|note)"
+                r"(?:this is (?:a|an) )?placeholder for (?:the )?(?:today s )?(?:daily )?(?:notes?|entries|entry)"
                 r"(?: capturing any relevant information and observations(?: for the day)?)?",
                 body,
             ),
