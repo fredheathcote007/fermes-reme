@@ -674,6 +674,79 @@ async def test_protected_empty_turn_has_idempotent_noop_receipt_without_commit_o
     assert not list(tmp_path.rglob("dialog/*.jsonl"))
 
 
+@_POSIX_DURABLE_COMMIT
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "accepted"),
+    [
+        (
+            "This is a placeholder for the daily entry, "
+            "capturing any relevant information and observations for the day.",
+            False,
+        ),
+        ("The user moved to Berlin and starts work on Monday.", True),
+        ("Today's daily note captures relevant observations: the user moved to Berlin on Monday.", True),
+        (
+            "# Daily Note – 2026-11-06\n\nThis is a placeholder for the daily entry, "
+            "capturing any relevant information and observations for the day.\n",
+            False,
+        ),
+        ("# Daily Note – 2026-11-06", False),
+        ("Placeholder for today's entry.", False),
+        ("No new information.", False),
+        ("用户搬到了柏林，周一开始上班。", True),
+        ("ユーザーは月曜日に仕事を始めます。", True),
+        ("Пользователь переехал в Берлин и начинает работу в понедельник.", True),
+        ("🎯", True),
+    ],
+)
+async def test_option_b_rejects_template_only_proposal_but_commits_substantive_content(
+    tmp_path,
+    monkeypatch,
+    content,
+    accepted,
+):
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/protected-fact.md",
+                    "name": "protected-fact",
+                    "description": "A deterministic protected fact.",
+                    "content": content,
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "template-session" if not accepted else "substantive-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            request_id="template-request" if not accepted else "substantive-request",
+            **request,
+        )
+
+    assert response.success is accepted
+    assert bool(list((workspace / "daily").rglob("*.md"))) is accepted
+    assert bool(list((workspace / "metadata/auto_memory_requests").rglob("*.json"))) is accepted
+    if not accepted:
+        assert "protected proposal contained no substantive memory content" in response.answer
+    assert list((workspace / "session/dialog").rglob("*.jsonl"))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("request_id", "step_kwargs", "diagnostic"),

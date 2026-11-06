@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -451,6 +453,97 @@ def test_hermes_provider_captures_with_agentscope_and_recalls_after_restart(tmp_
         restarted.shutdown()
         restarted = None
     finally:
+        if provider is not None:
+            provider.shutdown()
+        if restarted is not None:
+            restarted.shutdown()
+
+
+def test_protected_placeholder_keeps_hermes_spool_pending_until_real_commit(tmp_path, monkeypatch):
+    """A model-generated placeholder cannot ACK a queued Hermes memory write."""
+    from agentscope.model import OpenAIChatModel
+
+    day = datetime.now(UTC).date().isoformat()
+    marker = "coral-lattice-fhm007"
+    second_started = threading.Event()
+    release_second = threading.Event()
+    calls = []
+
+    async def model_call(_self, model_name, messages, tools=None, tool_choice=None, **kwargs):
+        del model_name, messages, tools, tool_choice, kwargs
+        calls.append(len(calls) + 1)
+        if len(calls) > 1:
+            second_started.set()
+            await asyncio.to_thread(release_second.wait, 12)
+        content = (
+            "# Daily Note – " + day + "\n\n"
+            "This is a placeholder for the daily entry, "
+            "capturing any relevant information and observations for the day.\n"
+            if len(calls) == 1
+            else f"The synthetic calibration marker is {marker}."
+        )
+        proposal = {
+            "path": f"daily/{day}/spool-probe.md",
+            "name": "spool-probe",
+            "description": "Synthetic marker retention proof.",
+            "content": content,
+        }
+        return ChatResponse(content=[TextBlock(text=json.dumps(proposal))], is_last=True)
+
+    monkeypatch.setattr(OpenAIChatModel, "_call_api", model_call)
+    reme_config = _write_test_config(tmp_path)
+    hermes_home = tmp_path / "hermes-home"
+    workspace = tmp_path / "reme-workspace"
+    (hermes_home / "reme").mkdir(parents=True)
+    (hermes_home / "reme/config.json").write_text(
+        json.dumps(
+            {
+                "mode": "embedded",
+                "workspace_dir": str(workspace),
+                "reme_config": str(reme_config),
+                "allow_custom_config": True,
+                "request_timeout": 20,
+                "recall_timeout": 8,
+                "health_timeout": 3,
+                "health_retry_seconds": 0.2,
+                "shutdown_timeout": 6,
+                "recall_limit": 5,
+            },
+        ),
+        encoding="utf-8",
+    )
+    provider = ReMeMemoryProvider()
+    restarted = None
+    try:
+        provider.initialize("spool-retry-session", hermes_home=hermes_home, agent_identity="probe-profile")
+        assert provider._backend_available, provider.unavailable_reason()
+        provider.sync_turn(f"Please retain synthetic marker {marker}.", f"Acknowledged {marker}.")
+        assert second_started.wait(15), "placeholder did not remain retryable"
+        pending = hermes_home / "reme/pending-writes.jsonl"
+        note = workspace / "daily" / day / "spool-probe.md"
+        receipts = workspace / "metadata/auto_memory_requests"
+        assert pending.is_file() and pending.read_text(encoding="utf-8").strip()
+        assert not note.exists()
+        assert not list(receipts.rglob("*.json"))
+        transcript = list((workspace / "session/dialog").glob("*.jsonl"))
+        assert len(transcript) == 1 and marker in transcript[0].read_text(encoding="utf-8")
+
+        release_second.set()
+        assert _wait_for(
+            lambda: note.is_file() and not pending.read_text(encoding="utf-8").strip(),
+            timeout=22,
+        )
+        assert marker in note.read_text(encoding="utf-8")
+        assert len(list(receipts.rglob("*.json"))) == 1
+        assert calls == [1, 2]
+        provider.shutdown()
+        provider = None
+        restarted = ReMeMemoryProvider()
+        restarted.initialize("fresh-spool-session", hermes_home=hermes_home, agent_identity="probe-profile")
+        recall = _wait_for(lambda: restarted.prefetch("coral lattice calibration"), timeout=12)
+        assert marker in recall
+    finally:
+        release_second.set()
         if provider is not None:
             provider.shutdown()
         if restarted is not None:

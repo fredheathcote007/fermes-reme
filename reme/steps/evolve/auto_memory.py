@@ -1033,6 +1033,33 @@ class AutoMemoryStep(BaseStep):
                 results[call_id] = (name, state)
         return set(calls) == set(results) and all(state in _SUCCESSFUL_TOOL_STATES for _, state in results.values())
 
+    @staticmethod
+    def _is_empty_option_b_content(content: str) -> bool:
+        """Reject recognised empty templates, not arbitrary model paraphrases."""
+        lines = []
+        for raw_line in content.splitlines():
+            if not raw_line.strip():
+                continue
+            # Unicode-aware: preserving non-Latin letters and digits avoids
+            # treating valid multilingual memories as empty proposals.
+            normalised_line = re.sub(r"[\W_]+", " ", raw_line.casefold()).strip()
+            if re.fullmatch(r"(?:daily )?(?:note|entry)(?: \d{4} \d{1,2} \d{1,2})?", normalised_line):
+                continue
+            # A meaningful emoji/symbol-only memory is not an empty template.
+            lines.append(normalised_line or raw_line.strip())
+        if not lines:
+            return True
+        body = " ".join(lines)
+        if body in {"placeholder", "template", "tbd", "todo", "none", "n a", "no new information"}:
+            return True
+        return bool(
+            re.fullmatch(
+                r"(?:this is (?:a|an) )?placeholder for (?:the )?(?:daily|today s) (?:entry|note)"
+                r"(?: capturing any relevant information and observations(?: for the day)?)?",
+                body,
+            ),
+        )
+
     async def _recover_or_validate_option_b_note(
         self,
         *,
@@ -1176,6 +1203,8 @@ class AutoMemoryStep(BaseStep):
         content = proposal["content"]
         if validate_filename_component(name, kind="name") or not description.strip():
             raise RuntimeError("protected proposal has invalid name or description")
+        if self._is_empty_option_b_content(content):
+            raise RuntimeError("protected proposal contained no substantive memory content")
         body = content if content.endswith("\n") else content + "\n"
         if len(body.encode("utf-8")) > self.max_file_bytes():
             raise RuntimeError("protected proposal exceeds the file byte limit")
