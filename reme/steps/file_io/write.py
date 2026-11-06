@@ -4,9 +4,14 @@ import frontmatter
 
 from ._base import _FileIOStep
 from ._file_io import detect_file_encoding, get_path_lock, write_file_safe
-from ._path import _check_path_permission, NON_MD_WARNING, gate_md, resolve_path
-from ._provenance import PROVENANCE_SESSION_KEY, ProvenanceError, strip_model_provenance, trusted_provenance
 from ...components import R
+from ._path import NON_MD_WARNING, _check_path_permission, gate_md, resolve_path
+from ._provenance import (
+    PROVENANCE_SESSION_KEY,
+    ProvenanceError,
+    strip_model_provenance,
+    trusted_provenance,
+)
 
 
 @R.register("write_step")
@@ -56,6 +61,8 @@ class WriteStep(_FileIOStep):
                 source_metadata = strip_model_provenance(metadata_raw) if protected else metadata_raw
                 for k, v in source_metadata.items():
                     if k in ("name", "description"):
+                        continue
+                    if v is None:
                         continue
                     meta[str(k)] = v
             if provenance_session_id is not None:

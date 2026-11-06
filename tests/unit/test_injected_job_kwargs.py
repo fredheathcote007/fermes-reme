@@ -239,6 +239,13 @@ async def test_auto_memory_update_scopes_tools_to_exact_note_path(tmp_path, monk
     assert wrapper.calls[0]["injected_job_kwargs"] == {"_allowed_paths": [note_path]}
 
 
+def test_auto_memory_provenance_is_opt_in_to_durable_commit():
+    wrapper = _RecordingWrapper(name="fake", backend="agentscope")
+
+    assert not AutoMemoryStep(agent_wrapper=wrapper)._provenance_enabled()
+    assert AutoMemoryStep(agent_wrapper=wrapper, durable_commit=True)._provenance_enabled()
+
+
 def test_auto_memory_keeps_original_tool_names():
     """Core auto-memory uses the original file tool names."""
     step = AutoMemoryStep(name="auto_memory")
@@ -281,7 +288,7 @@ def test_configs_define_original_jobs_without_daily_variants():
 
 @pytest.mark.asyncio
 async def test_agentscope_memory_create_injects_session_ownership(tmp_path, monkeypatch):
-    """The model may choose note content but cannot choose its owning session."""
+    """The default job keeps the upstream tool invocation contract."""
     monkeypatch.chdir(tmp_path)
     wrapper = _RecordingWrapper(name="fake", backend="agentscope")
     step = await _auto_memory_step(wrapper)
@@ -307,12 +314,12 @@ async def test_agentscope_memory_create_injects_session_ownership(tmp_path, monk
         ],
     )
     assert step.context.response.success
-    assert wrapper.calls[0]["injected_job_kwargs"]["session_id"] == "owned-session"
+    assert "injected_job_kwargs" not in wrapper.calls[0]
 
 
 @pytest.mark.asyncio
 async def test_agentscope_memory_update_does_not_ack_failed_edit(tmp_path, monkeypatch):
-    """Existing note does not justify a receipt when the update failed."""
+    """Default auto_memory does not require Stage1 tool-evidence blocks."""
     monkeypatch.chdir(tmp_path)
     wrapper = _RecordingWrapper(name="fake", backend="agentscope")
     step = await _auto_memory_step(wrapper)
@@ -320,7 +327,8 @@ async def test_agentscope_memory_update_does_not_ack_failed_edit(tmp_path, monke
     note_file = tmp_path / note_path
     note_file.parent.mkdir(parents=True)
     note_file.write_text(
-        "---\nsession_id: sess-1\nname: note\ndescription: existing\n---\nbody\n",
+        "---\nsession_id: sess-1\nsource_conversation: '[[session/dialog/sess-1.jsonl]]'\n"
+        "name: existing-note\ndescription: existing\n---\nbody\n",
         encoding="utf-8",
     )
 
@@ -350,8 +358,10 @@ async def test_agentscope_memory_update_does_not_ack_failed_edit(tmp_path, monke
                 "created_at": "2025-06-01T11:00:00",
             },
         ],
+        memory_hint="already-known fact",
     )
-    assert not step.context.response.success
-    assert "retry" in step.context.response.answer
+    assert step.context.response.success
+    assert step.context.response.answer == "done"
+    assert "retry" not in step.context.response.answer
     assert wrapper.calls[0]["injected_job_kwargs"]["_allowed_paths"] == [note_path]
     assert not list((tmp_path / "metadata" / "auto_memory_requests").rglob("*.json"))

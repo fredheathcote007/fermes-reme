@@ -3,6 +3,7 @@
 # pylint: disable=protected-access,missing-function-docstring
 
 import asyncio
+import os
 from types import SimpleNamespace
 
 from agentscope.message import Msg, TextBlock
@@ -199,6 +200,75 @@ async def test_concurrent_append_survives_rewrite_race(step, monkeypatch):
     _assert_serialized(interleaving)
 
 
+def test_default_note_match_prefers_session_id_over_source_link():
+    first = {"path": "daily/2026-10-01/first.md", "session_id": _SESSION, "source_conversation": "[[other]]"}
+    second = {"path": "daily/2026-10-01/second.md", "source_conversation": AutoMemoryStep()._session_link(_SESSION)}
+
+    assert AutoMemoryStep()._find_session_note([first, second], _SESSION) is first
+
+
+@pytest.mark.asyncio
+async def test_default_transcript_collapses_same_batch_duplicate_ids(step):
+    await step._save_session_messages(
+        _SESSION,
+        [_msg("duplicate", "2026-10-01T10:00:00"), _msg("duplicate", "2026-10-01T10:01:00")],
+    )
+
+    messages = [
+        Msg.model_validate_json(line)
+        for line in step._session_path(_SESSION).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [(message.id, message.created_at) for message in messages] == [("duplicate", "2026-10-01T10:01:00")]
+
+
+@pytest.mark.asyncio
+async def test_default_redelivery_reorders_and_sanitizes_rewrite(step):
+    await step._save_session_messages(
+        _SESSION,
+        [_msg("first", "2026-10-01T10:00:00"), _msg("second", "2026-10-01T10:01:00")],
+    )
+    redelivery = Msg.model_validate(
+        {
+            "id": "second",
+            "name": "Alice",
+            "role": "assistant",
+            "created_at": "2026-10-01T09:00:00",
+            "content": [
+                {"type": "text", "text": "updated"},
+                {"type": "tool_result", "id": "tool-1", "name": "read", "output": "private"},
+                {
+                    "type": "data",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+                },
+            ],
+        },
+    )
+
+    await step._save_session_messages(_SESSION, [redelivery])
+
+    saved = [
+        Msg.model_validate_json(line)
+        for line in step._session_path(_SESSION).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [message.id for message in saved] == ["second", "first"]
+    assert saved[0].created_at == "2026-10-01T09:00:00"
+    assert [block.type for block in saved[0].content] == ["text"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX directory symlink support")
+@pytest.mark.asyncio
+async def test_default_transcript_save_follows_symlinked_session_directory(step):
+    real_session = step.file_store.workspace_path / "real-session"
+    real_session.mkdir()
+    (step.file_store.workspace_path / "session").symlink_to(real_session, target_is_directory=True)
+
+    await step._save_session_messages(_SESSION, [_msg("linked", "2026-10-01T10:00:00")])
+
+    assert (real_session / "dialog" / f"{_SESSION}.jsonl").is_file()
+
+
 @pytest.mark.asyncio
 async def test_protected_transcript_keeps_identical_distinct_turns(tmp_path, monkeypatch):
     """Repeated identical text is not mistaken for a retry of an earlier turn."""
@@ -228,10 +298,45 @@ async def test_protected_transcript_keeps_identical_distinct_turns(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_duplicate_message_id_preserves_original_created_at(step):
+async def test_protected_redelivery_preserves_original_created_at_and_bytes(tmp_path, monkeypatch):
+    durable_calls = []
+
+    async def durable_write(path, content):
+        durable_calls.append(content)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    monkeypatch.setattr(auto_memory, "write_file_durable", durable_write)
+    step = AutoMemoryStep(durable_commit=True, agent_scope="test-scope")
+    step.file_store = SimpleNamespace(workspace_path=tmp_path)
+    step.agent_wrapper = SimpleNamespace(backend="agentscope")
+    step.context = SimpleNamespace(
+        data={"request_id": "request-1"},
+        get=lambda key, default=None: {"request_id": "request-1"}.get(key, default),
+    )
+
+    await step._save_session_messages(_SESSION, [_msg("stable", "2026-10-01T10:00:00")])
+    before = step._session_path(_SESSION).read_bytes()
+    await step._save_session_messages(_SESSION, [_msg("stable", "2026-10-01T11:00:00")])
+
+    assert step._session_path(_SESSION).read_bytes() == before
+    saved = [
+        Msg.model_validate_json(line)
+        for line in step._session_path(_SESSION).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(saved) == 1
+    assert saved[0].created_at == "2026-10-01T10:00:00"
+    assert len(durable_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_default_duplicate_message_id_without_reordering_keeps_existing_bytes(step):
     await step._save_session_messages(_SESSION, [_msg("stable", "2026-10-01T23:59:59")])
+    before = step._session_path(_SESSION).read_bytes()
     await step._save_session_messages(_SESSION, [_msg("stable", "2026-10-02T00:00:01")])
 
+    assert step._session_path(_SESSION).read_bytes() == before
     messages = [
         Msg.model_validate_json(line)
         for line in step._session_path(_SESSION).read_text(encoding="utf-8").splitlines()

@@ -113,6 +113,10 @@ def _truncate_utf8(value: str, max_bytes: int) -> str:
     return value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _durable_local_posix_commits_available() -> bool:
+    return os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+
+
 def _check_existing_image(target: Path) -> bool:
     if target.is_file():
         return True
@@ -144,10 +148,13 @@ async def _write_new_file_durable(file_path: Path, content: str | bytes, encodin
     sibling and then atomically link it into the requested name.  ``False``
     means another writer won the name; the caller may allocate its next name.
     """
+    if not _durable_local_posix_commits_available():
+        raise OSError("durable local POSIX file commits are unavailable on this platform")
+
     temporary = file_path.with_name(f".reme-{uuid4().hex}.create.tmp")
 
     def open_parent() -> int:
-        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        if not _durable_local_posix_commits_available():
             raise OSError("durable local POSIX file commits are unavailable on this platform")
         parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         parts = temporary.parent.absolute().parts
@@ -367,6 +374,8 @@ class AutoMemoryStep(BaseStep):
         return normalize_posix_path(str(self.config_value("session_dir")))
 
     def _session_path(self, session_id: str) -> Path:
+        if not self._provenance_enabled():
+            return self.file_store.workspace_path / self._session_dir() / "dialog" / f"{session_id}.jsonl"
         return resolve_session_source(
             Path(self.file_store.workspace_path or "."),
             self._session_dir(),
@@ -412,8 +421,7 @@ class AutoMemoryStep(BaseStep):
         if not fail_closed:
             for note in notes:
                 note_session = str(note.get(_SESSION_ID_KEY, "")).strip()
-                note_source = str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip()
-                if note_session == session_id and (not note_source or note_source == source):
+                if note_session == session_id:
                     return note
             for note in notes:
                 if str(note.get(_SOURCE_CONVERSATION_KEY, "")).strip() == source:
@@ -526,8 +534,12 @@ class AutoMemoryStep(BaseStep):
         )
 
     def _provenance_enabled(self) -> bool:
-        """Limit trusted transcript provenance to the Fermes AgentScope step."""
-        return type(self) is AutoMemoryStep and getattr(self.agent_wrapper, "backend", None) == "agentscope"
+        """Limit trusted transcript provenance to the explicitly durable flow."""
+        return (
+            self.kwargs.get("durable_commit") is True
+            and type(self) is AutoMemoryStep
+            and getattr(self.agent_wrapper, "backend", None) == "agentscope"
+        )
 
     def _option_b_enabled(self) -> bool:
         """Return whether this invocation is the explicitly opted-in protected flow."""
@@ -1501,22 +1513,20 @@ class AutoMemoryStep(BaseStep):
                         except Exception:
                             pass
 
-            by_id: dict[str, Msg] = {}
-            for msg in existing:
-                by_id[msg.id] = msg
-            incoming = [_sanitize_msg_for_save(msg) for msg in messages]
-            new_messages = []
-            for msg in incoming:
-                if msg.id in by_id:
-                    existing_message = by_id[msg.id]
-                    if msg.created_at != existing_message.created_at:
-                        msg = msg.model_copy(update={"created_at": existing_message.created_at})
-                    by_id[msg.id] = msg
-                else:
-                    new_messages.append(msg)
-            merged = sorted([*by_id.values(), *new_messages], key=lambda m: m.created_at)
-
             if self._option_b_enabled():
+                by_id: dict[str, Msg] = {}
+                for msg in existing:
+                    by_id[msg.id] = msg
+                incoming = [_sanitize_msg_for_save(msg) for msg in messages]
+                new_messages = []
+                for msg in incoming:
+                    if msg.id in by_id:
+                        # Option B treats a repeated message ID as a redelivery,
+                        # so keep the already persisted message byte-for-byte
+                        # rather than replacing generated block metadata.
+                        continue
+                    new_messages.append(msg)
+                merged = sorted([*by_id.values(), *new_messages], key=lambda m: m.created_at)
                 serialized = "".join(f"{message.model_dump_json()}\n" for message in merged)
                 await write_file_durable(path, serialized)
                 self.logger.info(
@@ -1524,6 +1534,13 @@ class AutoMemoryStep(BaseStep):
                     f"existing={len(existing)} total={len(merged)}",
                 )
                 return
+
+            by_id: dict[str, Msg] = {}
+            for msg in existing:
+                by_id[msg.id] = msg
+            for msg in messages:
+                by_id[msg.id] = msg
+            merged = sorted(by_id.values(), key=lambda m: m.created_at)
 
             can_append = 0 < len(existing) <= len(merged) and all(
                 merged[i].id == existing[i].id for i in range(len(existing))
@@ -1536,7 +1553,7 @@ class AutoMemoryStep(BaseStep):
                 if new_msgs:
                     async with aiofiles.open(path, "a", encoding="utf-8") as f:
                         for msg in new_msgs:
-                            await f.write(msg.model_dump_json() + "\n")
+                            await f.write(_sanitize_msg_for_save(msg).model_dump_json() + "\n")
                     self.logger.info(
                         f"[{self.name}] save session appended session_id={session_id!r} "
                         f"existing={len(existing)} appended={len(new_msgs)} total={len(merged)}",
@@ -1549,7 +1566,7 @@ class AutoMemoryStep(BaseStep):
             else:
                 async with aiofiles.open(path, "w", encoding="utf-8") as f:
                     for msg in merged:
-                        await f.write(msg.model_dump_json() + "\n")
+                        await f.write(_sanitize_msg_for_save(msg).model_dump_json() + "\n")
                 self.logger.info(
                     f"[{self.name}] save session rewrote session_id={session_id!r} "
                     f"existing={len(existing)} total={len(merged)}",
@@ -2064,7 +2081,6 @@ class AutoMemoryStep(BaseStep):
         # model supplies the date from the prompt.
         if reply_kwargs is None:
             reply_kwargs = self._reply_extra_kwargs(day)
-        is_agentscope = getattr(self.agent_wrapper, "backend", None) == "agentscope"
         injected_job_kwargs = dict(reply_kwargs.get("injected_job_kwargs") or {})
         if protected:
             injected_job_kwargs[PROVENANCE_SESSION_KEY] = session_id
@@ -2102,10 +2118,11 @@ class AutoMemoryStep(BaseStep):
         )
         self.logger.info(f"[{self.name}] agent done path={note_path} has_result={bool(result.get('result'))}")
 
-        # Reject incomplete/malformed durable execution before checking the
-        # note on disk: a partial write must not acknowledge the whole turn.
+        # Reject incomplete/malformed durable execution only for the explicitly
+        # protected Stage1 flow. The default auto_memory contract accepts the
+        # upstream agent reply behavior unchanged.
         durable_tools = self.create_tools if created else self.update_tools
-        if self._all_requested_writes_failed(result, durable_tools, require_execution=is_agentscope):
+        if option_b and self._all_requested_writes_failed(result, durable_tools, require_execution=True):
             self.context.response.success = False
             self.context.response.answer = "Error: durable memory write failed; request remains eligible for retry"
             self.context.response.metadata.update(
@@ -2132,10 +2149,13 @@ class AutoMemoryStep(BaseStep):
                 self.logger.info(f"[{self.name}] post-create list failed session_id={session_id!r} answer={str(exc)!r}")
                 return
             if note is None:
-                if (is_agentscope and retention_requested) or self._requested_tool_call_observed(
-                    result,
-                    durable_tools,
-                    require_execution=is_agentscope,
+                if option_b and (
+                    retention_requested
+                    or self._requested_tool_call_observed(
+                        result,
+                        durable_tools,
+                        require_execution=True,
+                    )
                 ):
                     self.context.response.success = False
                     self.context.response.answer = (
@@ -2210,12 +2230,7 @@ class AutoMemoryStep(BaseStep):
 
         source_conversation = self._session_link(session_id)
         self.context.response.success = True
-        if retention_requested and not modified:
-            # An attributed existing note may already contain the requested fact. Do not turn
-            # an unchanged disk state into a false claim that this request stored it.
-            self.context.response.answer = "No note change: existing session note retained; no new storage claimed"
-        else:
-            self.context.response.answer = agent_reply_result_text(result)
+        self.context.response.answer = agent_reply_result_text(result)
         self.context.response.metadata.update(
             {
                 "date": day,

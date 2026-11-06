@@ -126,6 +126,7 @@ async def test_daily_write_does_not_overwrite_foreign_note(tmp_path, monkeypatch
         session_id=SESSION,
         content="model content",
         date="2026-10-27",
+        _provenance_session_id=SESSION,
     )
 
     assert step.context.response.success is False
@@ -154,6 +155,7 @@ async def test_daily_write_rejects_conflicting_existing_owner_fields(tmp_path, m
         session_id=SESSION,
         content="model content",
         date="2026-10-27",
+        _provenance_session_id=SESSION,
     )
 
     assert step.context.response.success is False
@@ -196,6 +198,38 @@ async def test_daily_write_accepts_matching_one_field_legacy_note(tmp_path, monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "owner_frontmatter",
+    ["session_id: foreign", "name: historical"],
+)
+async def test_untrusted_daily_write_can_overwrite_existing_note(tmp_path, monkeypatch, owner_frontmatter):
+    monkeypatch.chdir(tmp_path)
+    _seed_source(tmp_path)
+    note = tmp_path / "daily/2026-10-27/note.md"
+    note.parent.mkdir(parents=True)
+    note.write_text(f"---\n{owner_frontmatter}\n---\nold content\n", encoding="utf-8")
+    store = await _store()
+    app_context = ApplicationContext(workspace_dir=str(tmp_path))
+    app_context.components[ComponentEnum.FILE_STORE] = {"default": store}
+
+    step = DailyWriteStep(app_context=app_context)
+    await step(
+        name="note",
+        description="updated",
+        session_id=SESSION,
+        content="new content",
+        date="2026-10-27",
+        metadata={"source_hash": {"value": "caller-owned"}},
+    )
+
+    saved = frontmatter.loads(note.read_text(encoding="utf-8"))
+    assert step.context.response.success is True
+    assert saved.content.strip() == "new content"
+    assert saved.metadata["source_hash"] == {"value": "caller-owned"}
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_daily_write_does_not_claim_unowned_note(tmp_path, monkeypatch):
     """A note without either owner field is not implicitly claimed."""
     monkeypatch.chdir(tmp_path)
@@ -215,6 +249,7 @@ async def test_daily_write_does_not_claim_unowned_note(tmp_path, monkeypatch):
         session_id=SESSION,
         content="model content",
         date="2026-10-27",
+        _provenance_session_id=SESSION,
     )
 
     assert step.context.response.success is False
@@ -243,6 +278,7 @@ async def test_daily_write_rejects_malformed_existing_frontmatter(tmp_path, monk
         session_id=SESSION,
         content="model content",
         date="2026-10-27",
+        _provenance_session_id=SESSION,
     )
 
     assert step.context.response.success is False

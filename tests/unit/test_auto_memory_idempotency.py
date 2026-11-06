@@ -25,6 +25,11 @@ from reme.steps.evolve.auto_memory import AutoMemoryStep
 
 from .test_hermes_agent_integration import PLUGIN_MODULE, ReMeBackendError
 
+_POSIX_DURABLE_COMMIT = pytest.mark.skipif(
+    os.name != "posix",
+    reason="requires POSIX durable no-overwrite commit semantics",
+)
+
 
 class _SecurityTestWrapper(BaseAgentWrapper):
     async def reply(self, _inputs, **_kwargs):
@@ -77,6 +82,7 @@ async def test_option_b_new_file_does_not_overwrite_existing_target_or_leave_tem
     assert not list(tmp_path.glob(".reme-*.create.tmp"))
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["write", "scheduler"])
 async def test_option_b_new_file_cleans_temp_when_staging_fails(tmp_path, monkeypatch, failure):
@@ -102,6 +108,71 @@ async def test_option_b_new_file_cleans_temp_when_staging_fails(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_option_b_new_file_rejects_unsupported_platform_before_staging(tmp_path, monkeypatch):
+    """Unsupported durable commits fail before the private staging write."""
+    target = tmp_path / "new.md"
+    staging_calls = []
+
+    async def durable_stub(*_args, **_kwargs):
+        staging_calls.append(True)
+
+    monkeypatch.setattr(auto_memory_module, "_durable_local_posix_commits_available", lambda: False)
+    monkeypatch.setattr(auto_memory_module, "write_file_durable", durable_stub)
+
+    with pytest.raises(OSError, match="durable local POSIX file commits are unavailable"):
+        await auto_memory_module._write_new_file_durable(target, b"new note bytes")
+
+    assert not staging_calls
+    assert not list(tmp_path.glob(".reme-*.create.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the native Windows durable-commit predicate")
+@pytest.mark.asyncio
+async def test_windows_protected_commit_fails_closed_before_staging(tmp_path, monkeypatch):
+    """Native Windows rejects protected session-save before publication, temp, or receipt."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    calls = []
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/windows-protected.md",
+                    "name": "windows-protected",
+                    "description": "A deterministic protected fact.",
+                    "content": "A protected fact.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    assert not auto_memory_module._durable_local_posix_commits_available()
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    request = {
+        "session_id": "windows-protected-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+        "date": "2026-10-21",
+    }
+    async with Application(**config) as app:
+        response = await app.run_job("auto_memory", request_id="windows-protected-request", **request)
+
+    assert not response.success
+    assert "durable local POSIX file commits are unavailable" in response.answer
+    assert not calls
+    assert not list((workspace / "session/dialog").glob("*.jsonl"))
+    assert not list(workspace.rglob(".reme-*.create.tmp"))
+    assert not list((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+    assert not list((workspace / "daily").rglob("*.md"))
+
+
+@_POSIX_DURABLE_COMMIT
+@pytest.mark.asyncio
 async def test_option_b_new_file_does_not_reallocate_after_post_commit_cleanup_failure(tmp_path, monkeypatch):
     """A post-commit long-path cleanup failure cannot turn one note into two."""
     target = tmp_path / "new.md"
@@ -120,6 +191,7 @@ async def test_option_b_new_file_does_not_reallocate_after_post_commit_cleanup_f
     assert not list(tmp_path.glob(".reme-*.create.tmp"))
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_new_file_swallows_post_commit_relative_cleanup_failure(tmp_path, monkeypatch):
     """A failure from relative cleanup after fsync still returns the committed result."""
@@ -156,6 +228,7 @@ async def test_option_b_new_file_swallows_post_commit_relative_cleanup_failure(t
     assert len(cleanup_calls) == 1
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_new_file_preserves_post_link_fsync_failure(tmp_path, monkeypatch):
     """Cleanup errors after linking cannot mask a failed directory fsync."""
@@ -225,6 +298,7 @@ async def test_option_b_receipt_note_path_is_rejected_before_storage_lookup(tmp_
         )
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("note_path", "permanent", "filesystem_setup"),
@@ -466,20 +540,23 @@ async def test_application_run_job_replays_real_receipt_without_repeating_side_e
 @pytest.mark.parametrize(
     ("messages", "tamper", "expected"),
     [
-        (
+        pytest.param(
             [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
             "response-object",
             "response is malformed",
+            marks=_POSIX_DURABLE_COMMIT,
         ),
-        (
+        pytest.param(
             [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
             "commit-object",
             "does not contain a successful commit",
+            marks=_POSIX_DURABLE_COMMIT,
         ),
-        (
+        pytest.param(
             [{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
             "response-false",
             "does not contain a matching successful commit",
+            marks=_POSIX_DURABLE_COMMIT,
         ),
         ([], "noop-commit", "no-op receipt contains commit evidence"),
         ([], "noop-response", "no-op receipt response is malformed"),
@@ -702,6 +779,7 @@ async def test_malformed_durable_commit_is_rejected_before_execute(tmp_path, mon
     assert not list(tmp_path.rglob("*.json"))
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_path, monkeypatch):
     """Protected replay is receipt-free only with matching marker/body evidence."""
@@ -767,6 +845,7 @@ async def test_option_b_marker_binds_body_and_allows_new_request_revision(tmp_pa
     assert len(calls) == 2
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_create_collision_allocates_unique_note_without_replay(tmp_path, monkeypatch):
     """Two protected sessions sharing a proposed name retain both revisions."""
@@ -834,6 +913,7 @@ async def test_option_b_create_collision_allocates_unique_note_without_replay(tm
     )
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_create_enametoolong_allocates_capped_suffix(tmp_path, monkeypatch):
     """An overlong original target advances to the bounded protected suffix."""
@@ -878,6 +958,7 @@ async def test_option_b_create_enametoolong_allocates_capped_suffix(tmp_path, mo
     assert len(note_name.encode("utf-8")) <= 255
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_create_post_commit_cleanup_failure_does_not_allocate_again(tmp_path, monkeypatch):
     """A cleanup-only ENAMETOOLONG leaves one committed candidate and no suffix note."""
@@ -931,6 +1012,7 @@ async def test_option_b_create_post_commit_cleanup_failure_does_not_allocate_aga
     assert not list(note_dir.glob(".reme-*.create.tmp"))
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_recovers_after_malformed_day_index_is_repaired(tmp_path, monkeypatch):
     """A derived-index parse failure does not force protected model replay."""
@@ -995,6 +1077,7 @@ async def test_option_b_recovers_after_malformed_day_index_is_repaired(tmp_path,
     assert note.read_text(encoding="utf-8").count("The protected recovery fact.") == 1
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_recovery_scans_prior_daily_directory_before_appending(tmp_path, monkeypatch):
     """A receipt loss recovered after midnight does not invoke the model twice."""
@@ -1052,6 +1135,7 @@ async def test_option_b_recovery_scans_prior_daily_directory_before_appending(tm
     assert len(list((workspace / "daily").glob("**/cross-midnight.md"))) == 1
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_receipt_replays_after_append_only_source_growth(tmp_path, monkeypatch):
     """A lost acknowledgement remains replayable after the owned transcript grows."""
@@ -1104,6 +1188,7 @@ async def test_option_b_receipt_replays_after_append_only_source_growth(tmp_path
     assert len(list((workspace / "metadata/auto_memory_requests").rglob("*.json"))) == 1
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_receipt_rejects_changed_historical_source_prefix(tmp_path, monkeypatch):
     """A changed historical record is not accepted merely because the file also grew."""
@@ -1177,6 +1262,7 @@ def test_option_b_system_prompt_renders_literal_json_schema():
     assert "test-scope" in prompt
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 @pytest.mark.parametrize("forgery", ["marker", "receipt"])
 async def test_option_b_refuses_forged_prior_revision_before_model(tmp_path, monkeypatch, forgery):
@@ -1229,6 +1315,7 @@ async def test_option_b_refuses_forged_prior_revision_before_model(tmp_path, mon
     assert note_path.read_bytes() == before
 
 
+@_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 async def test_option_b_orphaned_marker_cannot_be_superseded_without_receipt(tmp_path, monkeypatch):
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
@@ -1613,14 +1700,14 @@ async def test_rejects_invalid_request_id_before_running_agent(tmp_path, request
 @pytest.mark.parametrize(
     ("tool_execution", "expected_success", "memory_hint"),
     [
-        (None, False, ""),
-        ([{"type": "tool_call", "name": "daily_write", "call_id": "c1"}], False, ""),
+        (None, True, ""),
+        ([{"type": "tool_call", "name": "daily_write", "call_id": "c1"}], True, ""),
         (
             [
                 {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
                 {"type": "tool_result", "name": "daily_write", "call_id": "wrong", "state": "success"},
             ],
-            False,
+            True,
             "",
         ),
         (
@@ -1630,7 +1717,7 @@ async def test_rejects_invalid_request_id_before_running_agent(tmp_path, request
                 {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
                 {"type": "tool_result", "name": "daily_write", "call_id": "c2", "state": "error"},
             ],
-            False,
+            True,
             "",
         ),
         (
@@ -1638,22 +1725,22 @@ async def test_rejects_invalid_request_id_before_running_agent(tmp_path, request
                 {"type": "tool_call", "name": "daily_write", "call_id": "c1"},
                 {"type": "tool_result", "name": "daily_write", "call_id": "c1", "state": "success"},
             ],
-            False,
+            True,
             "",
         ),
         ([], True, ""),
-        ([], False, "must remember this"),
+        ([], True, "must remember this"),
         ([], True, "   "),
     ],
 )
-async def test_auto_memory_receipt_requires_current_turn_evidence(
+async def test_default_auto_memory_receipt_keeps_upstream_reply_behavior(
     tmp_path,
     monkeypatch,
     tool_execution,
     expected_success,
     memory_hint,
 ):
-    """Real job execution must not acknowledge an unverified AgentScope turn."""
+    """The default job does not require Stage1 tool-evidence blocks."""
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -1683,8 +1770,8 @@ async def test_auto_memory_receipt_requires_current_turn_evidence(
 
 
 @pytest.mark.asyncio
-async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, monkeypatch):
-    """A forged note after an apparently successful tool result remains retryable."""
+async def test_default_auto_memory_receipt_does_not_inject_provenance(tmp_path, monkeypatch):
+    """Default notes remain on the upstream schema without a source hash."""
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -1699,7 +1786,6 @@ async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, mon
         note_file.write_text(
             "---\nname: forged-note\nsession_id: synthetic-session\n"
             "source_conversation: '[[session/dialog/synthetic-session.jsonl]]'\n"
-            "source_hash: {algorithm: sha256, format: hex, value: deadbeef}\n"
             "---\nsynthetic fact\n",
             encoding="utf-8",
         )
@@ -1725,14 +1811,15 @@ async def test_provenance_mismatch_does_not_create_success_receipt(tmp_path, mon
             messages=[{"id": "m1", "name": "user", "role": "user", "content": "Synthetic fact."}],
             date="2026-10-21",
         )
-    assert not response.success
-    assert "provenance verification failed" in response.answer
-    assert not list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+    assert response.success
+    assert list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
+    saved = frontmatter.loads(note_file.read_text(encoding="utf-8"))
+    assert "source_hash" not in saved.metadata
 
 
 @pytest.mark.asyncio
-async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeypatch):
-    """A cached success cannot acknowledge a deleted or altered durable note."""
+async def test_default_receipt_replay_does_not_require_provenance(tmp_path, monkeypatch):
+    """Default replay does not quarantine a valid completed note on Stage1 evidence."""
     from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
     from reme.config import resolve_app_config
 
@@ -1776,12 +1863,15 @@ async def test_receipt_replay_rejects_tampered_note_provenance(tmp_path, monkeyp
         assert list((workspace / "metadata" / "auto_memory_requests").rglob("*.json"))
         initial_model_calls = len(calls)
         saved = frontmatter.loads(note.read_text(encoding="utf-8"))
-        assert saved.metadata.get("source_hash")
-        saved.metadata["source_hash"]["value"] = "0" * 64
+        assert "source_hash" not in saved.metadata
+        saved.metadata["source_hash"] = {
+            "algorithm": "sha256",
+            "format": "hex",
+            "value": "0" * 64,
+        }
         note.write_text(frontmatter.dumps(saved), encoding="utf-8")
         repeated = await app.run_job("auto_memory", **job_kwargs)
-        assert not repeated.success
-        assert "provenance" in repeated.answer
+        assert repeated.success
         assert len(calls) == initial_model_calls
 
 
@@ -1801,11 +1891,21 @@ async def test_auto_memory_repair_cannot_claim_foreign_session_note(tmp_path, mo
         "---\nForeign content.\n"
     )
     note.write_text(original, encoding="utf-8")
-    config_path = Path(__file__).resolve().parents[2] / "reme/config/default.yaml"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
     config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
 
     async def no_tool_reply(_self, _inputs, **_kwargs):
-        return {"result": "done", "tool_execution": [], "last_message": {"content": [{"type": "text", "text": "done"}]}}
+        return {
+            "result": json.dumps(
+                {
+                    "path": note_path,
+                    "name": "existing",
+                    "description": "updated protected fact",
+                    "content": "Updated protected content.",
+                },
+            ),
+            "tool_execution": [],
+        }
 
     async def find_foreign(_self, _day, _session_id):
         return {"path": note_path}

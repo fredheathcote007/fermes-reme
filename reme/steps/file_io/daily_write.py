@@ -10,7 +10,7 @@ from ._daily_index import parse_daily_date, refresh_day_index, validate_session_
 from ._path import resolve_path, validate_filename_component
 from ._provenance import ProvenanceError, note_owned_by_session, trusted_provenance
 
-_RESERVED_METADATA_KEYS = {"name", "description", "session_id", "source_conversation", "source_hash"}
+_RESERVED_METADATA_KEYS = {"name", "description", "session_id", "source_conversation"}
 
 
 @R.register("daily_write_step")
@@ -95,7 +95,7 @@ class DailyWriteStep(_FileIOStep):
         if path_error or target is None:
             self._fail(path_error or "invalid daily note path", path=path)
             return self.context.response
-        if target.is_file():
+        if trusted_session is not None and target.is_file():
             try:
                 import frontmatter
 
