@@ -1045,9 +1045,12 @@ class AutoMemoryStep(BaseStep):
                 continue
             # A complete inline fence can contain a real fact: retain its
             # inner content rather than discard the whole line as a marker.
-            inline_fence = re.fullmatch(r"(`{3,}|~{3,})(.*?)\1", stripped)
-            if inline_fence:
-                stripped = inline_fence.group(2).strip()
+            marker = stripped[0] if stripped and stripped[0] in "`~" else ""
+            leading = len(stripped) - len(stripped.lstrip(marker)) if marker else 0
+            trailing = len(stripped) - len(stripped.rstrip(marker)) if marker else 0
+            fence_width = min(leading, trailing)
+            if fence_width >= 3 and len(stripped) >= 2 * fence_width:
+                stripped = stripped[fence_width:-fence_width].strip()
                 if not stripped:
                     continue
             # Separate opening/closing fences may have language tags or attributes.
@@ -1216,11 +1219,11 @@ class AutoMemoryStep(BaseStep):
         content = proposal["content"]
         if validate_filename_component(name, kind="name") or not description.strip():
             raise RuntimeError("protected proposal has invalid name or description")
-        if self._is_empty_option_b_content(content):
-            raise RuntimeError("protected proposal contained no substantive memory content")
         body = content if content.endswith("\n") else content + "\n"
         if len(body.encode("utf-8")) > self.max_file_bytes():
             raise RuntimeError("protected proposal exceeds the file byte limit")
+        if self._is_empty_option_b_content(content):
+            raise RuntimeError("protected proposal contained no substantive memory content")
         if created:
             expected_path = self._daily_note_path(day, name)
         elif proposal["path"] != note_path:

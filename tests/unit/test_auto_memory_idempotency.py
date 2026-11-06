@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -674,6 +675,15 @@ async def test_protected_empty_turn_has_idempotent_noop_receipt_without_commit_o
     assert not list(tmp_path.rglob("dialog/*.jsonl"))
 
 
+@pytest.mark.parametrize("marker", ["`", "~"])
+def test_option_b_inline_fence_scan_remains_linear(marker):
+    """Adversarial unmatched fence runs must not stall the event loop."""
+    content = marker * 65536 + "a" + marker * 65536 + "b"
+    start = time.perf_counter()
+    assert AutoMemoryStep._is_empty_option_b_content(content) is False
+    assert time.perf_counter() - start < 2.0
+
+
 @_POSIX_DURABLE_COMMIT
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -779,6 +789,50 @@ async def test_option_b_rejects_template_only_proposal_but_commits_substantive_c
     if not accepted:
         assert "protected proposal contained no substantive memory content" in response.answer
     assert list((workspace / "session/dialog").rglob("*.jsonl"))
+
+
+@_POSIX_DURABLE_COMMIT
+@pytest.mark.asyncio
+async def test_option_b_checks_size_before_template_parser(tmp_path, monkeypatch):
+    """Reject oversized proposals before scanning the model's content."""
+    from reme.components.agent_wrapper.as_agent_wrapper import AsAgentWrapper
+    from reme.config import resolve_app_config
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+
+    async def proposal_reply(_self, _inputs, **_kwargs):
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/oversize.md",
+                    "name": "oversize",
+                    "description": "Oversized protected content",
+                    "content": "x" * 8192,
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    def unexpected_parser(_content):
+        raise AssertionError("size check must precede the template parser")
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
+    monkeypatch.setattr(AutoMemoryStep, "max_file_bytes", lambda _self: 4096)
+    monkeypatch.setattr(AutoMemoryStep, "_is_empty_option_b_content", staticmethod(unexpected_parser))
+    async with Application(**config) as app:
+        response = await app.run_job(
+            "auto_memory",
+            session_id="oversize-session",
+            messages=[{"id": "m1", "name": "user", "role": "user", "content": "fact"}],
+            date="2026-10-21",
+            request_id="oversize-request",
+        )
+    assert not response.success
+    assert "protected proposal exceeds the file byte limit" in response.answer
+    assert not list((workspace / "daily").rglob("*.md"))
+    assert not list((workspace / "metadata/auto_memory_requests").rglob("*.json"))
 
 
 @pytest.mark.asyncio
