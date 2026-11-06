@@ -45,11 +45,15 @@ class HttpReMeBackend:
         messages: list[dict[str, Any]],
         *,
         timeout: float,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Submit a completed turn through the HTTP action service."""
+        payload: dict[str, Any] = {"session_id": session_id, "messages": messages}
+        if request_id is not None:
+            payload["request_id"] = request_id
         return self._call(
             "auto_memory",
-            {"session_id": session_id, "messages": messages},
+            payload,
             timeout=timeout,
         )
 

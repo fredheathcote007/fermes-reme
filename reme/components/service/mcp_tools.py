@@ -20,6 +20,8 @@ def add_mcp_job(
         return False
 
     async def execute_tool(**kwargs):
+        if "_provenance_session_id" in kwargs or "_provenance_session_id" in injected_job_kwargs:
+            raise ToolError("Reserved provenance context is unavailable through MCP tools")
         conflicts = sorted(injected_job_kwargs.keys() & kwargs.keys())
         if conflicts:
             names = ", ".join(conflicts)

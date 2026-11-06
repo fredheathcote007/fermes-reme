@@ -216,11 +216,19 @@ class HttpService(BaseService):
             raise ValueError(f"mcp_path conflicts with reserved HTTP path {path!r}")
         return path
 
+    @staticmethod
+    def _public_job_kwargs(request: Request) -> dict:
+        """Reject trusted internal context fields at the external HTTP boundary."""
+        payload = request.model_dump(exclude_none=True)
+        if "_provenance_session_id" in payload:
+            raise HTTPException(status_code=422, detail="Reserved internal job context cannot be supplied")
+        return payload
+
     def _add_json_job(self, job: BaseJob) -> None:
         """Register a job as POST /{job.name} returning a JSON Response."""
 
         async def endpoint(request: Request) -> Response:
-            return await job(**request.model_dump(exclude_none=True))
+            return await job(**self._public_job_kwargs(request))
 
         self.service.post(
             f"/{job.name}",
@@ -234,7 +242,7 @@ class HttpService(BaseService):
         async def endpoint(request: Request) -> StreamingResponse:
             stream_queue: asyncio.Queue = asyncio.Queue()
             task = asyncio.create_task(
-                job(stream_queue=stream_queue, **request.model_dump(exclude_none=True)),
+                job(stream_queue=stream_queue, **self._public_job_kwargs(request)),
             )
 
             async def body() -> AsyncGenerator[bytes, None]:

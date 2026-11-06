@@ -183,7 +183,7 @@ async def test_candidate_and_judge_start_with_native_settings(tmp_path, monkeypa
         monkeypatch.setattr(MobileMemAutoMemoryStep, "_list_session_note", AsyncMock(return_value=None))
         wrappers = candidate_app.context.components["agent_wrapper"]
         for wrapper in wrappers.values():
-            wrapper.reply = AsyncMock(return_value={"result": "answer"})
+            wrapper.reply = AsyncMock(return_value={"result": "answer", "tool_execution": []})
         _, scene = mobile_scene
         messages = mobilemem.session_messages(scene["sessions"][0], scene["image_root"])
         for images, kwargs in ((True, {}), (False, {"include_images": False})):

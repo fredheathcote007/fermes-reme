@@ -1,0 +1,87 @@
+# FHM-007 — ReMe Stage 1 model-tool contract qualification
+
+project_id: fermes-hermes
+
+Date: 2026-10-26 (Australia/Perth)
+Status: Draft PR evidence; **NOT** production acceptance, deployment, or approval to merge to main.
+
+## Failure and correction
+
+- Original real Qwen 3.5 4B / AgentScope calls submitted seven `daily_write` operations with empty `{}` inputs. ReMe stored no note and incorrectly acknowledged the Hermes journal.
+- Stage 1 declared `daily_write`, `read`, `write`, `edit` and `frontmatter_update` jobs without their JSON input parameters. The corrected local-only profile copies the existing upstream ReMe parameter contracts; it does not enable Dream, cron, HTTP serving, remote credentials, new vectors, or SQLite.
+- AgentScope's current-turn tool calls/results are now redacted to tool name, ID and state, explicitly bounded to the current reply. The ReMe acknowledgement path fails closed on unpaired, missing, invalid, unknown, duplicate and mixed-result durable operations, including when a partial side effect has occurred. Missing AgentScope execution summaries are not accepted as no-op success.
+- The provider retains its profile-local durable journal and stable request IDs. A fully observed no-tool turn can still be a legitimate no-op.
+
+## Evidence and results
+
+- Four focused suites, including AgentScope wrapper, idempotency, Hermes integration and synthetic file/BM25 capture: **101 passed**, exit 0; Project Coordinator private test log `/tmp/fhm007/integrated-final-tests.log`.
+- Five new job-level receipt tests: missing current-turn evidence, missing result, wrong call ID, mixed success/error, and genuine no-tool no-op; **5/5 passed** in the idempotency suite.
+- First actual model retest with the corrected Stage 1 schema and earlier correctness patch: **PASS**, Qwen 3.5 4B via authorised Dad-PC `10.1.1.50:1234`, Bubblewrap read-only root, two Markdown daily files, cleared journal, fresh-session BM25 retrieval containing synthetic marker and teal colour; exit 0. Evidence: `/tmp/fhm007/live-reme-capture-schema-contract.log`.
+- Post-review remediation actual model retest: **PASS**, same isolated model/provider path with a newly created test home and workspace, two durable Markdown daily files, one request receipt, zero pending journal lines, restart retrieval of `FHM007-amber-kite-824` and colour `teal`; `ACCEPTANCE True`, exit **0**. Evidence: `/tmp/fhm007/live-reme-capture-final-contract.log`; isolated workspace `/tmp/fhm007/live-model-sandbox-4`.
+- Written note includes `session_id` and `source_conversation` metadata linking to a synthetic session transcript. It does **not** include a cryptographically verifiable source-content hash.
+- The first Cursor independent review identified a P1 missing-summary fallback and P2 missing job-level test; both were remediated. The second independent Cursor review (private log `/tmp/fhm007/fhm007-cursor-second-review.log`) found no remaining P0/P1 blockers to **draft PR update**. Remaining P2 scope: model-created note attribution for weak models, non-AgentScope fallback, partial side effects on retry, and update-path job-level regressions. This review is not a merge or deployment approval.
+
+## Constraints and unresolved gates
+
+- All tests use synthetic data and an isolated test environment; no active Hermes install or production profiles were modified.
+- Dream, scheduler, proposed FHM-006 pre-compression checkpoint, SQLite/vector additions, Hindsight, and autonomous skill promotion remain disabled/deferred.
+- Production acceptance still requires provenance/retention/poisoning and workspace ownership validation, FHM-006 fail-closed checkpoint contract, arbitrary crash/partial-write recovery, operational security of LAN API, and any additional independent reviewer findings.
+- The observed successful real-model shutdown had no event-loop-closed exception, but failure-path asynchronous cleanup is not independently proven.
+- First full GitHub matrix for `1a5d54e` found 16 failures in older tests that mocked AgentScope replies without the new required `tool_execution` record. These test doubles have been updated to declare explicit no-tool or successful paired tool evidence without relaxing the production fail-closed gate. **180/180** affected and focused host tests PASS after correction (`/tmp/fhm007/ci-remediation-host-tests.log`).
+- The first Python quality check required trailing-comma/Black formatting and docstrings on new test fixture classes. Locally pinned `add-trailing-comma` and Black 26.5.1 with CI arguments now PASS. The baseline host `ruff` invocation remains non-authoritative (its failures also occur on `661a5ed`); full new GitHub quality and test matrix must pass before CI closure.
+- Keep ReMe PR #1 a **draft** and FHM-007 Issue #7 **OPEN P1**. No main merge or deployment without owner approval.
+
+## Rollback
+
+No production rollback is required because these changes have not been deployed. To abandon the draft changes, retain the protected upstream baseline `661a5ed` and do not promote the isolated branch. Never force-push away other workers' commits.
+
+## FHM-007 P2 follow-up checkpoint — 2026-10-26
+
+- AgentScope create operations now inject server-owned session_id. The model schema hides this parameter and conflicts fail rather than overriding ownership.
+- A successful daily_write without a note belonging to the requested session fails closed, preserving the queued turn and preventing a false receipt; a genuine no-tool no-op remains valid.
+- An existing-note failed edit has an explicit job-level negative regression test.
+- Internally owned OpenAI asynchronous clients are closed before shutdown; externally supplied clients are not closed by ReMe.
+- Combined host results: 102 focused adapter tests PASS, 33 LLM/component tests PASS, and four selected injection tests PASS. Optional Claude SDK-dependent test was not run locally.
+- Live model test on isolated Bubblewrap sandbox 5: two durable daily files; pending journal zero; new-session BM25 recalled FHM007-amber-kite-824 and teal; ACCEPTANCE True; exit 0. The model hit its six-iteration ceiling after writing; useful-memory acceptance still passed.
+- Still draft-only, NOT deployment or main merge approved. Pending full CI and independent review; source-hash provenance, FHM-006 checkpoint, arbitrary crash/replay and profile ownership controls remain separate acceptance gates.
+
+## Final Stage 1 patch assurance checkpoint (2026-10-26)
+
+- Final local CI-equivalent tests: 85 memory/provider tests PASS and 26 LLM lifecycle, wrapper and attribution tests PASS, both exit 0.
+- Session-ID schema hiding and rejection of a foreign model-supplied session ID is now regression-tested.
+- Failure-path unit test awaits a synthetic model call that raises, then verifies the internally owned async client closes; externally injected models remain borrowed.
+- Independent Cursor review: no P0 for the Stage 1 AgentScope/OpenAI path. P1 acceptance concern remains: a genuinely no-tool automatic-memory turn may acknowledge the spool without writing a note. This is compatible with the approved legitimate no-op policy but is not proof every explicit retention request will be stored.
+- Keep the draft PR unmerged and production unchanged. FHM-007 is still OPEN P1 pending retention-intent/no-op contract, cryptographic provenance, FHM-006 checkpoint, crash replay and workspace security gates.
+
+## 2026-10-27 — Full Python matrix follow-up
+
+- Commit 10ed292 CI exposed test-fixture drift in the image-memory suite: AgentScope now receives a trusted injected session_id, which older expected-call assertions omitted. Fixed the affected assertions; local image test suite 68/68 PASS.
+- Python quality also found W0212 in the newly added private injection-contract test. The test documents its deliberate protected-access exception. Other pre-commit hooks passed on 10ed292.
+- Require fresh complete GitHub CI on the follow-up commit. Keep PR draft-only and FHM-007 OPEN P1.
+
+
+## 2026-10-27 — Automatic-tagging tool schema qualification
+
+- Captured two separate AgentScope runs in isolated real Qwen 3.5 4B test sandbox 6. The memory-write agent finished in two iterations with one successful `daily_write`; the auto-tagging agent hit the six-iteration ceiling, including a failed `frontmatter_read` because the Stage 1 profile omitted its parameter schema.
+- Stage 1 configuration now includes upstream ReMe-compatible parameter contracts for `frontmatter_read` (required `path`) and `list_tags` (optional pagination/sort fields), keeping `enable_serve: false` and existing local-only restrictions.
+- Re-run in disposable sandbox 7: `frontmatter_read`, `list_tags` and `frontmatter_update` succeeded; daily note includes a `memory_tags` field; real model-generated note and fresh-session BM25 retrieval PASS, journal cleared, exit 0. The tagger **still reached the six-iteration limit** after successful tagging; this is a remaining model finalisation/efficiency issue, not evidence of failed note persistence.
+- Focused host tests **111/111 PASS** after the schema correction. This checkpoint is not deployment/merge approval, and requires independent review and new PR CI before promotion.
+
+
+## Stage 1 embedded configuration and workspace ownership guard (2026-10-27)
+
+- **Default restricted profile:** Embedded Hermes now selects `reme_config: fermes-hermes-stage1` by default. Its CLI-only, local model, approved job/step and component allowlists are checked on config load and again on provider initialisation. An upstream `default` or customised profile is rejected unless the operator deliberately sets `allow_custom_config: true` in profile-local JSON. This break-glass bypass may enable network services or unattended jobs and is NOT a qualified Stage 1 deployment profile. The HTTP mode remains separately unqualified for Stage 1.
+- **Workspace identity:** Embedded workspaces persist private `.hermes-reme-owner.json` with the canonical Hermes profile owner. Different profiles using the same workspace, symlinked roots/markers, insecure marker permissions, and nonempty unowned legacy workspaces fail closed. Marker survives restart and crash. Same-profile concurrent writers are still governed by the existing writer lock. This metadata is not an authentication signature; local filesystem permissions remain the trust foundation.
+- **Migration:** The new guard deliberately stops an existing embedded profile using `reme_config: default` or a populated workspace without ownership metadata. Do not delete or overwrite old memory/marker as a quick workaround. First make a verified backup, identify the original Hermes profile, inspect source notes for appropriate ownership, create a fresh private per-profile Stage 1 workspace, and migrate only reviewed data through a separately tested procedure. No automatic legacy workspace claim has been approved.
+- **Validation:** Independent read-only Cursor reviews `/tmp/fhm007/config-guard-review-27.log`, `/tmp/fhm007/config-guard-final-review-27.log`; focused provider/capture tests **66 passed**, configuration/ownership subset **20 passed**, Black formatting **PASS**, source whitespace **PASS**. No production or active Hermes change. Full GitHub CI is required at the eventual commit; do not confuse previous `3a2be24` green workflows with this new source.
+- **Residual:** HTTP service trust, user-intent retention, source provenance, FHM-006 pre-compaction and arbitrary crash-window replay remain separate P1 or acceptance gates; no merge/deployment approval inferred.
+
+
+## 2026-10-27 — Trusted transcript provenance combined pre-merge qualification
+
+- Source branch `fermes/fhm007-provenance-integration-20261027` is rebased by additive patch onto already green `f5421d7` Stage 1 configuration/workspace guard, isolated from the PR and active Hermes installation.
+- **Protected embedded auto-memory path:** trusted scoped session reference and SHA-256 of the exact saved transcript bytes are attached to a note and checked before a success receipt. Model-supplied `session_id`, `source_conversation`, and `source_hash` are replaced for protected tool calls, with injected arguments hidden from the model. Direct file tools without trusted injection preserve upstream compatibility and do not claim source-hash assurance.
+- Model-free host regression: **225 focused tests PASS**, excluding one locally unavailable optional Claude SDK test. Additional negative Application job test: simulated successful `daily_write` with forged `source_hash` returns failure and produces **no request receipt**. Tests verify transcript mutation invalidates the note hash, foreign ownership is rejected, symlinked transcript is rejected, and empty-message no-op still works. Image-specific fixtures that mock all provenance stamping explicitly mock the verifier only within those isolated tests.
+- Real Qwen 3.5 4B via authorised Dad-PC LM Studio API inside disposable read-only-root Bubblewrap sandbox `/tmp/fhm007/live-model-sandbox-9`: two daily files including substantive synthetic note with source hash, pending Hermes spool zero, new-session BM25 retrieved expected synthetic marker `FHM007-amber-kite-824` and colour `teal`; `ACCEPTANCE True`, exit 0. Script explicitly uses custom test-only model-endpoint override; production defaults remain restricted.
+- Review: `/tmp/fhm007/prov-combined-review.log`. Findings: injected provenance anti-forgery appears sound; source hash is a **non-authenticating integrity digest**, not a cryptographic signature. Remaining **main-merge/production risks** include current-turn prompt poisoning, transcript/hash drift after later writes, idempotent receipt replay after tamper, time-of-check races, arbitrary crash-window replay, FHM-006 checkpoint and explicit Hermes retention intent contract. The current Stage 1 code must not be represented as production-qualified or fully self-learning.
+- This branch requires final full GitHub CI and owner-approved main-merge decision. Keep ReMe PR #1 DRAFT and FHM-007 OPEN P1. No production deployment or main merge performed.

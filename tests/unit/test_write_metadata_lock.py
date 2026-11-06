@@ -94,6 +94,27 @@ async def test_write_metadata_reserved_keys_ignored():
 
 
 @pytest.mark.asyncio
+async def test_write_metadata_drops_none_values():
+    """``None`` metadata values are omitted from serialized frontmatter."""
+
+    with tempfile.TemporaryDirectory() as tmp, temp_chdir(tmp):
+        store = await _make_store()
+        resp = await _write(
+            store,
+            path="note.md",
+            name="N",
+            description="D",
+            content="body",
+            metadata={"kept": "yes", "empty": None},
+        )
+        assert resp.success is True, resp
+        post = frontmatter.loads((Path(tmp) / "note.md").read_text(encoding="utf-8"))
+        assert post.metadata["kept"] == "yes"
+        assert "empty" not in post.metadata
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_write_no_metadata_preserves_legacy_shape():
     """No ``metadata`` arg → frontmatter still contains only name/description."""
 

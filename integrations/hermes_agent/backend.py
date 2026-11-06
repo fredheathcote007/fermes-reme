@@ -32,8 +32,14 @@ class ReMeBackend(Protocol):
         messages: list[dict[str, Any]],
         *,
         timeout: float,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
-        """Record and extract memory from one completed turn."""
+        """Record and extract memory from one completed turn.
+
+        ``request_id`` is the durable Hermes spool record ID.  Backends may
+        omit it only when talking to an older ReMe service that has no
+        idempotent request field yet.
+        """
 
     def close(self, *, timeout: float) -> None:
         """Release resources within a bounded interval."""

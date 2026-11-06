@@ -219,6 +219,16 @@ async def test_auto_memory_update_scopes_tools_to_exact_note_path(tmp_path, monk
     monkeypatch.setattr(step, "_list_session_note", existing_note)
     monkeypatch.setattr("reme.steps.evolve.auto_memory.refresh_day_index", no_index)
 
+    async def stamp_source(_path, _scope, _image_sources):
+        import frontmatter
+        from reme.steps.file_io._provenance import trusted_provenance
+
+        post = frontmatter.loads(note_file.read_text(encoding="utf-8"))
+        post.metadata.update(trusted_provenance(tmp_path, "session", session_id))
+        note_file.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    monkeypatch.setattr(step, "_ensure_session_frontmatter", stamp_source)
+
     await step(
         session_id=session_id,
         messages=[{"name": "user", "role": "user", "content": "hi again", "created_at": "2025-06-01T11:00:00"}],
@@ -227,6 +237,13 @@ async def test_auto_memory_update_scopes_tools_to_exact_note_path(tmp_path, monk
     assert step.context.response.success is True
     assert wrapper.calls[0]["job_tools"] == ["read", "edit", "frontmatter_update", "write"]
     assert wrapper.calls[0]["injected_job_kwargs"] == {"_allowed_paths": [note_path]}
+
+
+def test_auto_memory_provenance_is_opt_in_to_durable_commit():
+    wrapper = _RecordingWrapper(name="fake", backend="agentscope")
+
+    assert not AutoMemoryStep(agent_wrapper=wrapper)._provenance_enabled()
+    assert AutoMemoryStep(agent_wrapper=wrapper, durable_commit=True)._provenance_enabled()
 
 
 def test_auto_memory_keeps_original_tool_names():
@@ -267,3 +284,84 @@ def test_configs_define_original_jobs_without_daily_variants():
         {"backend": "auto_memory_cc_step"},
         {"backend": "auto_tag_step"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_agentscope_memory_create_injects_session_ownership(tmp_path, monkeypatch):
+    """The default job keeps the upstream tool invocation contract."""
+    monkeypatch.chdir(tmp_path)
+    wrapper = _RecordingWrapper(name="fake", backend="agentscope")
+    step = await _auto_memory_step(wrapper)
+
+    async def no_note(_day, _session_id):
+        return None
+
+    async def no_tools_reply(_inputs, **kwargs):
+        wrapper.calls.append(kwargs)
+        return {"last_message": {}, "result": "no-op", "tool_execution": []}
+
+    monkeypatch.setattr(step, "_list_session_note", no_note)
+    monkeypatch.setattr(wrapper, "reply", no_tools_reply)
+    await step(
+        session_id="owned-session",
+        messages=[
+            {
+                "name": "user",
+                "role": "user",
+                "content": "calibration",
+                "created_at": "2025-06-01T10:00:00",
+            },
+        ],
+    )
+    assert step.context.response.success
+    assert "injected_job_kwargs" not in wrapper.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_agentscope_memory_update_does_not_ack_failed_edit(tmp_path, monkeypatch):
+    """Default auto_memory does not require Stage1 tool-evidence blocks."""
+    monkeypatch.chdir(tmp_path)
+    wrapper = _RecordingWrapper(name="fake", backend="agentscope")
+    step = await _auto_memory_step(wrapper)
+    note_path = "daily/2025-06-01/existing-note.md"
+    note_file = tmp_path / note_path
+    note_file.parent.mkdir(parents=True)
+    note_file.write_text(
+        "---\nsession_id: sess-1\nsource_conversation: '[[session/dialog/sess-1.jsonl]]'\n"
+        "name: existing-note\ndescription: existing\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    async def existing_note(_day, _session_id):
+        return {"path": note_path, "session_id": "sess-1"}
+
+    async def failed_update(_inputs, **kwargs):
+        wrapper.calls.append(kwargs)
+        return {
+            "last_message": {},
+            "result": "done",
+            "tool_execution": [
+                {"type": "tool_call", "name": "edit", "call_id": "c1"},
+                {"type": "tool_result", "name": "edit", "call_id": "c1", "state": "error"},
+            ],
+        }
+
+    monkeypatch.setattr(step, "_list_session_note", existing_note)
+    monkeypatch.setattr(wrapper, "reply", failed_update)
+    await step(
+        session_id="sess-1",
+        messages=[
+            {
+                "name": "user",
+                "role": "user",
+                "content": "change",
+                "created_at": "2025-06-01T11:00:00",
+            },
+        ],
+        memory_hint="already-known fact",
+    )
+    assert step.context.response.success
+    assert step.context.response.answer == "done"
+    assert "retry" not in step.context.response.answer
+    assert wrapper.calls[0]["injected_job_kwargs"]["_allowed_paths"] == [note_path]
+    assert not list((tmp_path / "metadata" / "auto_memory_requests").rglob("*.json"))

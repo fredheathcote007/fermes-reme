@@ -98,3 +98,44 @@ def test_explicit_model_assignment_preserves_injection():
     llm.model = model
     assert llm.model is model
     llm.credential_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_owned_openai_client_closes_after_failed_call():
+    """A failed model operation must not leave client cleanup until loop GC."""
+    from reme.components.as_llm import OpenAIAsLLM
+
+    llm = OpenAIAsLLM(backend="openai", model="synthetic")
+    model_cls = Mock()
+    model_cls.return_value.client.close = AsyncMock()
+    model_cls.return_value.call = AsyncMock(side_effect=ConnectionError("synthetic"))
+    credential_cls = Mock()
+    credential_cls.return_value.get_chat_model_class.return_value = model_cls
+    llm.credential_cls = credential_cls
+    await llm.start()
+    try:
+        model = llm.model
+        with pytest.raises(ConnectionError, match="synthetic"):
+            await model.call("synthetic", [])
+        assert model is model_cls.return_value
+    finally:
+        await llm.close()
+    model_cls.return_value.client.close.assert_awaited_once_with()
+    assert llm._model is None
+    await llm.close()
+    model_cls.return_value.client.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_injected_openai_client_is_borrowed():
+    """The component must not close externally supplied model clients."""
+    from reme.components.as_llm import OpenAIAsLLM
+
+    llm = OpenAIAsLLM(backend="openai", model="synthetic")
+    model = Mock()
+    model.client.close = AsyncMock()
+    llm.model = model
+    await llm.start()
+    await llm.close()
+    model.client.close.assert_not_awaited()
+    assert llm._model is model
