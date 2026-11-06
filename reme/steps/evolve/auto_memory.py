@@ -1033,6 +1033,50 @@ class AutoMemoryStep(BaseStep):
                 results[call_id] = (name, state)
         return set(calls) == set(results) and all(state in _SUCCESSFUL_TOOL_STATES for _, state in results.values())
 
+    @staticmethod
+    def _is_empty_option_b_content(content: str) -> bool:
+        """Reject recognised empty templates, not arbitrary model paraphrases."""
+        lines = []
+        for raw_line in content.splitlines():
+            stripped = raw_line.strip()
+            # Structural Markdown can contain ASCII punctuation such as table
+            # alignment colons and empty checkboxes, but not memory facts.
+            if not stripped or (stripped.isascii() and not any(char.isalnum() for char in stripped)):
+                continue
+            # A complete inline fence can contain a real fact: retain its
+            # inner content rather than discard the whole line as a marker.
+            marker = stripped[0] if stripped and stripped[0] in "`~" else ""
+            leading = len(stripped) - len(stripped.lstrip(marker)) if marker else 0
+            trailing = len(stripped) - len(stripped.rstrip(marker)) if marker else 0
+            fence_width = min(leading, trailing)
+            if fence_width >= 3 and len(stripped) >= 2 * fence_width:
+                stripped = stripped[fence_width:-fence_width].strip()
+                if not stripped:
+                    continue
+            # Separate opening/closing fences may have language tags or attributes.
+            elif re.fullmatch(r"`{3,}[^`]*|~{3,}[^~]*", stripped):
+                continue
+            # Unicode-aware: preserving non-Latin letters and digits avoids
+            # treating valid multilingual memories as empty proposals.
+            normalised_line = re.sub(r"[\W_]+", " ", stripped.casefold()).strip()
+            if re.fullmatch(r"(?:daily )?(?:notes?|entries|entry)(?: \d{4} \d{1,2} \d{1,2})?", normalised_line):
+                continue
+            # A meaningful emoji/symbol-only memory is not an empty template.
+            lines.append(normalised_line or raw_line.strip())
+        if not lines:
+            return True
+        body = " ".join(lines)
+        if body in {"placeholder", "template", "tbd", "t b d", "todo", "to do", "none", "n a", "no new information"}:
+            return True
+        return bool(
+            re.fullmatch(
+                r"(?:this is (?:a|an) )?placeholder for (?:the )?"
+                r"(?:today s |todays )?(?:daily )?(?:notes?|entries|entry)"
+                r"(?: capturing any relevant information and observations(?: for the day)?)?",
+                body,
+            ),
+        )
+
     async def _recover_or_validate_option_b_note(
         self,
         *,
@@ -1179,6 +1223,8 @@ class AutoMemoryStep(BaseStep):
         body = content if content.endswith("\n") else content + "\n"
         if len(body.encode("utf-8")) > self.max_file_bytes():
             raise RuntimeError("protected proposal exceeds the file byte limit")
+        if self._is_empty_option_b_content(content):
+            raise RuntimeError("protected proposal contained no substantive memory content")
         if created:
             expected_path = self._daily_note_path(day, name)
         elif proposal["path"] != note_path:
