@@ -1066,11 +1066,12 @@ class AutoMemoryStep(BaseStep):
         if not lines:
             return True
         body = " ".join(lines)
-        if body in {"placeholder", "template", "tbd", "todo", "none", "n a", "no new information"}:
+        if body in {"placeholder", "template", "tbd", "t b d", "todo", "to do", "none", "n a", "no new information"}:
             return True
         return bool(
             re.fullmatch(
-                r"(?:this is (?:a|an) )?placeholder for (?:the )?(?:today s )?(?:daily )?(?:notes?|entries|entry)"
+                r"(?:this is (?:a|an) )?placeholder for (?:the )?"
+                r"(?:today s |todays )?(?:daily )?(?:notes?|entries|entry)"
                 r"(?: capturing any relevant information and observations(?: for the day)?)?",
                 body,
             ),
