@@ -1233,20 +1233,19 @@ def test_backend_unavailable_result_is_backed_off_without_attempt_budget(monkeyp
     assert pending.read_text(encoding="utf-8") == ""
 
 
-def test_quarantine_repairs_torn_line_and_does_not_duplicate_after_cleanup_failure(monkeypatch, tmp_path):
+def test_quarantine_torn_line_halts_without_repair_or_duplicate(monkeypatch, tmp_path):
     provider = ReMeMemoryProvider()
     provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
     record = provider._append_pending_write({"session_id": "s", "messages": []})
     quarantine = provider._pending_path.parent / "quarantined-writes.jsonl"
     quarantine.parent.mkdir(parents=True, exist_ok=True)
     quarantine.write_text('{"id":"older","reason":"permanent_refusal"}', encoding="utf-8")
-    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record_id: False)
+    monkeypatch.setattr(provider, "_remove_pending_write", lambda _record: False)
 
-    assert provider._quarantine_pending_write(record, "permanent_refusal") is True
-    assert provider._quarantine_pending_write(record, "permanent_refusal") is True
-    entries = [json.loads(line) for line in quarantine.read_text(encoding="utf-8").splitlines()]
-    assert entries[0]["id"] == "older"
-    assert [entry["id"] for entry in entries].count(record["id"]) == 1
+    before = quarantine.read_bytes()
+    assert provider._quarantine_pending_write(record, "permanent_refusal") is False
+    assert provider._journal_state == "HALTED_CORRUPT"
+    assert quarantine.read_bytes() == before
     assert provider._pending_path.read_text(encoding="utf-8").strip()
 
 

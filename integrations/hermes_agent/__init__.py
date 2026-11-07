@@ -1,5 +1,9 @@
 """Hermes Agent memory provider backed by HTTP or an embedded ReMe SDK."""
 
+# Keep the existing security-sensitive journal state machine intact in Stage 2A.
+# Follow-up modularisation is separate from this source-only safety correction.
+# pylint: disable=C0302,R0911
+
 from __future__ import annotations
 
 import atexit
@@ -24,16 +28,24 @@ from .backend import ReMeBackend, ReMeBackendError, spawn_profile_thread
 from .config import (
     ReMeConfig,
     ReMeConfigError,
+    STAGE1_CONFIG_NAME,
     _validate_embedded_policy,
     load_config,
     save_config,
 )
 from .embedded_backend import EmbeddedReMeBackend
 from .http_backend import HttpReMeBackend
-from .retry_policy import is_permanent_write_failure as _is_permanent_write_failure
+from .retry_policy import classify_write_failure as _classify_write_failure
+from .retry_policy import is_permanent_write_failure as _is_permanent_write_failure  # noqa: F401
 from .turn_payload import build_turn_payload as _build_turn_payload
 from .turn_payload import upgrade_legacy_payload as _upgrade_legacy_payload
 from .turn_payload import valid_pending_record as _valid_pending_record
+from .turn_payload import (
+    MAX_JOURNAL_BYTES as _MAX_JOURNAL_BYTES,
+    MAX_JOURNAL_LINE_BYTES as _MAX_JOURNAL_LINE_BYTES,
+    MAX_JOURNAL_RECORDS as _MAX_JOURNAL_RECORDS,
+    MAX_RECORD_JSON_BYTES as _MAX_RECORD_JSON_BYTES,
+)
 from .turn_payload import scoped_session_id
 from .write_queue import RetryWakeup, rebuild_write_queue_locked
 from .durability import (
@@ -41,6 +53,7 @@ from .durability import (
     _fsync_directory as _durability_fsync_directory,
     _fsync_file as _durability_fsync_file,
     _is_reparse_point as _durability_is_reparse_point,
+    _safe_existing_path_components as _durability_safe_existing_path_components,
     _is_unsafe_link as _durability_is_unsafe_link,
     _owned_by_current_user as _durability_owned_by_current_user,
     _safe_staging_mode as _durability_safe_staging_mode,
@@ -70,6 +83,7 @@ def _is_windows_platform() -> bool:
 _fsync_directory = _durability_fsync_directory
 _fsync_file = _durability_fsync_file
 _is_reparse_point = _durability_is_reparse_point
+_safe_existing_path_components = _durability_safe_existing_path_components
 _is_unsafe_link = _durability_is_unsafe_link
 _owned_by_current_user = _durability_owned_by_current_user
 _safe_staging_mode = _durability_safe_staging_mode
@@ -357,6 +371,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._retry_wakeup = RetryWakeup(self)
         self._retry_wakeup_pending, self._writer_starting, self._pending_generation = False, False, 0
         self._pending_path: Path | None = None
+        self._profile_root: Path | None = None
         self._legacy_created_at_by_record: dict[tuple[Path, str], str] = {}
         self._profile_lock: _ProfileWriterLock | None = None
         self._workspace_owner: _WorkspaceOwnerMarker | None = None
@@ -364,9 +379,11 @@ class ReMeMemoryProvider(MemoryProvider):
         self._backend_lock = threading.RLock()
         self._shutdown_started = False
         self._deferred_backend_close = False
+        self._backend_cleanup_pending = False
         self._atexit_registered = False
         self._recall_status: RecallStatus | None = None
         self._unavailable_reason = ""
+        self._journal_state = "READY"
 
     @property
     def name(self) -> str:
@@ -403,7 +420,6 @@ class ReMeMemoryProvider(MemoryProvider):
                 raise RuntimeError(
                     "Cannot reinitialize ReMe while its previous writer is still running",
                 )
-        self._profile_lock_required = False
         hermes_home = str(kwargs.get("hermes_home") or "") or None
         if hermes_home is None:
             self._disable_without_profile(session_id, kwargs.get("agent_identity"))
@@ -413,9 +429,14 @@ class ReMeMemoryProvider(MemoryProvider):
             config = load_config(hermes_home)
         except ReMeConfigError as exc:
             with self._backend_lock:
-                self._close_backend_locked()
+                if not self._close_backend_locked():
+                    self._accept_writes = False
+                    self._unavailable_reason = "previous ReMe backend cleanup is still pending"
+                    return
             self._release_profile_lock()
             self._release_workspace_owner()
+            self._profile_lock_required = False
+            self._profile_root = profile_home
             self._config = None
             self._backend_label = "invalid configuration"
             self._session_id = str(session_id or "")
@@ -429,9 +450,14 @@ class ReMeMemoryProvider(MemoryProvider):
             return
 
         with self._backend_lock:
-            self._close_backend_locked()
+            if not self._close_backend_locked():
+                self._accept_writes = False
+                self._unavailable_reason = "previous ReMe backend cleanup is still pending"
+                return
         self._release_profile_lock()
         self._release_workspace_owner()
+        self._profile_lock_required = False
+        self._profile_root = profile_home
         try:
             if config.mode == "embedded":
                 if _is_windows_platform():
@@ -466,7 +492,10 @@ class ReMeMemoryProvider(MemoryProvider):
         self._pending_path = pending_path
         self._profile_lock_required = True
         try:
-            profile_lock = _ProfileWriterLock(profile_home / _PENDING_QUEUE_DIRECTORY / _PROFILE_LOCK_FILENAME)
+            profile_lock = _ProfileWriterLock(
+                profile_home / _PENDING_QUEUE_DIRECTORY / _PROFILE_LOCK_FILENAME,
+                trusted_root=profile_home,
+            )
             profile_lock.acquire()
         except OSError as exc:
             self._config = None
@@ -521,6 +550,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._next_write_attempt = 0.0
         self._last_write_failure_kind = ""
         self._accept_writes = True
+        self._journal_state = "READY"
         self._write_queue = queue.Queue()
         self._queued_record_ids = set()
         self._retry_timers = set()
@@ -528,6 +558,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._write_thread = None
         self._shutdown_started = False
         self._deferred_backend_close = False
+        self._backend_cleanup_pending = False
         self._recall_status = None
         if not self._atexit_registered:
             atexit.register(self._atexit_shutdown)
@@ -774,14 +805,15 @@ class ReMeMemoryProvider(MemoryProvider):
         """Drain queued writes, then close the backend within a bounded interval."""
         deadline = time.monotonic() + self._shutdown_timeout
         with self._write_thread_lock:
-            if self._shutdown_started:
-                return
-            self._shutdown_started = True
-            self._accept_writes = False
+            already_started = self._shutdown_started
+            if not already_started:
+                self._shutdown_started = True
+                self._accept_writes = False
+                self._journal_state = "SHUTDOWN"
             thread = self._write_thread
             self._retry_wakeup.cancel_locked()
             self._retry_wakeup_pending = False
-            if thread is not None:
+            if thread is not None and not already_started:
                 self._write_queue.put(None)
         if thread is not None:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -799,10 +831,11 @@ class ReMeMemoryProvider(MemoryProvider):
             timeout=max(0.0, deadline - time.monotonic()),
         ):
             try:
-                self._close_backend_locked(
+                closed = self._close_backend_locked(
                     timeout=max(0.0, deadline - time.monotonic()),
                 )
-                self._finish_deferred_backend_close_locked()
+                if closed:
+                    self._finish_deferred_backend_close_locked()
             finally:
                 self._backend_lock.release()
         else:
@@ -829,7 +862,7 @@ class ReMeMemoryProvider(MemoryProvider):
             # journal acknowledgement, queue bookkeeping, and task_done all
             # finish. In particular, do not release from the writer's own
             # _record_payload finally block before _remove_pending_write.
-            if self._write_thread is not None:
+            if self._write_thread is not None or self._backend is not None or self._backend_cleanup_pending:
                 return False
             self._release_profile_lock()
             self._release_workspace_owner()
@@ -861,7 +894,11 @@ class ReMeMemoryProvider(MemoryProvider):
 
     def _enqueue_write(self, payload: dict[str, Any]) -> bool:
         with self._write_thread_lock:
-            if not self._accept_writes:
+            if not self._accept_writes or self._journal_state != "READY":
+                return False
+            if self._pending_path is None or self._read_pending_writes() is None:
+                if self._journal_state != "HALTED_IO":
+                    self._set_journal_halted("HALTED_CORRUPT")
                 return False
             try:
                 record = self._append_pending_write(payload)
@@ -882,8 +919,11 @@ class ReMeMemoryProvider(MemoryProvider):
                 )
             self._accept_writes = False
         with self._backend_lock:
-            self._close_backend_locked()
+            if not self._close_backend_locked():
+                return
         self._release_profile_lock()
+        self._profile_lock_required = False
+        self._profile_root = None
         self._config = None
         self._backend_label = "missing Hermes profile"
         self._session_id = str(session_id or "")
@@ -891,6 +931,7 @@ class ReMeMemoryProvider(MemoryProvider):
         self._pending_path = None
         self._release_workspace_owner()
         self._backend_available = False
+        self._backend_cleanup_pending = False
         self._recall_status = None
         self._unavailable_reason = "hermes_home is required for profile-scoped ReMe state"
         logger.warning("ReMe provider is unavailable because Hermes supplied no hermes_home")
@@ -900,6 +941,8 @@ class ReMeMemoryProvider(MemoryProvider):
         with self._write_thread_lock:
             if self._write_thread is not None or self._writer_starting:
                 return
+            if self._journal_state in {"HALTED_CORRUPT", "SHUTDOWN"}:
+                return
             if time.monotonic() < self._next_write_attempt:
                 if self._retry_wakeup_pending:
                     self._retry_wakeup.arm_locked()
@@ -907,7 +950,19 @@ class ReMeMemoryProvider(MemoryProvider):
             self._writer_starting = True
             generation = self._pending_generation
         try:
+            if not self._reconcile_durable_state():
+                with self._write_thread_lock:
+                    if self._journal_state in {"QUARANTINE_CLEANUP", "HALTED_IO"} and not self._shutdown_started:
+                        self._retry_wakeup_pending = True
+                        self._retry_wakeup.arm_locked()
+                return
             records = self._read_pending_writes()
+            if records is None:
+                with self._write_thread_lock:
+                    if self._journal_state == "HALTED_IO" and not self._shutdown_started:
+                        self._retry_wakeup_pending = True
+                        self._retry_wakeup.arm_locked()
+                return
             with self._write_thread_lock:
                 if self._shutdown_started:
                     return
@@ -937,7 +992,7 @@ class ReMeMemoryProvider(MemoryProvider):
         records: tuple[dict[str, Any], ...] | None = None,
     ) -> None:
         if records is None:
-            records = tuple(self._read_pending_writes())
+            records = tuple(self._read_pending_writes() or ())
         for record in records:
             record_id = record["id"]
             if record_id in self._queued_record_ids:
@@ -945,33 +1000,225 @@ class ReMeMemoryProvider(MemoryProvider):
             self._queued_record_ids.add(record_id)
             self._write_queue.put(record)
 
+    def _journal_path_safe(self, path: Path) -> bool:
+        """Reject links, hardlinks, non-files, and ambiguous journal paths."""
+        try:
+            if not _safe_existing_path_components(
+                path.parent,
+                trusted_root=self._profile_root,
+            ):
+                return False
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return stat.S_ISREG(file_stat.st_mode) and file_stat.st_nlink == 1 and not _is_unsafe_link(path, file_stat)
+
+    def _set_journal_halted(self, state: str, detail: str = "") -> None:
+        if self._journal_state in {"HALTED_CORRUPT", "SHUTDOWN"} and self._journal_state != state:
+            return
+        self._journal_state = state
+        self._accept_writes = False
+        self._unavailable_reason = detail or "durable ReMe journal requires operator recovery"
+        if state != "HALTED_CORRUPT":
+            self._defer_write_retry()
+        logger.error("ReMe durable journal entered %s", state)
+
+    @staticmethod
+    def _record_payload_equal(first: dict[str, Any], second: dict[str, Any]) -> bool:
+        profiles_match = (
+            first.get("profile_id") is None
+            or second.get("profile_id") is None
+            or first.get("profile_id") == second.get("profile_id")
+        )
+        first_payload = first.get("payload")
+        second_payload = second.get("payload")
+        if first_payload == second_payload:
+            return profiles_match
+        if not isinstance(first_payload, dict) or not isinstance(second_payload, dict):
+            return False
+        if {key: value for key, value in first_payload.items() if key != "messages"} != {
+            key: value for key, value in second_payload.items() if key != "messages"
+        }:
+            return False
+        first_messages = first_payload.get("messages")
+        second_messages = second_payload.get("messages")
+        if not isinstance(first_messages, list) or not isinstance(second_messages, list):
+            return False
+        if len(first_messages) != len(second_messages):
+            return False
+        for first_message, second_message in zip(first_messages, second_messages):
+            if not isinstance(first_message, dict) or not isinstance(second_message, dict):
+                return False
+            if {key: value for key, value in first_message.items() if key != "created_at"} != {
+                key: value for key, value in second_message.items() if key != "created_at"
+            }:
+                return False
+            if "created_at" in first_message and "created_at" in second_message:
+                if first_message["created_at"] != second_message["created_at"]:
+                    return False
+        return profiles_match
+
+    @staticmethod
+    def _quarantine_record_equal(first: dict[str, Any], second: dict[str, Any]) -> bool:
+        """Require every quarantine evidence field to agree for duplicate IDs."""
+        return all(
+            first.get(key) == second.get(key)
+            for key in ("id", "profile_id", "attempts", "semantic_refusals", "reason", "outcome", "payload")
+        )
+
+    @staticmethod
+    def _valid_quarantine_record(record: object) -> bool:
+        if not isinstance(record, dict) or not _valid_pending_record(
+            {
+                key: value
+                for key, value in record.items()
+                if key in {"id", "profile_id", "attempts", "semantic_refusals", "payload"}
+            },
+        ):
+            return False
+        if record.get("reason") not in {"semantic_refusal", "permanent_refusal"}:
+            return False
+        if record.get("outcome") != "QUARANTINED/NOT COMMITTED":
+            return False
+        attempts = record.get("attempts", 0)
+        return isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0
+
+    def _iter_journal_lines(self, path: Path):
+        """Yield bounded raw lines without a whole-file read race."""
+        size = path.stat().st_size
+        if size > _MAX_JOURNAL_BYTES:
+            raise ValueError("durable journal exceeds its size limit")
+        stream = path.open("rb")
+        total = 0
+        try:
+            while True:
+                raw_line = stream.readline(_MAX_JOURNAL_LINE_BYTES + 1)
+                if not raw_line:
+                    return
+                if len(raw_line) > _MAX_JOURNAL_LINE_BYTES or not raw_line.endswith(b"\n"):
+                    raise ValueError("durable journal line is oversized or incomplete")
+                total += len(raw_line)
+                if total > _MAX_JOURNAL_BYTES:
+                    raise ValueError("durable journal exceeds its size limit")
+                yield raw_line
+        finally:
+            if hasattr(stream, "close"):
+                stream.close()
+
+    @staticmethod
+    def _has_final_newline(path: Path) -> bool:
+        """Check journal termination without allocating the journal contents."""
+        if not path.exists() or path.stat().st_size == 0:
+            return True
+        with path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            return handle.read(1) == b"\n"
+
+    def _scan_journal(self, path: Path, *, quarantine: bool = False) -> list[dict[str, Any]] | None:
+        """Parse one private JSONL journal without treating failures as empty."""
+        if not self._journal_path_safe(path):
+            return None
+        if not path.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        seen: dict[str, dict[str, Any]] = {}
+        try:
+            for raw_line in self._iter_journal_lines(path):
+                record = json.loads(raw_line.decode("utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("journal entry is not an object")
+                record_id = record.get("id")
+                if not isinstance(record_id, str) or not record_id:
+                    raise ValueError("journal entry has no valid id")
+                if quarantine:
+                    if not self._valid_quarantine_record(record):
+                        raise ValueError("quarantine payload is invalid")
+                elif not _valid_pending_record(record):
+                    raise ValueError("pending journal entry is invalid")
+                profile_id = record.get("profile_id")
+                if profile_id is not None and profile_id != self._profile_id:
+                    raise ValueError("journal profile scope does not match")
+                previous = seen.get(record_id)
+                if previous is not None:
+                    if not quarantine or not self._quarantine_record_equal(previous, record):
+                        raise ValueError("journal contains an ambiguous duplicate id")
+                    continue
+                seen[record_id] = record
+                if len(records) >= _MAX_JOURNAL_RECORDS:
+                    raise ValueError("durable journal exceeds its record limit")
+                records.append(record)
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError):
+            return None
+        return records
+
+    def _reconcile_durable_state(self) -> bool:
+        """Reconcile quarantine before every queue snapshot, never replaying it."""
+        if self._journal_state in {"HALTED_CORRUPT", "SHUTDOWN"}:
+            return False
+        path = self._pending_path
+        if path is None:
+            return False
+        quarantine_path = path.parent / _QUARANTINE_QUEUE_FILENAME
+        with self._pending_lock:
+            pending = self._scan_journal(path)
+            quarantined = self._scan_journal(quarantine_path, quarantine=True)
+        if pending is None or quarantined is None:
+            self._set_journal_halted("HALTED_CORRUPT")
+            return False
+        by_id = {record["id"]: record for record in pending}
+        for entry in quarantined:
+            pending_record = by_id.get(entry["id"])
+            if pending_record is None:
+                continue
+            if "payload" not in entry or not self._record_payload_equal(pending_record, entry):
+                self._set_journal_halted("HALTED_CORRUPT")
+                return False
+            if not self._remove_pending_write(pending_record):
+                self._journal_state = "QUARANTINE_CLEANUP"
+                self._accept_writes = False
+                self._defer_write_retry()
+                return False
+        if self._shutdown_started or self._journal_state in {"HALTED_CORRUPT", "SHUTDOWN"}:
+            return False
+        self._journal_state = "READY"
+        self._accept_writes = True
+        return True
+
     def _append_pending_write(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._pending_path is None:
             raise OSError("profile-local ReMe queue path is not configured")
-        record = {"id": uuid.uuid4().hex, "attempts": 0, "payload": payload}
+        if self._journal_state != "READY":
+            raise OSError("durable ReMe journal is not accepting writes")
+        record = {"id": uuid.uuid4().hex, "profile_id": self._profile_id, "attempts": 0, "payload": payload}
+        encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        if len(encoded) > _MAX_RECORD_JSON_BYTES:
+            raise ValueError("durable ReMe turn exceeds the 1 MiB record limit")
         path = self._pending_path
-        if path.is_symlink() or (path.exists() and not path.is_file()):
+        if not self._journal_path_safe(path):
             raise OSError(f"Refusing unsafe ReMe queue path: {path}")
-        if path.parent.is_symlink():
-            raise OSError(f"Refusing symlinked ReMe queue directory: {path.parent}")
         parent_created = not path.parent.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._journal_path_safe(path):
+            raise OSError(f"Refusing unsafe ReMe queue path: {path}")
         if parent_created:
             _fsync_directory(path.parent.parent)
         with self._pending_lock:
-            if path.is_symlink() or (path.exists() and not path.is_file()):
+            if not self._journal_path_safe(path):
                 raise OSError(f"Refusing unsafe ReMe queue path: {path}")
             os.chmod(path.parent, 0o700)
-            if path.exists() and path.stat().st_size:
-                with path.open("rb") as existing:
-                    existing.seek(-1, os.SEEK_END)
-                    if existing.read(1) != b"\n":
-                        repair_fd = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
-                        try:
-                            os.write(repair_fd, b"\n")
-                            _fsync_file(repair_fd)
-                        finally:
-                            os.close(repair_fd)
+            if not self._journal_path_safe(path):
+                raise OSError(f"Refusing unsafe ReMe queue path: {path}")
+            existing = self._scan_journal(path)
+            if existing is None:
+                self._set_journal_halted("HALTED_CORRUPT")
+                raise OSError("durable ReMe journal is corrupt")
+            current_size = path.stat().st_size if path.exists() else 0
+            if len(existing) >= _MAX_JOURNAL_RECORDS or current_size + len(encoded) > _MAX_JOURNAL_BYTES:
+                raise OSError("durable ReMe journal capacity is exhausted")
+            if path.exists() and path.stat().st_size and not self._has_final_newline(path):
+                raise OSError("durable ReMe journal has an incomplete final line")
             flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -981,7 +1228,7 @@ class ReMeMemoryProvider(MemoryProvider):
                 with os.fdopen(fd, "a", encoding="utf-8") as handle:
                     fd = -1
                     handle.write(
-                        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
+                        encoded.decode("utf-8"),
                     )
                     handle.flush()
                     _fsync_file(handle.fileno())
@@ -994,95 +1241,71 @@ class ReMeMemoryProvider(MemoryProvider):
     def _update_pending_write(self, record: dict[str, Any]) -> bool:
         """Persist retry metadata without changing the record's queue position."""
         path = self._pending_path
-        if path is None or not path.is_file() or path.is_symlink() or path.parent.is_symlink():
+        if path is None or not self._journal_path_safe(path) or not _valid_pending_record(record):
             return False
         with self._pending_lock:
             try:
-                lines = path.read_bytes().splitlines(keepends=True)
-                updated: list[bytes] = []
-                found = False
-                for raw_line in lines:
-                    try:
-                        line = raw_line.decode("utf-8")
-                    except UnicodeError:
-                        updated.append(raw_line)
-                        continue
-                    try:
-                        current = json.loads(line)
-                    except (json.JSONDecodeError, RecursionError, TypeError, UnicodeError, ValueError):
-                        updated.append(raw_line)
-                        continue
-                    if (
-                        isinstance(current, dict)
-                        and current.get("id") == record.get("id")
-                        and _valid_pending_record(current)
-                    ):
-                        updated.append((json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
-                        found = True
-                    else:
-                        # Shape-invalid JSON is poison too; keep its exact
-                        # bytes while updating a later valid record.
-                        updated.append(raw_line)
-                if not found:
+                current_records = self._scan_journal(path)
+                if current_records is None:
                     return False
-                fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-                try:
-                    with os.fdopen(fd, "wb") as handle:
-                        handle.write(b"".join(updated))
-                        handle.flush()
-                        _fsync_file(handle.fileno())
-                    os.chmod(temp_name, 0o600)
-                    os.replace(temp_name, path)
-                    _fsync_directory(path.parent)
-                finally:
-                    if os.path.exists(temp_name):
-                        os.unlink(temp_name)
+                matches = [item for item in current_records if item.get("id") == record.get("id")]
+                if len(matches) != 1 or not self._record_payload_equal(matches[0], record):
+                    return False
+                updated = self._rewrite_pending_record(path, matches[0], replacement=record)
+                if not updated:
+                    self._defer_write_retry()
+                return updated
             except (OSError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
                 logger.error("ReMe could not persist durable write retry state: %s", exc)
+                self._defer_write_retry()
                 return False
         return True
 
     def _quarantine_pending_write(self, record: dict[str, Any], reason: str) -> bool:
         """Durably move a refused/exhausted record out of the active retry queue."""
         path = self._pending_path
-        if path is None or path.is_symlink() or path.parent.is_symlink():
+        if path is None or not self._journal_path_safe(path):
             return False
         quarantine = path.parent / _QUARANTINE_QUEUE_FILENAME
-        if quarantine.is_symlink() or (quarantine.exists() and not quarantine.is_file()):
+        if not self._journal_path_safe(quarantine):
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._journal_path_safe(path) or not self._journal_path_safe(quarantine):
+            return False
         entry = {
             "id": record.get("id"),
             "attempts": record.get("attempts", 0),
+            "semantic_refusals": record.get("semantic_refusals", 0),
+            "profile_id": record.get("profile_id", self._profile_id),
             "reason": reason,
+            "outcome": "QUARANTINED/NOT COMMITTED",
             "payload": record.get("payload"),
         }
+        if not self._valid_quarantine_record(entry):
+            self._set_journal_halted("HALTED_CORRUPT")
+            return False
         with self._pending_lock:
             try:
-                if quarantine.exists() and quarantine.stat().st_size:
-                    with quarantine.open("rb") as existing:
-                        existing.seek(-1, os.SEEK_END)
-                        if existing.read(1) != b"\n":
-                            repair_fd = os.open(
-                                quarantine,
-                                os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
-                            )
-                            try:
-                                os.write(repair_fd, b"\n")
-                                _fsync_file(repair_fd)
-                            finally:
-                                os.close(repair_fd)
-                already_quarantined = False
-                if quarantine.exists():
-                    for line in quarantine.read_bytes().splitlines():
-                        try:
-                            existing = json.loads(line)
-                        except (json.JSONDecodeError, RecursionError, TypeError, UnicodeError, ValueError):
-                            continue
-                        if isinstance(existing, dict) and existing.get("id") == record.get("id"):
-                            already_quarantined = True
-                            break
-                if not already_quarantined:
+                existing_records = self._scan_journal(quarantine, quarantine=True)
+                if existing_records is None:
+                    self._set_journal_halted("HALTED_CORRUPT")
+                    return False
+                matching = [item for item in existing_records if item.get("id") == record.get("id")]
+                if matching and not any(self._quarantine_record_equal(item, entry) for item in matching):
+                    self._set_journal_halted("HALTED_CORRUPT")
+                    return False
+                if not matching:
+                    encoded = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+                    if len(encoded) > _MAX_JOURNAL_LINE_BYTES:
+                        return False
+                    quarantine_size = quarantine.stat().st_size if quarantine.exists() else 0
+                    if (
+                        len(existing_records) >= _MAX_JOURNAL_RECORDS
+                        or quarantine_size + len(encoded) > _MAX_JOURNAL_BYTES
+                    ):
+                        return False
+                    if quarantine.exists() and quarantine.stat().st_size and not self._has_final_newline(quarantine):
+                        return False
                     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
                     if hasattr(os, "O_NOFOLLOW"):
                         flags |= os.O_NOFOLLOW
@@ -1091,7 +1314,7 @@ class ReMeMemoryProvider(MemoryProvider):
                         _set_private_file_mode(quarantine, fd)
                         with os.fdopen(fd, "a", encoding="utf-8") as handle:
                             fd = -1
-                            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+                            handle.write(encoded.decode("utf-8"))
                             handle.flush()
                             _fsync_file(handle.fileno())
                     finally:
@@ -1105,46 +1328,34 @@ class ReMeMemoryProvider(MemoryProvider):
         # is temporarily unavailable.  The next provider start will retry only
         # that cleanup; do not issue another backend write or duplicate the
         # quarantine entry in this process.
-        self._remove_pending_write(str(record.get("id", "")))
-        return True
+        if self._remove_pending_write(record):
+            return True
+        self._journal_state = "QUARANTINE_CLEANUP"
+        self._accept_writes = False
+        self._defer_write_retry()
+        return False
 
-    def _read_pending_writes(self) -> list[dict[str, Any]]:
+    def _read_pending_writes(self) -> list[dict[str, Any]] | None:
         path = self._pending_path
-        if path is None or not path.is_file():
+        if path is None:
             return []
-        if path.is_symlink() or path.parent.is_symlink():
-            logger.error("Refusing unsafe ReMe queue read path: %s", path)
+        if not self._journal_path_safe(path):
+            self._set_journal_halted("HALTED_CORRUPT")
+            return None
+        if not path.exists():
             return []
-        records = []
         with self._pending_lock:
-            try:
-                lines = path.read_bytes().splitlines()
-                default_historical_created_at = time.strftime(
-                    "%Y-%m-%dT%H:%M:%S+00:00",
-                    time.gmtime(path.stat().st_mtime),
-                )
-            except OSError as exc:
-                logger.error(
-                    "ReMe could not read its durable write queue %s: %s",
-                    path,
-                    exc,
-                )
-                return []
+            records = self._scan_journal(path)
+        if records is None:
+            self._set_journal_halted("HALTED_CORRUPT")
+            return None
+        default_historical_created_at = time.strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00",
+            time.gmtime(path.stat().st_mtime),
+        )
         legacy_records = []
-        for line_number, raw_line in enumerate(lines, start=1):
-            try:
-                line = raw_line.decode("utf-8")
-                record = json.loads(line)
-                if not isinstance(record, dict) or not _valid_pending_record(record):
-                    raise TypeError("record does not contain a valid durable turn payload")
-            except (UnicodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
-                logger.error(
-                    "ReMe durable write queue %s line %d is retained but invalid: %s",
-                    path,
-                    line_number,
-                    exc,
-                )
-                continue
+        upgraded_records = []
+        for record in records:
             try:
                 record_key = (path, record["id"])
                 historical_created_at = self._legacy_created_at_by_record.get(
@@ -1152,15 +1363,10 @@ class ReMeMemoryProvider(MemoryProvider):
                     default_historical_created_at,
                 )
                 upgraded = _upgrade_legacy_payload(record, historical_created_at)
-            except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
-                logger.error(
-                    "ReMe durable write queue %s line %d could not be upgraded: %s",
-                    path,
-                    line_number,
-                    exc,
-                )
-                continue
-            records.append(upgraded)
+            except (RecursionError, TypeError, UnicodeError, ValueError):
+                self._set_journal_halted("HALTED_CORRUPT")
+                return None
+            upgraded_records.append(upgraded)
             if upgraded is not record:
                 self._legacy_created_at_by_record.setdefault(record_key, historical_created_at)
                 legacy_records.append(upgraded)
@@ -1170,59 +1376,114 @@ class ReMeMemoryProvider(MemoryProvider):
                     "ReMe could not persist legacy timestamp upgrade for durable write %s",
                     record.get("id", "unknown"),
                 )
+                self._set_journal_halted("HALTED_IO")
+                return None
             else:
                 self._legacy_created_at_by_record.pop((path, record["id"]), None)
-        return records
+        return upgraded_records
 
-    def _remove_pending_write(self, record_id: str) -> bool:
+    def _rewrite_pending_record(
+        self,
+        path: Path,
+        expected_record: dict[str, Any],
+        *,
+        replacement: dict[str, Any] | None = None,
+    ) -> bool:
+        """Rewrite only after a complete verified scan, preserving all other bytes."""
+        if not self._journal_path_safe(path):
+            return False
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        backup_fd, backup_name = tempfile.mkstemp(prefix=f".{path.name}.original.", dir=path.parent)
+        replaced = False
+        found = 0
+        try:
+            with os.fdopen(fd, "wb") as output, os.fdopen(backup_fd, "wb") as backup:
+                fd = -1
+                backup_fd = -1
+                for raw_line in self._iter_journal_lines(path):
+                    current = json.loads(raw_line.decode("utf-8"))
+                    if isinstance(current, dict) and current.get("id") == expected_record.get("id"):
+                        if not self._record_payload_equal(current, expected_record):
+                            raise ValueError("durable record identity changed before mutation")
+                        found += 1
+                        backup.write(raw_line)
+                        if replacement is None:
+                            continue
+                        raw_line = (json.dumps(replacement, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+                    else:
+                        backup.write(raw_line)
+                    output.write(raw_line)
+                if found != 1:
+                    return False
+                output.flush()
+                _fsync_file(output.fileno())
+                backup.flush()
+                _fsync_file(backup.fileno())
+            if not self._journal_path_safe(path):
+                return False
+            os.chmod(temp_name, 0o600)
+            os.chmod(backup_name, 0o600)
+            if not self._journal_path_safe(path):
+                return False
+            os.replace(temp_name, path)
+            replaced = True
+            if not self._journal_path_safe(path):
+                return False
+            _fsync_directory(path.parent)
+            if not self._journal_path_safe(path):
+                return False
+            os.unlink(backup_name)
+            return True
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
+            logger.error("ReMe could not complete a durable journal mutation: %s", exc)
+            if replaced:
+                try:
+                    if self._journal_path_safe(path):
+                        os.replace(backup_name, path)
+                        _fsync_directory(path.parent)
+                    else:
+                        logger.error("ReMe refused to restore a journal after its parent became unsafe")
+                except OSError:
+                    logger.error("ReMe could not restore the original durable journal after mutation failure")
+            return False
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if backup_fd >= 0:
+                os.close(backup_fd)
+            if self._journal_path_safe(path) and os.path.exists(temp_name):
+                os.unlink(temp_name)
+            if self._journal_path_safe(path) and os.path.exists(backup_name):
+                os.unlink(backup_name)
+
+    def _remove_pending_write(self, record: dict[str, Any]) -> bool:
+        """Remove exactly one caller-identified durable record, never by ID alone."""
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+            return False
         path = self._pending_path
-        if path is None or not path.is_file():
+        if path is None or not self._journal_path_safe(path):
             logger.error("ReMe queue disappeared before acknowledgement: %s", path)
             return False
-        if path.is_symlink() or path.parent.is_symlink():
+        if not self._journal_path_safe(path):
             logger.error("Refusing unsafe ReMe queue acknowledgement path: %s", path)
             return False
         with self._pending_lock:
             try:
-                lines = path.read_bytes().splitlines(keepends=True)
-                kept: list[bytes] = []
-                removed = False
-                for raw_line in lines:
-                    try:
-                        line = raw_line.decode("utf-8")
-                    except UnicodeError:
-                        kept.append(raw_line)
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except (json.JSONDecodeError, RecursionError, TypeError, UnicodeError, ValueError):
-                        kept.append(raw_line)
-                        continue
-                    if isinstance(record, dict) and record.get("id") == record_id and _valid_pending_record(record):
-                        removed = True
-                    else:
-                        kept.append(raw_line)
-                if not removed:
+                records = self._scan_journal(path)
+                if records is None:
+                    return False
+                matches = [item for item in records if item.get("id") == record.get("id")]
+                if len(matches) > 1:
+                    return False
+                if not matches:
                     return True
-                fd, temp_name = tempfile.mkstemp(
-                    prefix=f".{path.name}.",
-                    dir=path.parent,
-                )
-                try:
-                    with os.fdopen(fd, "wb") as handle:
-                        handle.write(b"".join(kept))
-                        handle.flush()
-                        _fsync_file(handle.fileno())
-                    os.chmod(temp_name, 0o600)
-                    os.replace(temp_name, path)
-                    _fsync_directory(path.parent)
-                finally:
-                    if os.path.exists(temp_name):
-                        os.unlink(temp_name)
+                if not self._record_payload_equal(matches[0], record):
+                    return False
+                return self._rewrite_pending_record(path, matches[0])
             except (OSError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
                 logger.error(
                     "ReMe could not acknowledge durable write %s: %s",
-                    record_id,
+                    record.get("id", "unknown"),
                     exc,
                 )
                 return False
@@ -1243,7 +1504,7 @@ class ReMeMemoryProvider(MemoryProvider):
                             respect_cooldown=True,
                         ):
                             retry = True
-                        elif not self._remove_pending_write(payload["id"]):
+                        elif not self._remove_pending_write(payload):
                             self._last_write_failure_kind = "ack_failure"
                             self._defer_write_retry()
                             retry = True
@@ -1264,8 +1525,25 @@ class ReMeMemoryProvider(MemoryProvider):
                         except (TypeError, ValueError):
                             prior_attempts = 0
                         payload["attempts"] = max(0, prior_attempts) + 1
-                        if failure_kind == "permanent":
-                            quarantine_reason = "permanent_refusal"
+                        if failure_kind in {"semantic_refusal", "permanent"}:
+                            if failure_kind == "semantic_refusal":
+                                prior_refusals = payload.get("semantic_refusals", 0)
+                                if not isinstance(prior_refusals, int) or isinstance(prior_refusals, bool):
+                                    self._set_journal_halted("HALTED_CORRUPT")
+                                    return
+                                next_refusals = prior_refusals + 1
+                                if next_refusals < 3:
+                                    payload["semantic_refusals"] = next_refusals
+                                    if not self._update_pending_write(payload):
+                                        self._set_journal_halted("HALTED_IO")
+                                        return
+                                    self._defer_write_retry()
+                                    self._schedule_retry(payload)
+                                    return
+                                payload["semantic_refusals"] = 3
+                                quarantine_reason = "semantic_refusal"
+                            else:
+                                quarantine_reason = "permanent_refusal"
                             if self._quarantine_pending_write(payload, quarantine_reason):
                                 logger.error(
                                     "ReMe durable write %s was quarantined (%s)",
@@ -1273,7 +1551,12 @@ class ReMeMemoryProvider(MemoryProvider):
                                     quarantine_reason,
                                 )
                                 continue
-                        self._update_pending_write(payload)
+                            self._defer_write_retry()
+                            self._schedule_retry(payload)
+                            return
+                        if not self._update_pending_write(payload):
+                            self._set_journal_halted("HALTED_IO")
+                            return
                         logger.warning(
                             "ReMe durable write %s remains queued for a later retry (attempt %d)",
                             payload.get("id", "unknown"),
@@ -1297,7 +1580,21 @@ class ReMeMemoryProvider(MemoryProvider):
             if should_restart:
                 self._start_writer_if_needed()
             if self._shutdown_started:
+                # The writer slot is now clear: complete any deferred backend
+                # teardown before releasing the profile and workspace locks.
+                with self._backend_lock:
+                    self._close_backend_if_shutdown_locked()
                 self._release_profile_resources_if_writer_stopped()
+
+    def _protected_option_b_enabled(self) -> bool:
+        """Return whether this provider uses the fixed protected Stage 1 contract."""
+        config = self._config
+        return bool(
+            config
+            and config.mode == "embedded"
+            and config.reme_config == STAGE1_CONFIG_NAME
+            and not config.allow_custom_config,
+        )
 
     def _record_payload(
         self,
@@ -1332,6 +1629,9 @@ class ReMeMemoryProvider(MemoryProvider):
                     request_id=request_id,
                 )
                 if not isinstance(response, dict) or response.get("success") is not True:
+                    metadata = response.get("metadata") if isinstance(response, dict) else None
+                    refusal_code = metadata.get("fermes_refusal_code") if isinstance(metadata, dict) else None
+                    refusal_reason = metadata.get("fermes_refusal_reason") if isinstance(metadata, dict) else None
                     raise ReMeBackendError(
                         str(
                             (
@@ -1341,11 +1641,44 @@ class ReMeMemoryProvider(MemoryProvider):
                             ),
                         )
                         or "auto_memory did not report success",
+                        refusal_code=(
+                            refusal_code
+                            if self._protected_option_b_enabled()
+                            and refusal_code == "PROTECTED_OPTION_B_PROPOSAL_INVALID"
+                            else None
+                        ),
+                        refusal_reason=refusal_reason if isinstance(refusal_reason, str) else None,
                     )
+                if self._protected_option_b_enabled():
+                    metadata = response.get("metadata")
+                    if not isinstance(metadata, dict):
+                        raise ReMeBackendError("protected auto_memory returned no durable receipt")
+                    outcome = metadata.get("outcome", "commit")
+                    if outcome == "commit":
+                        commit = metadata.get("commit")
+                        if (
+                            not isinstance(commit, dict)
+                            or not isinstance(request_id, str)
+                            or commit.get("request_id") != request_id
+                        ):
+                            raise ReMeBackendError("protected auto_memory returned an unbound commit receipt")
+                    elif outcome == "noop":
+                        if (
+                            not isinstance(request_id, str)
+                            or metadata.get("request_id") != request_id
+                            or metadata.get("modified") is not False
+                            or metadata.get("n_messages") != 0
+                            or "commit" in metadata
+                        ):
+                            raise ReMeBackendError("protected auto_memory returned an invalid no-op receipt")
+                    else:
+                        raise ReMeBackendError("protected auto_memory returned an unknown receipt outcome")
+                if response.get("answer") and not isinstance(response.get("metadata"), dict):
+                    raise ReMeBackendError("auto_memory returned success without a verified commit receipt")
                 return True
             except ReMeBackendError as exc:
-                self._last_write_failure_kind = "permanent" if _is_permanent_write_failure(exc) else "retryable"
-                if self._last_write_failure_kind != "permanent":
+                self._last_write_failure_kind = _classify_write_failure(exc)
+                if self._last_write_failure_kind not in {"permanent", "semantic_refusal"}:
                     self._defer_write_retry()
                 logger.warning(
                     "ReMe recording failed at %s (%s)",
@@ -1385,6 +1718,17 @@ class ReMeMemoryProvider(MemoryProvider):
                 return False
             if self._profile_lock_required and self._profile_lock is None:
                 return False
+            if self._backend_cleanup_pending:
+                cleanup_timeout = self._shutdown_timeout
+                if deadline is not None:
+                    cleanup_timeout = min(cleanup_timeout, max(0.0, deadline - time.monotonic()))
+                if not self._close_backend_locked(timeout=cleanup_timeout):
+                    self._mark_unavailable("backend cleanup", ReMeBackendError("cleanup remains pending"))
+                    return False
+                if self._deferred_backend_close:
+                    self._finish_deferred_backend_close_locked()
+                if self._shutdown_started:
+                    return False
             now = time.monotonic()
             if not force and now < self._next_health_probe:
                 return False
@@ -1407,20 +1751,12 @@ class ReMeMemoryProvider(MemoryProvider):
                         self._backend.start()
                     else:
                         self._backend.start(deadline=deadline)
-                except (ReMeBackendError, TypeError, ValueError, OSError) as exc:
-                    failed, self._backend = self._backend, None
-                    if failed is not None:
-                        try:
-                            cleanup_timeout = self._shutdown_timeout
-                            if deadline is not None:
-                                cleanup_timeout = max(0.0, deadline - time.monotonic())
-                            if deadline is None or cleanup_timeout > 0:
-                                failed.close(timeout=cleanup_timeout)
-                        except ReMeBackendError as close_exc:
-                            logger.warning(
-                                "Failed to clean up ReMe after startup error: %s",
-                                close_exc,
-                            )
+                except Exception as exc:
+                    cleanup_timeout = self._shutdown_timeout
+                    if deadline is not None:
+                        cleanup_timeout = max(0.0, deadline - time.monotonic())
+                    if self._backend is not None:
+                        self._close_backend_locked(timeout=cleanup_timeout)
                     self._mark_unavailable("startup", exc)
                     return False
             try:
@@ -1440,28 +1776,43 @@ class ReMeMemoryProvider(MemoryProvider):
 
     def _close_backend_if_shutdown_locked(self) -> None:
         if self._deferred_backend_close:
-            self._close_backend_locked()
-            self._finish_deferred_backend_close_locked()
+            if self._close_backend_locked():
+                if self._deferred_backend_close:
+                    self._finish_deferred_backend_close_locked()
 
-    def _finish_deferred_backend_close_locked(self) -> None:
+    def _finish_deferred_backend_close_locked(self) -> bool:
         """Finish shutdown ownership release after backend close completes."""
+        if self._backend is not None or self._backend_cleanup_pending:
+            return False
+        if not self._release_profile_resources_if_writer_stopped():
+            return False
         self._deferred_backend_close = False
-        self._release_profile_resources_if_writer_stopped()
+        return True
 
-    def _close_backend_locked(self, *, timeout: float | None = None) -> None:
-        backend, self._backend = self._backend, None
+    def _close_backend_locked(self, *, timeout: float | None = None) -> bool:
+        backend = self._backend
+        if backend is None:
+            self._backend_cleanup_pending = False
+            self._backend_available = False
+            return True
         if backend is not None:
             try:
                 backend.close(
                     timeout=self._shutdown_timeout if timeout is None else timeout,
                 )
-            except ReMeBackendError as exc:
+            except Exception as exc:
+                self._backend_cleanup_pending = True
                 logger.warning(
                     "ReMe backend shutdown failed at %s: %s",
                     self._backend_label,
                     exc,
                 )
+                self._backend_available = False
+                return False
+        self._backend = None
+        self._backend_cleanup_pending = False
         self._backend_available = False
+        return True
 
     def _mark_unavailable(self, operation: str, error: Exception) -> None:
         self._backend_available = False

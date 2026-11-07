@@ -53,6 +53,10 @@ def build_turn_payload(profile_id: str, session_id: str, user: str, assistant: s
 _VALID_MESSAGE_ROLES = frozenset({"user", "assistant", "system"})
 _MAX_SESSION_ID_BYTES = 249
 _MAX_RECORD_ID_LENGTH = 128
+MAX_RECORD_JSON_BYTES = 1024 * 1024
+MAX_JOURNAL_LINE_BYTES = 2 * 1024 * 1024
+MAX_JOURNAL_BYTES = 100 * 1024 * 1024
+MAX_JOURNAL_RECORDS = 50_000
 
 
 def _is_utf8_text(value: str) -> bool:
@@ -128,6 +132,12 @@ def valid_pending_record(record: object) -> bool:
     if not isinstance(record_id, str) or not record_id or len(record_id) > _MAX_RECORD_ID_LENGTH:
         return False
     if not _is_utf8_text(record_id):
+        return False
+    if "semantic_refusals" in record:
+        count = record["semantic_refusals"]
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 3:
+            return False
+    if "profile_id" in record and not isinstance(record["profile_id"], str):
         return False
     return valid_pending_payload(record.get("payload"))
 

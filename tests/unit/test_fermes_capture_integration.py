@@ -104,6 +104,8 @@ def _write_test_config(tmp_path: Path) -> Path:
     llm["credential"]["base_url"] = "http://127.0.0.1:1/v1"
     llm["client_kwargs"] = {"timeout": 2.0, "max_retries": 0}
     config["components"]["agent_wrapper"]["default"]["react_config"] = {"max_iters": 4}
+    # The deterministic model date is UTC, so ReMe must use the matching IANA timezone.
+    config["timezone"] = "UTC"
     path = tmp_path / "stage1-synthetic.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return path

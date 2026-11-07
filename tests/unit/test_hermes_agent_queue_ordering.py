@@ -378,7 +378,7 @@ def test_false_or_malformed_auto_memory_ack_keeps_spool_record(monkeypatch, tmp_
     provider.shutdown()
 
 
-def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_path):
+def test_pending_queue_poison_line_halts_without_follower_admission(tmp_path):
     provider = ReMeMemoryProvider()
     provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
     provider._pending_path.parent.mkdir()
@@ -390,15 +390,10 @@ def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_
         binary_poison + b"not-json\n" + shape_poison + message_poison + json.dumps(valid).encode() + b"\n",
     )
 
-    assert provider._read_pending_writes() == [valid]
-    assert provider._update_pending_write({**valid, "attempts": 1, "payload": valid["payload"]}) is True
-    assert provider._remove_pending_write("valid") is True
-    remaining = provider._pending_path.read_bytes()
-    assert binary_poison in remaining
-    assert b"not-json" in remaining
-    assert shape_poison in remaining
-    assert message_poison in remaining
-    assert b'"valid"' not in remaining
+    before = provider._pending_path.read_bytes()
+    assert provider._read_pending_writes() is None
+    assert provider._journal_state == "HALTED_CORRUPT"
+    assert provider._pending_path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -410,15 +405,17 @@ def test_pending_queue_retains_poison_line_and_reads_following_valid_record(tmp_
         b'"role":"user","content":"x","metadata":5}]}}\n',
     ],
 )
-def test_deep_or_unicode_poison_line_does_not_block_following_record(tmp_path, poison):
+def test_deep_or_unicode_poison_line_halts_following_record(tmp_path, poison):
     provider = ReMeMemoryProvider()
     provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
     provider._pending_path.parent.mkdir()
     valid = {"id": "valid", "attempts": 0, "payload": {"session_id": "s", "messages": []}}
     provider._pending_path.write_bytes(poison + json.dumps(valid).encode() + b"\n")
 
-    assert provider._read_pending_writes() == [valid]
-    assert poison in provider._pending_path.read_bytes()
+    before = provider._pending_path.read_bytes()
+    assert provider._read_pending_writes() is None
+    assert provider._journal_state == "HALTED_CORRUPT"
+    assert provider._pending_path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -481,7 +478,7 @@ def test_journal_rewrite_rejects_unencodable_retry_record_without_losing_bytes(t
         },
     ],
 )
-def test_provider_skips_invalid_session_or_role_and_runs_following_record(monkeypatch, tmp_path, bad_payload):
+def test_provider_halts_invalid_session_or_role_before_following_record(monkeypatch, tmp_path, bad_payload):
     backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
@@ -493,14 +490,13 @@ def test_provider_skips_invalid_session_or_role_and_runs_following_record(monkey
 
     provider = ReMeMemoryProvider()
     provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
-    deadline = time.monotonic() + 1
-    while backend.request_ids != ["valid"] and time.monotonic() < deadline:
-        time.sleep(0.005)
-    provider.shutdown()
+    time.sleep(0.1)
 
-    assert backend.request_ids == ["valid"]
+    assert backend.request_ids == []
+    assert provider._journal_state == "HALTED_CORRUPT"
     assert poison in pending.read_bytes()
-    assert b'"valid"' not in pending.read_bytes()
+    assert b'"valid"' in pending.read_bytes()
+    provider.shutdown()
 
 
 def test_stage1_legacy_spool_upgrades_missing_created_at_without_data_loss(tmp_path):
@@ -515,15 +511,13 @@ def test_stage1_legacy_spool_upgrades_missing_created_at_without_data_loss(tmp_p
             "messages": [{"id": "m", "name": "user", "role": "user", "content": "old turn"}],
         },
     }
-    poison = b"not-json\n"
-    provider._pending_path.write_bytes(poison + (json.dumps(legacy) + "\n").encode())
+    provider._pending_path.write_bytes((json.dumps(legacy) + "\n").encode())
 
     records = provider._read_pending_writes()
 
     assert records[0]["payload"]["messages"][0]["created_at"]
-    persisted = json.loads(provider._pending_path.read_bytes().splitlines()[1])
+    persisted = json.loads(provider._pending_path.read_bytes().splitlines()[0])
     assert persisted["payload"]["messages"][0]["created_at"] == records[0]["payload"]["messages"][0]["created_at"]
-    assert poison in provider._pending_path.read_bytes()
 
 
 def test_failed_legacy_upgrade_keeps_timestamp_stable_across_reread(monkeypatch, tmp_path):
@@ -542,14 +536,14 @@ def test_failed_legacy_upgrade_keeps_timestamp_stable_across_reread(monkeypatch,
     provider._pending_path.write_bytes((json.dumps(legacy) + "\n").encode())
     monkeypatch.setattr(provider, "_update_pending_write", lambda _record: False)
 
-    first = provider._read_pending_writes()[0]
+    assert provider._read_pending_writes() is None
     os.utime(provider._pending_path, (1_800_000_000, 1_800_000_000))
-    second = provider._read_pending_writes()[0]
+    assert provider._read_pending_writes() is None
+    assert provider._journal_state == "HALTED_IO"
+    assert provider._pending_path.read_bytes() == (json.dumps(legacy) + "\n").encode()
 
-    assert first["payload"]["messages"][0]["created_at"] == second["payload"]["messages"][0]["created_at"]
 
-
-def test_startup_recovers_valid_record_after_invalid_utf8_poison_line(monkeypatch, tmp_path):
+def test_startup_halts_before_invalid_utf8_poison_follower(monkeypatch, tmp_path):
     backend = FakeBackend()
     monkeypatch.setattr(PLUGIN_MODULE, "load_config", lambda home=None: ReMeConfig(health_retry_seconds=0.01))
     monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
@@ -561,15 +555,14 @@ def test_startup_recovers_valid_record_after_invalid_utf8_poison_line(monkeypatc
 
     provider = ReMeMemoryProvider()
     provider.initialize("session", hermes_home=tmp_path, agent_identity="profile")
-    deadline = time.monotonic() + 1
-    while len(backend.request_ids) < 1 and time.monotonic() < deadline:
-        time.sleep(0.005)
-    provider.shutdown()
+    time.sleep(0.1)
 
-    assert backend.request_ids == ["valid"]
+    assert backend.request_ids == []
+    assert provider._journal_state == "HALTED_CORRUPT"
     assert binary_poison in pending.read_bytes()
-    assert b'"valid"' not in pending.read_bytes()
+    assert b'"valid"' in pending.read_bytes()
     assert provider._writer_starting is False
+    provider.shutdown()
 
 
 def test_disk_append_failure_does_not_acknowledge_or_queue_turn(monkeypatch, tmp_path, caplog):

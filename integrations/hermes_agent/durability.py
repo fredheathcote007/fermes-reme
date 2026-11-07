@@ -146,6 +146,37 @@ def _is_unsafe_link(path: Path, file_stat: os.stat_result) -> bool:
     return stat.S_ISLNK(file_stat.st_mode) or _runtime_reparse_point(path, file_stat)
 
 
+def _safe_existing_path_components(path: Path, *, trusted_root: Path | None = None) -> bool:
+    """Reject unsafe existing components below the canonical profile root.
+
+    Missing components are allowed so normal profile creation can proceed. The
+    caller must run this check again after creating them and immediately before
+    each filesystem operation that can follow the path.
+    """
+    candidate = Path(path)
+    root = Path(trusted_root) if trusted_root is not None else None
+    if not candidate.is_absolute() or (root is not None and not root.is_absolute()):
+        return False
+    if root is None:
+        root = candidate.parent.parent
+    try:
+        relative_parts = candidate.relative_to(root).parts
+    except ValueError:
+        return False
+    current = root
+    for part in relative_parts:
+        current /= part
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if _is_unsafe_link(current, current_stat):
+            return False
+    return True
+
+
 def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
     """Return whether two stat results identify the same device and inode."""
     return first.st_dev == second.st_dev and first.st_ino == second.st_ino
@@ -195,8 +226,9 @@ class ProfileWriterLock:
     leave a stale marker that blocks future recovery.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, trusted_root: Path | None = None):
         self.path = path
+        self.trusted_root = trusted_root or path.parent.parent
         self._fd: int | None = None
         self._key = _runtime_os().path.normcase(str(path.resolve(strict=False)))
 
@@ -206,14 +238,24 @@ class ProfileWriterLock:
         with _HELD_PROFILE_LOCKS_LOCK:
             if self._key in _HELD_PROFILE_LOCKS:
                 raise OSError("profile writer is already owned by this process")
+            if not _safe_existing_path_components(self.path.parent, trusted_root=self.trusted_root):
+                raise OSError(f"Refusing unsafe profile writer lock path: {self.path}")
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.parent.is_symlink() or self.path.is_symlink():
+            if not _safe_existing_path_components(self.path.parent, trusted_root=self.trusted_root):
+                raise OSError(f"Refusing unsafe profile writer lock path: {self.path}")
+            try:
+                lock_stat = self.path.lstat()
+            except FileNotFoundError:
+                lock_stat = None
+            if lock_stat is not None and _is_unsafe_link(self.path, lock_stat):
                 raise OSError(f"Refusing unsafe profile writer lock path: {self.path}")
             flags = runtime_os.O_RDWR | runtime_os.O_CREAT
             if hasattr(runtime_os, "O_NOFOLLOW"):
                 flags |= runtime_os.O_NOFOLLOW
             fd = runtime_os.open(self.path, flags, 0o600)
             try:
+                if not _safe_existing_path_components(self.path.parent, trusted_root=self.trusted_root):
+                    raise OSError(f"Refusing unsafe profile writer lock path: {self.path}")
                 _set_private_file_mode(self.path, fd)
                 if fcntl is not None:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
