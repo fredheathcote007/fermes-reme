@@ -64,7 +64,6 @@ _TEXTUAL_INFRASTRUCTURE_MARKERS = (
     "too many open files",
     "connection reset",
     "temporarily unavailable",
-    "temporarily unavailable",
     "please retry",
     "backend is temporarily unavailable",
 )

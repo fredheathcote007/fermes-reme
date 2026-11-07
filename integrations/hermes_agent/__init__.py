@@ -413,6 +413,7 @@ class ReMeMemoryProvider(MemoryProvider):
         """Return the last local availability failure as user-facing guidance."""
         return self._unavailable_reason
 
+    # pylint: disable-next=too-many-statements
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         """Load profile config and start the selected backend best-effort."""
         with self._write_thread_lock:
@@ -896,10 +897,6 @@ class ReMeMemoryProvider(MemoryProvider):
         with self._write_thread_lock:
             if not self._accept_writes or self._journal_state != "READY":
                 return False
-            if self._pending_path is None or self._read_pending_writes() is None:
-                if self._journal_state != "HALTED_IO":
-                    self._set_journal_halted("HALTED_CORRUPT")
-                return False
             try:
                 record = self._append_pending_write(payload)
             except (OSError, TypeError, ValueError) as exc:
@@ -1090,9 +1087,8 @@ class ReMeMemoryProvider(MemoryProvider):
         size = path.stat().st_size
         if size > _MAX_JOURNAL_BYTES:
             raise ValueError("durable journal exceeds its size limit")
-        stream = path.open("rb")
         total = 0
-        try:
+        with path.open("rb") as stream:
             while True:
                 raw_line = stream.readline(_MAX_JOURNAL_LINE_BYTES + 1)
                 if not raw_line:
@@ -1103,9 +1099,6 @@ class ReMeMemoryProvider(MemoryProvider):
                 if total > _MAX_JOURNAL_BYTES:
                     raise ValueError("durable journal exceeds its size limit")
                 yield raw_line
-        finally:
-            if hasattr(stream, "close"):
-                stream.close()
 
     @staticmethod
     def _has_final_newline(path: Path) -> bool:
@@ -1265,12 +1258,15 @@ class ReMeMemoryProvider(MemoryProvider):
         """Durably move a refused/exhausted record out of the active retry queue."""
         path = self._pending_path
         if path is None or not self._journal_path_safe(path):
+            self._set_journal_halted("HALTED_CORRUPT", "durable quarantine path is unavailable")
             return False
         quarantine = path.parent / _QUARANTINE_QUEUE_FILENAME
         if not self._journal_path_safe(quarantine):
+            self._set_journal_halted("HALTED_CORRUPT", "durable quarantine path is unsafe")
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
         if not self._journal_path_safe(path) or not self._journal_path_safe(quarantine):
+            self._set_journal_halted("HALTED_CORRUPT", "durable quarantine path became unsafe")
             return False
         entry = {
             "id": record.get("id"),
@@ -1297,14 +1293,17 @@ class ReMeMemoryProvider(MemoryProvider):
                 if not matching:
                     encoded = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
                     if len(encoded) > _MAX_JOURNAL_LINE_BYTES:
+                        self._set_journal_halted("HALTED_CORRUPT", "durable quarantine record exceeds its size limit")
                         return False
                     quarantine_size = quarantine.stat().st_size if quarantine.exists() else 0
                     if (
                         len(existing_records) >= _MAX_JOURNAL_RECORDS
                         or quarantine_size + len(encoded) > _MAX_JOURNAL_BYTES
                     ):
+                        self._set_journal_halted("HALTED_CORRUPT", "durable quarantine capacity is exhausted")
                         return False
                     if quarantine.exists() and quarantine.stat().st_size and not self._has_final_newline(quarantine):
+                        self._set_journal_halted("HALTED_CORRUPT", "durable quarantine has an incomplete final line")
                         return False
                     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
                     if hasattr(os, "O_NOFOLLOW"):
@@ -1392,11 +1391,15 @@ class ReMeMemoryProvider(MemoryProvider):
         """Rewrite only after a complete verified scan, preserving all other bytes."""
         if not self._journal_path_safe(path):
             return False
-        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        backup_fd, backup_name = tempfile.mkstemp(prefix=f".{path.name}.original.", dir=path.parent)
+        fd = -1
+        backup_fd = -1
+        temp_name: str | None = None
+        backup_name: str | None = None
         replaced = False
         found = 0
         try:
+            fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            backup_fd, backup_name = tempfile.mkstemp(prefix=f".{path.name}.original.", dir=path.parent)
             with os.fdopen(fd, "wb") as output, os.fdopen(backup_fd, "wb") as backup:
                 fd = -1
                 backup_fd = -1
@@ -1421,6 +1424,8 @@ class ReMeMemoryProvider(MemoryProvider):
                 _fsync_file(backup.fileno())
             if not self._journal_path_safe(path):
                 return False
+            assert temp_name is not None
+            assert backup_name is not None
             os.chmod(temp_name, 0o600)
             os.chmod(backup_name, 0o600)
             if not self._journal_path_safe(path):
@@ -1451,9 +1456,9 @@ class ReMeMemoryProvider(MemoryProvider):
                 os.close(fd)
             if backup_fd >= 0:
                 os.close(backup_fd)
-            if self._journal_path_safe(path) and os.path.exists(temp_name):
+            if temp_name is not None and self._journal_path_safe(path) and os.path.exists(temp_name):
                 os.unlink(temp_name)
-            if self._journal_path_safe(path) and os.path.exists(backup_name):
+            if backup_name is not None and self._journal_path_safe(path) and os.path.exists(backup_name):
                 os.unlink(backup_name)
 
     def _remove_pending_write(self, record: dict[str, Any]) -> bool:
@@ -1551,6 +1556,8 @@ class ReMeMemoryProvider(MemoryProvider):
                                     quarantine_reason,
                                 )
                                 continue
+                            if self._journal_state == "HALTED_CORRUPT":
+                                return
                             self._defer_write_retry()
                             self._schedule_retry(payload)
                             return

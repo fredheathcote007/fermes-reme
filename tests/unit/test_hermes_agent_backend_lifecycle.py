@@ -1,5 +1,8 @@
 """D16 bounded backend ownership and cleanup tests."""
 
+# These tests intentionally inspect private lifecycle seams and use compact helpers.
+# pylint: disable=missing-class-docstring,missing-function-docstring,protected-access
+
 from __future__ import annotations
 
 import os
@@ -93,7 +96,7 @@ def test_d16_r01_real_blocked_close_retains_owner_and_explicit_retry_stops_loop(
 
 
 @pytest.mark.parametrize("error_type", [ReMeBackendError, OSError, RuntimeError])
-def test_d16_r02_r03_failed_start_retains_identity_until_close_succeeds(monkeypatch, tmp_path, error_type):
+def test_d16_r02_r03_failed_start_retains_identity_until_close_succeeds(monkeypatch, error_type):
     failed = _StartupFailureBackend(failures=2, error_type=error_type)
     created = []
 

@@ -1040,7 +1040,7 @@ def test_f_d14_native_regular_profile_success_and_ack(monkeypatch, tmp_path):
         assert _wait_for(
             lambda: len(backend.request_ids) == 1
             and not provider._queued_record_ids
-            and _pending_path(tmp_path).read_text() == ""
+            and _pending_path(tmp_path).read_text() == "",
         )
         assert provider._pending_path.resolve().is_relative_to(tmp_path.resolve())
         assert not _quarantine_path(tmp_path).exists()
@@ -1095,7 +1095,7 @@ def test_f_d14_native_owner_configured_home_alias_resolves_to_canonical_root(mon
         assert _wait_for(
             lambda: len(backend.request_ids) == 1
             and not provider._queued_record_ids
-            and provider._pending_path.read_text() == ""
+            and provider._pending_path.read_text() == "",
         )
         assert (canonical / "reme" / "pending-writes.jsonl").exists()
         assert not (alias / "reme" / "pending-writes.jsonl").is_symlink()

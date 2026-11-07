@@ -467,6 +467,98 @@ def test_journal_rewrite_rejects_unencodable_retry_record_without_losing_bytes(t
     assert provider._pending_path.read_text(encoding="utf-8") == json.dumps(valid) + "\n"
 
 
+def test_journal_rewrite_cleans_first_staging_file_when_backup_creation_fails(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    record = provider._append_pending_write({"session_id": "s", "messages": []})
+    before = provider._pending_path.read_bytes()
+    original_mkstemp = PLUGIN_MODULE.tempfile.mkstemp
+    calls = 0
+
+    def fail_second_mkstemp(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("backup staging unavailable")
+        return original_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(PLUGIN_MODULE.tempfile, "mkstemp", fail_second_mkstemp)
+
+    assert (
+        provider._rewrite_pending_record(provider._pending_path, record, replacement={**record, "attempts": 1}) is False
+    )
+    assert provider._pending_path.read_bytes() == before
+    assert not list(provider._pending_path.parent.glob(f".{provider._pending_path.name}*"))
+
+
+def test_enqueue_uses_append_scan_as_its_single_admission_check(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._accept_writes = True
+    monkeypatch.setattr(provider, "_read_pending_writes", lambda: pytest.fail("redundant pre-scan"))
+    monkeypatch.setattr(provider, "_start_writer_if_needed", lambda: None)
+
+    assert provider._enqueue_write({"session_id": "session", "messages": []}) is True
+    assert provider._pending_path.read_text(encoding="utf-8").strip()
+
+
+@pytest.mark.parametrize("exhaustion", ["oversized", "capacity"])
+def test_permanent_quarantine_storage_failure_halts_without_retry(monkeypatch, tmp_path, exhaustion):
+    provider = ReMeMemoryProvider()
+    provider._profile_id = "profile"
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    provider._pending_path.parent.mkdir()
+    content = "x" if exhaustion == "capacity" else "x" * 2_100_000
+    record = {
+        "id": f"quarantine-{exhaustion}",
+        "profile_id": "profile",
+        "attempts": 0,
+        "payload": {
+            "session_id": "s",
+            "messages": [{"id": "m", "name": "user", "role": "user", "content": content}],
+        },
+    }
+    provider._pending_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    before = provider._pending_path.read_bytes()
+
+    if exhaustion == "oversized":
+        monkeypatch.setattr(PLUGIN_MODULE, "_MAX_JOURNAL_LINE_BYTES", 10)
+    else:
+        existing = {
+            **record,
+            "id": "older",
+            "reason": "permanent_refusal",
+            "outcome": "QUARANTINED/NOT COMMITTED",
+        }
+        quarantine = provider._pending_path.parent / "quarantined-writes.jsonl"
+        quarantine.write_text(json.dumps(existing) + "\n", encoding="utf-8")
+        next_entry = {
+            **record,
+            "reason": "permanent_refusal",
+            "outcome": "QUARANTINED/NOT COMMITTED",
+        }
+        encoded = (json.dumps(next_entry, sort_keys=True) + "\n").encode("utf-8")
+        monkeypatch.setattr(
+            PLUGIN_MODULE,
+            "_MAX_JOURNAL_BYTES",
+            quarantine.stat().st_size + len(encoded) - 1,
+        )
+
+    def permanent_failure(*args, **kwargs):
+        del args, kwargs
+        provider._last_write_failure_kind = "permanent"
+        return False
+
+    monkeypatch.setattr(provider, "_record_payload", permanent_failure)
+    provider._write_queue.put(record)
+    provider._write_loop(provider._write_queue)
+
+    assert provider._journal_state == "HALTED_CORRUPT"
+    assert provider._accept_writes is False
+    assert provider._retry_timers == set()
+    assert provider._pending_path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "bad_payload",
     [
