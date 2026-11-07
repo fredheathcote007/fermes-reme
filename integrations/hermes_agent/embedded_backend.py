@@ -206,7 +206,7 @@ class EmbeddedReMeBackend:
             raise ReMeBackendError(str(exc) or type(exc).__name__) from exc
 
     @staticmethod
-    def _response_dict(response: Any) -> dict[str, Any]:
+    def _response_dict(response: Any, *, action: str | None = None) -> dict[str, Any]:
         if hasattr(response, "model_dump"):
             result = response.model_dump()
         elif isinstance(response, dict):
@@ -214,8 +214,18 @@ class EmbeddedReMeBackend:
         else:
             raise ReMeBackendError("ReMe returned an unsupported response object")
         if result.get("success") is not True:
+            metadata = result.get("metadata")
+            refusal_code = None
+            refusal_reason = None
+            if action in {None, "auto_memory"} and isinstance(metadata, dict):
+                if metadata.get("fermes_refusal_code") == "PROTECTED_OPTION_B_PROPOSAL_INVALID":
+                    refusal_code = metadata["fermes_refusal_code"]
+                    if isinstance(metadata.get("fermes_refusal_reason"), str):
+                        refusal_reason = metadata["fermes_refusal_reason"]
             raise ReMeBackendError(
                 str(result.get("answer") or "ReMe action did not report success"),
+                refusal_code=refusal_code,
+                refusal_reason=refusal_reason,
             )
         return result
 
@@ -223,7 +233,7 @@ class EmbeddedReMeBackend:
         if self._app is None:
             raise ReMeBackendError("Embedded ReMe Application is unavailable")
         response = await self._app.run_job(name, **kwargs)
-        return self._response_dict(response)
+        return self._response_dict(response, action=name)
 
     def health(self, *, timeout: float) -> dict[str, Any]:
         """Run ReMe's health-check job on the owned loop."""

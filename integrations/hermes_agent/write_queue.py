@@ -28,10 +28,16 @@ def rebuild_write_queue_locked(provider: Any, records: list[dict[str, Any]]) -> 
         finally:
             write_queue.task_done()
 
-    durable_ids = {record["id"] for record in records}
     _private(provider, "_queued_record_ids").clear()
     ordered = list(records)
-    ordered.extend(record for record in queued_without_journal if record.get("id") not in durable_ids)
+    # A volatile queue entry has no durable admission proof.  It may be stale
+    # after an acknowledgement, quarantine, crash, or profile switch, so it
+    # must never be resurrected into the FIFO.
+    durable_by_id = {record["id"]: record for record in records}
+    for queued_record in queued_without_journal:
+        durable_record = durable_by_id.get(queued_record.get("id"))
+        if durable_record is not None and durable_record == queued_record:
+            ordered.append(durable_record)
     _private(provider, "_queue_pending_records")(tuple(ordered))
 
 

@@ -1,3 +1,5 @@
+# pylint: disable=missing-function-docstring,protected-access,too-many-lines
+
 """Tests for background steps: scan/watch/dispatch steps.
 
 Both scan steps are subclasses of BaseStep. To exercise them without spinning up
@@ -7,8 +9,6 @@ the step's kwargs (so the BaseStep _resolve() machinery returns them).
 InitChangesStep writes its result into ``context["changes"]`` for a
 downstream ``update_index_step`` to consume; tests assert against that key.
 """
-
-# pylint: disable=protected-access,too-many-lines
 
 from contextlib import chdir as temp_chdir
 import asyncio

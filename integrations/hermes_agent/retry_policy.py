@@ -1,5 +1,8 @@
 """Retry classification for durable Hermes provider writes."""
 
+# Explicit fail-closed branches are clearer here than combining dissimilar errors.
+# pylint: disable=R0911
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -29,7 +32,8 @@ _MAX_NESTED_ERROR_NODES = 128
 _RECEIPT_REPLAY_PREFIX = "protected receipt replay refused:"
 _PERMANENT_ERROR_MARKERS = (
     "request_id was already used for different input",
-    "protected note marker",
+    "protected note marker is missing or contradictory",
+    "protected note marker is contradictory",
     "protected note belongs to",
     "existing protected note belongs to a different source session",
     "protected marker source provenance is not an append-only extension",
@@ -48,11 +52,21 @@ _PERMANENT_ERROR_MARKERS = (
     "protected prior commit has no durable receipt",
     "protected prior commit receipt is malformed",
     "protected no-op receipt",
-    "protected note body digest",
     "protected note is unreadable",
     "protected daily note is unreadable",
 )
 _REPLAY_ONLY_PERMANENT_ERRORS = frozenset({"invalid protected note path"})
+_SEMANTIC_REFUSAL_CODE = "PROTECTED_OPTION_B_PROPOSAL_INVALID"
+_TEXTUAL_INFRASTRUCTURE_MARKERS = (
+    "[errno ",
+    "permission denied",
+    "no space left",
+    "too many open files",
+    "connection reset",
+    "temporarily unavailable",
+    "please retry",
+    "backend is temporarily unavailable",
+)
 
 
 def _contains_os_error(error: BaseException) -> bool:
@@ -96,6 +110,8 @@ def _contains_os_error(error: BaseException) -> bool:
 
 def is_permanent_write_failure(error: BaseException) -> bool:
     """Recognize application refusals that cannot improve by replaying unchanged input."""
+    if getattr(error, "refusal_code", None) == _SEMANTIC_REFUSAL_CODE:
+        return False
     if _contains_os_error(error):
         return False
     try:
@@ -104,6 +120,8 @@ def is_permanent_write_failure(error: BaseException) -> bool:
         return False
     if detail.startswith("error:"):
         detail = detail[6:].strip()
+    if any(marker in detail for marker in _TEXTUAL_INFRASTRUCTURE_MARKERS):
+        return False
     is_receipt_replay = detail.startswith(_RECEIPT_REPLAY_PREFIX)
     if is_receipt_replay:
         detail = detail[len(_RECEIPT_REPLAY_PREFIX) :].strip()
@@ -114,3 +132,12 @@ def is_permanent_write_failure(error: BaseException) -> bool:
             detail.startswith(marker) for marker in _PERMANENT_ERROR_MARKERS
         )
     return any(marker in detail for marker in _PERMANENT_ERROR_MARKERS)
+
+
+def classify_write_failure(error: BaseException) -> str:
+    """Classify a write without trusting model prose or infrastructure text."""
+    if _contains_os_error(error):
+        return "retryable"
+    if getattr(error, "refusal_code", None) == _SEMANTIC_REFUSAL_CODE:
+        return "semantic_refusal"
+    return "permanent" if is_permanent_write_failure(error) else "retryable"

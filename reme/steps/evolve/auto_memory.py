@@ -1,9 +1,9 @@
 """auto_memory — record conversation facts into a daily note via an agent."""
 
+# pylint: disable=C0302,R0915
 # This security-sensitive step intentionally keeps its provenance and crash-recovery
 # paths together; splitting it solely to satisfy a module-size threshold would make
 # the fail-closed state transitions harder to audit.
-# pylint: disable=too-many-lines
 
 import base64
 import binascii
@@ -1162,6 +1162,13 @@ class AutoMemoryStep(BaseStep):
             raise TypeError("protected memory commit requires request_id fingerprint state")
         agent_scope = self._option_b_scope()
 
+        def proposal_refusal(reason: str, message: str) -> None:
+            """Record a server-owned pre-commit refusal before raising."""
+            metadata = self.context.response.metadata
+            metadata["fermes_refusal_code"] = "PROTECTED_OPTION_B_PROPOSAL_INVALID"
+            metadata["fermes_refusal_reason"] = reason
+            raise RuntimeError(message)
+
         # A matching marker is the recovery path for SIGKILL after note commit.
         # Structural validation is independent of the current transcript hash:
         # a distinct request may have appended new source turns since this
@@ -1203,34 +1210,49 @@ class AutoMemoryStep(BaseStep):
             **reply_kwargs,
         )
         if not self._proposal_execution_valid(result):
-            raise RuntimeError("protected proposal contained failed, unknown, or ambiguous tool execution")
+            proposal_refusal(
+                "tool_result_invalid",
+                "protected proposal contained failed, unknown, or ambiguous tool execution",
+            )
         text = self._proposal_text(result)
         if text is None:
-            raise RuntimeError("protected proposal was not a JSON revision")
+            proposal_refusal("not_json_revision", "protected proposal was not a JSON revision")
         try:
             proposal = json.loads(text)
         except (TypeError, ValueError) as exc:
+            metadata = self.context.response.metadata
+            metadata["fermes_refusal_code"] = "PROTECTED_OPTION_B_PROPOSAL_INVALID"
+            metadata["fermes_refusal_reason"] = "invalid_json"
             raise RuntimeError("protected proposal was not valid JSON") from exc
         if not isinstance(proposal, dict) or set(proposal) != {"path", "name", "description", "content"}:
-            raise RuntimeError("protected proposal must contain exactly path, name, description, and content")
+            proposal_refusal(
+                "schema_mismatch",
+                "protected proposal must contain exactly path, name, description, and content",
+            )
         if any(not isinstance(proposal[key], str) for key in proposal):
-            raise RuntimeError("protected proposal fields must be strings")
+            proposal_refusal("non_string_field", "protected proposal fields must be strings")
         name = proposal["name"]
         description = proposal["description"]
         content = proposal["content"]
         if validate_filename_component(name, kind="name") or not description.strip():
-            raise RuntimeError("protected proposal has invalid name or description")
+            proposal_refusal("invalid_name_description", "protected proposal has invalid name or description")
         body = content if content.endswith("\n") else content + "\n"
         if len(body.encode("utf-8")) > self.max_file_bytes():
-            raise RuntimeError("protected proposal exceeds the file byte limit")
+            proposal_refusal("proposal_too_large", "protected proposal exceeds the file byte limit")
         if self._is_empty_option_b_content(content):
-            raise RuntimeError("protected proposal contained no substantive memory content")
+            proposal_refusal("empty_content", "protected proposal contained no substantive memory content")
         if created:
             expected_path = self._daily_note_path(day, name)
         elif proposal["path"] != note_path:
-            raise RuntimeError("protected update proposal changed the application-owned note path")
+            proposal_refusal(
+                "changed_update_path",
+                "protected update proposal changed the application-owned note path",
+            )
         if proposal["path"] != expected_path:
-            raise RuntimeError("protected proposal path does not match the application-owned daily path")
+            proposal_refusal(
+                "unexpected_daily_path",
+                "protected proposal path does not match the application-owned daily path",
+            )
         candidate_names = [name]
         if created:
             request_suffix = hashlib.sha256(f"{session_id}\0{request_id}".encode("utf-8")).hexdigest()[:8]
@@ -2039,6 +2061,11 @@ class AutoMemoryStep(BaseStep):
             return
         await self._save_session_messages(session_id, messages)
         if not messages:
+            request_id = self.context.get("request_id") if option_b else None
+            if option_b and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128):
+                self.context.response.success = False
+                self.context.response.answer = "Error: protected memory commit requires a valid request_id"
+                return
             self.context.response.success = True
             self.context.response.answer = "Skipped: no messages"
             self.context.response.metadata.update(
@@ -2049,6 +2076,8 @@ class AutoMemoryStep(BaseStep):
                     "outcome": _OPTION_B_NOOP_OUTCOME if option_b else None,
                 },
             )
+            if option_b:
+                self.context.response.metadata["request_id"] = request_id
             if not option_b:
                 self.context.response.metadata.pop("outcome", None)
             self.logger.info(f"[{self.name}] Skipped: no messages session_id={session_id!r} modified=False")

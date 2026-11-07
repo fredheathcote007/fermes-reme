@@ -11,6 +11,17 @@ from typing import Any, Callable, Protocol
 class ReMeBackendError(RuntimeError):
     """Raised when a ReMe backend cannot complete an operation."""
 
+    def __init__(
+        self,
+        message: object,
+        *details: object,
+        refusal_code: str | None = None,
+        refusal_reason: str | None = None,
+    ) -> None:
+        super().__init__(message, *details)
+        self.refusal_code = refusal_code
+        self.refusal_reason = refusal_reason
+
 
 class ReMeBackend(Protocol):
     """Synchronous interface matching Hermes' memory-provider lifecycle."""

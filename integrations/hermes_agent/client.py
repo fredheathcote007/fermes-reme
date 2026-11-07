@@ -13,6 +13,17 @@ from urllib.parse import urlsplit
 class ReMeServiceError(RuntimeError):
     """Raised when a ReMe action cannot be completed successfully."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        refusal_code: str | None = None,
+        refusal_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.refusal_code = refusal_code
+        self.refusal_reason = refusal_reason
+
 
 def _failure_detail(result: dict[str, Any]) -> str:
     """Return trusted detail from a failed response without exposing arbitrary fields."""
@@ -96,7 +107,19 @@ class ReMeHttpClient:
         if not isinstance(result, dict):
             raise ReMeServiceError("ReMe returned a non-object response")
         if result.get("success") is not True:
-            raise ReMeServiceError(_failure_detail(result))
+            refusal_code = None
+            refusal_reason = None
+            metadata = result.get("metadata")
+            if action == "auto_memory" and isinstance(metadata, dict):
+                if metadata.get("fermes_refusal_code") == "PROTECTED_OPTION_B_PROPOSAL_INVALID":
+                    refusal_code = metadata["fermes_refusal_code"]
+                    if isinstance(metadata.get("fermes_refusal_reason"), str):
+                        refusal_reason = metadata["fermes_refusal_reason"]
+            raise ReMeServiceError(
+                _failure_detail(result),
+                refusal_code=refusal_code,
+                refusal_reason=refusal_reason,
+            )
         return result
 
     def health(self, *, timeout: float) -> dict[str, Any]:
