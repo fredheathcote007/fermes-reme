@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import ExitStack
 import importlib.util
 import json
 import logging
@@ -1103,11 +1104,17 @@ class ReMeMemoryProvider(MemoryProvider):
     @staticmethod
     def _has_final_newline(path: Path) -> bool:
         """Check journal termination without allocating the journal contents."""
-        if not path.exists() or path.stat().st_size == 0:
+        try:
+            with path.open("rb") as handle:
+                try:
+                    handle.seek(-1, os.SEEK_END)
+                    return handle.read(1) == b"\n"
+                except OSError:
+                    return True
+        except FileNotFoundError:
             return True
-        with path.open("rb") as handle:
-            handle.seek(-1, os.SEEK_END)
-            return handle.read(1) == b"\n"
+        except OSError:
+            return False
 
     def _scan_journal(self, path: Path, *, quarantine: bool = False) -> list[dict[str, Any]] | None:
         """Parse one private JSONL journal without treating failures as empty."""
@@ -1142,6 +1149,8 @@ class ReMeMemoryProvider(MemoryProvider):
                 if len(records) >= _MAX_JOURNAL_RECORDS:
                     raise ValueError("durable journal exceeds its record limit")
                 records.append(record)
+        except FileNotFoundError:
+            return []
         except (OSError, UnicodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError):
             return None
         return records
@@ -1400,8 +1409,10 @@ class ReMeMemoryProvider(MemoryProvider):
         try:
             fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
             backup_fd, backup_name = tempfile.mkstemp(prefix=f".{path.name}.original.", dir=path.parent)
-            with os.fdopen(fd, "wb") as output, os.fdopen(backup_fd, "wb") as backup:
+            with ExitStack() as stack:
+                output = stack.enter_context(os.fdopen(fd, "wb"))
                 fd = -1
+                backup = stack.enter_context(os.fdopen(backup_fd, "wb"))
                 backup_fd = -1
                 for raw_line in self._iter_journal_lines(path):
                     current = json.loads(raw_line.decode("utf-8"))

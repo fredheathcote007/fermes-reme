@@ -491,6 +491,55 @@ def test_journal_rewrite_cleans_first_staging_file_when_backup_creation_fails(mo
     assert not list(provider._pending_path.parent.glob(f".{provider._pending_path.name}*"))
 
 
+def test_has_final_newline_treats_disappearing_file_as_complete(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    path = tmp_path / "quarantined-writes.jsonl"
+    path.write_bytes(b"record\n")
+    original_open = Path.open
+
+    def disappear_on_open(candidate, *args, **kwargs):
+        if candidate == path:
+            raise FileNotFoundError(path)
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", disappear_on_open)
+
+    assert provider._has_final_newline(path) is True
+
+
+def test_scan_journal_treats_disappearing_file_as_empty(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    path = tmp_path / "pending-writes.jsonl"
+    path.write_bytes(b"record\n")
+    monkeypatch.setattr(provider, "_iter_journal_lines", lambda _path: (_ for _ in ()).throw(FileNotFoundError(path)))
+
+    assert provider._scan_journal(path) == []
+
+
+def test_journal_rewrite_preserves_original_error_when_backup_fdopen_fails(monkeypatch, tmp_path):
+    provider = ReMeMemoryProvider()
+    provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
+    record = provider._append_pending_write({"session_id": "s", "messages": []})
+    before = provider._pending_path.read_bytes()
+    original_fdopen = PLUGIN_MODULE.os.fdopen
+    calls = 0
+
+    def fail_second_fdopen(fd, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("backup stream unavailable")
+        return original_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(PLUGIN_MODULE.os, "fdopen", fail_second_fdopen)
+
+    assert (
+        provider._rewrite_pending_record(provider._pending_path, record, replacement={**record, "attempts": 1}) is False
+    )
+    assert provider._pending_path.read_bytes() == before
+    assert not list(provider._pending_path.parent.glob(f".{provider._pending_path.name}*"))
+
+
 def test_enqueue_uses_append_scan_as_its_single_admission_check(monkeypatch, tmp_path):
     provider = ReMeMemoryProvider()
     provider._pending_path = tmp_path / "reme" / "pending-writes.jsonl"
