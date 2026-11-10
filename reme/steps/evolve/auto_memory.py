@@ -587,9 +587,6 @@ class AutoMemoryStep(BaseStep):
                 raise ValueError("protected outcome policy identity does not match the request")
         if retention_requested and policy["policy"] == _OPTION_B_NOOP_POLICY:
             raise ValueError("protected memory_hint requires retention_required policy")
-        if policy["policy"] == _OPTION_B_NOOP_POLICY:
-            if set(policy) != {"policy", "authority_id", "request_id", "session_id"}:
-                raise ValueError("protected no-op policy is incomplete")
         return policy
 
     def _set_protected_policy_conflict(self, reason: str) -> None:
