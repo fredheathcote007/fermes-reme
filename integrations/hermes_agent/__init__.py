@@ -1120,8 +1120,6 @@ class ReMeMemoryProvider(MemoryProvider):
         """Parse one private JSONL journal without treating failures as empty."""
         if not self._journal_path_safe(path):
             return None
-        if not path.exists():
-            return []
         records: list[dict[str, Any]] = []
         seen: dict[str, dict[str, Any]] = {}
         try:
