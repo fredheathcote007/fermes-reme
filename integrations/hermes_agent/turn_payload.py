@@ -25,11 +25,19 @@ def scoped_session_id(profile_id: str, session_id: str) -> str:
     return f"hermes-{_slug(profile, 'default', limit=32)}-{_slug(session, 'session', limit=64)}-{digest}"
 
 
-def build_turn_payload(profile_id: str, session_id: str, user: str, assistant: str) -> dict[str, Any]:
+def build_turn_payload(
+    profile_id: str,
+    session_id: str,
+    user: str,
+    assistant: str,
+    *,
+    memory_hint: str | None = None,
+    noop_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build the two-message payload for one completed Hermes turn."""
     turn_id = uuid.uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
-    return {
+    payload = {
         "session_id": scoped_session_id(profile_id, session_id),
         "messages": [
             {
@@ -48,6 +56,11 @@ def build_turn_payload(profile_id: str, session_id: str, user: str, assistant: s
             },
         ],
     }
+    if memory_hint is not None:
+        payload["memory_hint"] = memory_hint
+    if noop_policy is not None:
+        payload["noop_policy"] = noop_policy
+    return payload
 
 
 _VALID_MESSAGE_ROLES = frozenset({"user", "assistant", "system"})
@@ -120,6 +133,10 @@ def valid_pending_payload(payload: object) -> bool:
         return False
     messages = payload.get("messages")
     if not isinstance(messages, list) or not all(_valid_message(message) for message in messages):
+        return False
+    if "memory_hint" in payload and not isinstance(payload["memory_hint"], str):
+        return False
+    if "noop_policy" in payload and not isinstance(payload["noop_policy"], dict):
         return False
     return _is_json_safe(payload)
 

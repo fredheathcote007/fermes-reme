@@ -2,12 +2,13 @@
 
 # Keep the existing security-sensitive journal state machine intact in Stage 2A.
 # Follow-up modularisation is separate from this source-only safety correction.
-# pylint: disable=C0302,R0911
+# pylint: disable=C0302,R0911,R0916
 
 from __future__ import annotations
 
 import atexit
 from contextlib import ExitStack
+import hashlib
 import importlib.util
 import json
 import logging
@@ -768,12 +769,14 @@ class ReMeMemoryProvider(MemoryProvider):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        memory_hint: str | None = None,
+        noop_policy: dict[str, Any] | None = None,
     ) -> None:
         """Durably spool one completed turn before background memory extraction."""
         del messages
         user = str(user_content or "").strip()
         assistant = str(assistant_content or "").strip()
-        if not self._write_enabled or not (user or assistant):
+        if not self._write_enabled or (not (user or assistant) and memory_hint is None and noop_policy is None):
             return
         routed_session = str(session_id or self._session_id)
         if not routed_session:
@@ -781,7 +784,14 @@ class ReMeMemoryProvider(MemoryProvider):
                 "ReMe skipped a completed turn because Hermes supplied no session id",
             )
             return
-        payload = _build_turn_payload(self._profile_id, routed_session, user, assistant)
+        payload = _build_turn_payload(
+            self._profile_id,
+            routed_session,
+            user,
+            assistant,
+            memory_hint=memory_hint,
+            noop_policy=noop_policy,
+        )
         if not self._enqueue_write(payload):
             logger.warning(
                 "ReMe did not record session %s because the provider is unavailable: %s",
@@ -1059,11 +1069,58 @@ class ReMeMemoryProvider(MemoryProvider):
         return profiles_match
 
     @staticmethod
+    def _quarantine_provenance(record: dict[str, Any]) -> dict[str, Any] | None:
+        """Build privacy-safe provenance for a newly generated quarantine row."""
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or not isinstance(payload.get("session_id"), str):
+            return None
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or any(not isinstance(message, dict) for message in messages):
+            return None
+        message_ids = [message.get("id") for message in messages]
+        if any(not isinstance(message_id, str) for message_id in message_ids):
+            return None
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            return None
+        policy = payload.get("noop_policy")
+        return {
+            "profile_id": record.get("profile_id"),
+            "request_id": record.get("id"),
+            "session_id": payload["session_id"],
+            "message_ids": message_ids,
+            "input_sha256": hashlib.sha256(encoded).hexdigest(),
+            "memory_hint_present": "memory_hint" in payload,
+            "policy": policy.get("policy") if isinstance(policy, dict) else None,
+        }
+
+    @staticmethod
+    def _valid_quarantine_provenance(record: dict[str, Any]) -> bool:
+        """Validate optional Stage 2B provenance while accepting legacy rows."""
+        provenance = record.get("provenance")
+        if provenance is None:
+            return True
+        if not isinstance(provenance, dict):
+            return False
+        expected = ReMeMemoryProvider._quarantine_provenance(record)
+        return expected is not None and provenance == expected
+
+    @staticmethod
     def _quarantine_record_equal(first: dict[str, Any], second: dict[str, Any]) -> bool:
         """Require every quarantine evidence field to agree for duplicate IDs."""
         return all(
             first.get(key) == second.get(key)
-            for key in ("id", "profile_id", "attempts", "semantic_refusals", "reason", "outcome", "payload")
+            for key in (
+                "id",
+                "profile_id",
+                "attempts",
+                "semantic_refusals",
+                "reason",
+                "outcome",
+                "payload",
+                "provenance",
+            )
         )
 
     @staticmethod
@@ -1081,7 +1138,12 @@ class ReMeMemoryProvider(MemoryProvider):
         if record.get("outcome") != "QUARANTINED/NOT COMMITTED":
             return False
         attempts = record.get("attempts", 0)
-        return isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0
+        return (
+            isinstance(attempts, int)
+            and not isinstance(attempts, bool)
+            and attempts >= 0
+            and ReMeMemoryProvider._valid_quarantine_provenance(record)
+        )
 
     def _iter_journal_lines(self, path: Path):
         """Yield bounded raw lines without a whole-file read race."""
@@ -1191,7 +1253,23 @@ class ReMeMemoryProvider(MemoryProvider):
             raise OSError("profile-local ReMe queue path is not configured")
         if self._journal_state != "READY":
             raise OSError("durable ReMe journal is not accepting writes")
-        record = {"id": uuid.uuid4().hex, "profile_id": self._profile_id, "attempts": 0, "payload": payload}
+        request_id = uuid.uuid4().hex
+        journal_payload = dict(payload)
+        policy = journal_payload.get("noop_policy")
+        if isinstance(policy, dict):
+            # The journal record is the outer request boundary.  Bind the
+            # application-owned envelope to the stable record/session IDs
+            # before it is fingerprinted or handed to a backend.
+            bound_policy = dict(policy)
+            bound_policy["request_id"] = request_id
+            bound_policy["session_id"] = journal_payload.get("session_id")
+            journal_payload["noop_policy"] = bound_policy
+        record = {
+            "id": request_id,
+            "profile_id": self._profile_id,
+            "attempts": 0,
+            "payload": journal_payload,
+        }
         encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
         if len(encoded) > _MAX_RECORD_JSON_BYTES:
             raise ValueError("durable ReMe turn exceeds the 1 MiB record limit")
@@ -1284,6 +1362,11 @@ class ReMeMemoryProvider(MemoryProvider):
             "outcome": "QUARANTINED/NOT COMMITTED",
             "payload": record.get("payload"),
         }
+        provenance = self._quarantine_provenance(entry)
+        if provenance is None:
+            self._set_journal_halted("HALTED_CORRUPT", "durable quarantine provenance is invalid")
+            return False
+        entry["provenance"] = provenance
         if not self._valid_quarantine_record(entry):
             self._set_journal_halted("HALTED_CORRUPT")
             return False
@@ -1512,9 +1595,15 @@ class ReMeMemoryProvider(MemoryProvider):
                         return
                     retry = False
                     try:
+                        record_payload = payload["payload"]
+                        backend_kwargs: dict[str, Any] = {"request_id": payload["id"]}
+                        if "memory_hint" in record_payload:
+                            backend_kwargs["memory_hint"] = record_payload["memory_hint"]
+                        if "noop_policy" in record_payload:
+                            backend_kwargs["noop_policy"] = record_payload["noop_policy"]
                         if not self._record_payload(
-                            payload["payload"],
-                            request_id=payload["id"],
+                            record_payload,
+                            **backend_kwargs,
                             respect_cooldown=True,
                         ):
                             retry = True
@@ -1617,9 +1706,15 @@ class ReMeMemoryProvider(MemoryProvider):
         payload: dict[str, Any],
         *,
         request_id: str | None = None,
+        memory_hint: str | None = None,
+        noop_policy: dict[str, Any] | None = None,
         respect_cooldown: bool = True,
     ) -> bool:
         self._last_write_failure_kind = ""
+        if memory_hint is None and "memory_hint" in payload:
+            memory_hint = payload["memory_hint"]
+        if noop_policy is None and "noop_policy" in payload:
+            noop_policy = payload["noop_policy"]
         if respect_cooldown and time.monotonic() < self._next_write_attempt:
             self._last_write_failure_kind = "cooldown"
             logger.warning(
@@ -1638,11 +1733,24 @@ class ReMeMemoryProvider(MemoryProvider):
                 return False
             assert self._backend is not None
             try:
+                backend_kwargs: dict[str, Any] = {
+                    "timeout": self._request_timeout,
+                    "request_id": request_id,
+                }
+                if memory_hint is not None:
+                    backend_kwargs["memory_hint"] = memory_hint
+                if noop_policy is not None:
+                    backend_kwargs["noop_policy"] = noop_policy
+                if (
+                    isinstance(noop_policy, dict)
+                    and noop_policy.get("policy") == "application_authorized_noop"
+                    and not self._protected_option_b_enabled()
+                ):
+                    raise ReMeBackendError("protected no-op authority is unavailable for this backend")
                 response = self._backend.auto_memory(
                     payload["session_id"],
                     payload["messages"],
-                    timeout=self._request_timeout,
-                    request_id=request_id,
+                    **backend_kwargs,
                 )
                 if not isinstance(response, dict) or response.get("success") is not True:
                     metadata = response.get("metadata") if isinstance(response, dict) else None
@@ -1660,7 +1768,11 @@ class ReMeMemoryProvider(MemoryProvider):
                         refusal_code=(
                             refusal_code
                             if self._protected_option_b_enabled()
-                            and refusal_code == "PROTECTED_OPTION_B_PROPOSAL_INVALID"
+                            and refusal_code
+                            in {
+                                "PROTECTED_OPTION_B_PROPOSAL_INVALID",
+                                "PROTECTED_OPTION_B_POLICY_CONFLICT",
+                            }
                             else None
                         ),
                         refusal_reason=refusal_reason if isinstance(refusal_reason, str) else None,
@@ -1682,8 +1794,15 @@ class ReMeMemoryProvider(MemoryProvider):
                         if (
                             not isinstance(request_id, str)
                             or metadata.get("request_id") != request_id
+                            or metadata.get("session_id") != payload.get("session_id")
+                            or metadata.get("schema_version") != 2
+                            or not isinstance(metadata.get("input_fingerprint"), str)
+                            or not isinstance(noop_policy, dict)
+                            or noop_policy.get("policy") != "application_authorized_noop"
+                            or metadata.get("authority_id") != noop_policy.get("authority_id")
+                            or metadata.get("policy") != "application_authorized_noop"
                             or metadata.get("modified") is not False
-                            or metadata.get("n_messages") != 0
+                            or metadata.get("n_messages") != len(payload.get("messages") or [])
                             or "commit" in metadata
                         ):
                             raise ReMeBackendError("protected auto_memory returned an invalid no-op receipt")

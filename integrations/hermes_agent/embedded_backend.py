@@ -218,7 +218,10 @@ class EmbeddedReMeBackend:
             refusal_code = None
             refusal_reason = None
             if action in {None, "auto_memory"} and isinstance(metadata, dict):
-                if metadata.get("fermes_refusal_code") == "PROTECTED_OPTION_B_PROPOSAL_INVALID":
+                if metadata.get("fermes_refusal_code") in {
+                    "PROTECTED_OPTION_B_PROPOSAL_INVALID",
+                    "PROTECTED_OPTION_B_POLICY_CONFLICT",
+                }:
                     refusal_code = metadata["fermes_refusal_code"]
                     if isinstance(metadata.get("fermes_refusal_reason"), str):
                         refusal_reason = metadata["fermes_refusal_reason"]
@@ -257,6 +260,8 @@ class EmbeddedReMeBackend:
         *,
         timeout: float,
         request_id: str | None = None,
+        memory_hint: str | None = None,
+        noop_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run ReMe's automatic-memory job on the owned loop."""
         with self._operation_lock:
@@ -266,6 +271,10 @@ class EmbeddedReMeBackend:
             }
             if request_id is not None:
                 kwargs["request_id"] = request_id
+            if memory_hint is not None:
+                kwargs["memory_hint"] = memory_hint
+            if noop_policy is not None:
+                kwargs["noop_policy"] = noop_policy
             return self._submit(
                 self._run_job("auto_memory", **kwargs),
                 timeout=timeout,

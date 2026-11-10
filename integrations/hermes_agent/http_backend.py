@@ -50,11 +50,19 @@ class HttpReMeBackend:
         *,
         timeout: float,
         request_id: str | None = None,
+        memory_hint: str | None = None,
+        noop_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Submit a completed turn through the HTTP action service."""
+        if isinstance(noop_policy, dict) and noop_policy.get("policy") == "application_authorized_noop":
+            raise ReMeBackendError("HTTP backend cannot authenticate protected no-op authority")
         payload: dict[str, Any] = {"session_id": session_id, "messages": messages}
         if request_id is not None:
             payload["request_id"] = request_id
+        if memory_hint is not None:
+            payload["memory_hint"] = memory_hint
+        if noop_policy is not None:
+            payload["noop_policy"] = noop_policy
         return self._call(
             "auto_memory",
             payload,

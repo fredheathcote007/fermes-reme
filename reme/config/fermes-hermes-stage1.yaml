@@ -58,6 +58,11 @@ jobs:
           type: string
           description: >-
             optional explicit retention hint; nonblank AgentScope hints require attributable durable evidence
+        noop_policy:
+          type: object
+          description: >-
+            application-owned protected outcome policy; application_authorized_noop requires matching authority,
+            request, and session identity
         include_images: {type: boolean, default: false}
         date: {type: string, default: ""}
       required: [messages]

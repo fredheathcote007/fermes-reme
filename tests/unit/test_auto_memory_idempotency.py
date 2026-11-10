@@ -593,6 +593,13 @@ async def test_application_run_job_rejects_tampered_protected_receipt(
 
     monkeypatch.setattr(AsAgentWrapper, "reply", proposal_reply)
     request = {"session_id": "tamper-session", "messages": messages, "date": "2026-10-21"}
+    if not messages:
+        request["noop_policy"] = {
+            "policy": "application_authorized_noop",
+            "authority_id": "test-harness",
+            "request_id": "tamper-request",
+            "session_id": "tamper-session",
+        }
     async with Application(**config) as app:
         first = await app.run_job("auto_memory", request_id="tamper-request", **request)
         assert first.success
@@ -652,6 +659,12 @@ async def test_protected_empty_turn_has_idempotent_noop_receipt_without_commit_o
             session_id="protected-empty-session",
             messages=[],
             date="2026-10-21",
+            noop_policy={
+                "policy": "application_authorized_noop",
+                "authority_id": "test-harness",
+                "request_id": "protected-empty-turn",
+                "session_id": "protected-empty-session",
+            },
         )
         return step
 
