@@ -44,12 +44,15 @@ class ReMeBackend(Protocol):
         *,
         timeout: float,
         request_id: str | None = None,
+        memory_hint: str | None = None,
+        noop_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record and extract memory from one completed turn.
 
         ``request_id`` is the durable Hermes spool record ID.  Backends may
         omit it only when talking to an older ReMe service that has no
-        idempotent request field yet.
+        idempotent request field yet.  The optional retention fields are
+        forwarded only when present, preserving older callers.
         """
 
     def close(self, *, timeout: float) -> None:

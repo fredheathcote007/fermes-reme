@@ -111,7 +111,10 @@ class ReMeHttpClient:
             refusal_reason = None
             metadata = result.get("metadata")
             if action == "auto_memory" and isinstance(metadata, dict):
-                if metadata.get("fermes_refusal_code") == "PROTECTED_OPTION_B_PROPOSAL_INVALID":
+                if metadata.get("fermes_refusal_code") in {
+                    "PROTECTED_OPTION_B_PROPOSAL_INVALID",
+                    "PROTECTED_OPTION_B_POLICY_CONFLICT",
+                }:
                     refusal_code = metadata["fermes_refusal_code"]
                     if isinstance(metadata.get("fermes_refusal_reason"), str):
                         refusal_reason = metadata["fermes_refusal_reason"]

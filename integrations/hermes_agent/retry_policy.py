@@ -57,6 +57,12 @@ _PERMANENT_ERROR_MARKERS = (
 )
 _REPLAY_ONLY_PERMANENT_ERRORS = frozenset({"invalid protected note path"})
 _SEMANTIC_REFUSAL_CODE = "PROTECTED_OPTION_B_PROPOSAL_INVALID"
+_SEMANTIC_REFUSAL_CODES = frozenset(
+    {
+        _SEMANTIC_REFUSAL_CODE,
+        "PROTECTED_OPTION_B_POLICY_CONFLICT",
+    },
+)
 _TEXTUAL_INFRASTRUCTURE_MARKERS = (
     "[errno ",
     "permission denied",
@@ -110,7 +116,7 @@ def _contains_os_error(error: BaseException) -> bool:
 
 def is_permanent_write_failure(error: BaseException) -> bool:
     """Recognize application refusals that cannot improve by replaying unchanged input."""
-    if getattr(error, "refusal_code", None) == _SEMANTIC_REFUSAL_CODE:
+    if getattr(error, "refusal_code", None) in _SEMANTIC_REFUSAL_CODES:
         return False
     if _contains_os_error(error):
         return False
@@ -138,6 +144,6 @@ def classify_write_failure(error: BaseException) -> str:
     """Classify a write without trusting model prose or infrastructure text."""
     if _contains_os_error(error):
         return "retryable"
-    if getattr(error, "refusal_code", None) == _SEMANTIC_REFUSAL_CODE:
+    if getattr(error, "refusal_code", None) in _SEMANTIC_REFUSAL_CODES:
         return "semantic_refusal"
     return "permanent" if is_permanent_write_failure(error) else "retryable"

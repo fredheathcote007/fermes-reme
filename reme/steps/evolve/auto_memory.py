@@ -1,6 +1,6 @@
 """auto_memory — record conversation facts into a daily note via an agent."""
 
-# pylint: disable=C0302,R0915
+# pylint: disable=C0302,R0915,R0916
 # This security-sensitive step intentionally keeps its provenance and crash-recovery
 # paths together; splitting it solely to satisfy a module-size threshold would make
 # the fail-closed state transitions harder to audit.
@@ -61,8 +61,12 @@ _MESSAGE_TIME_ALIASES = ("time_created", "timestamp", "createdAt", "timeCreated"
 _SUCCESSFUL_TOOL_STATES = {"success", "succeeded", "ok"}
 _OPTION_B_MARKER = "_reme_commit"
 _OPTION_B_VERSION = 1
+_OPTION_B_NOOP_SCHEMA_VERSION = 2
 _OPTION_B_COMMIT_OUTCOME = "commit"
 _OPTION_B_NOOP_OUTCOME = "noop"
+_OPTION_B_POLICY_CONFLICT_CODE = "PROTECTED_OPTION_B_POLICY_CONFLICT"
+_OPTION_B_NOOP_POLICY = "application_authorized_noop"
+_OPTION_B_RETENTION_POLICY = "retention_required"
 _OPTION_B_RESERVED_METADATA = frozenset(
     {
         "name",
@@ -558,6 +562,45 @@ class AutoMemoryStep(BaseStep):
             raise ValueError("protected memory commit requires a configured agent_scope")
         return scope
 
+    def _protected_outcome_policy(self, *, request_id: str, session_id: str, memory_hint: object) -> dict:
+        """Validate the application-owned protected outcome policy before model work."""
+        raw_policy = self.context.get("noop_policy") if self.context is not None else None
+        retention_requested = isinstance(memory_hint, str) and bool(memory_hint.strip())
+        if raw_policy is None:
+            policy = {"policy": _OPTION_B_RETENTION_POLICY}
+        elif not isinstance(raw_policy, dict):
+            raise ValueError("protected outcome policy is malformed")
+        else:
+            required = {"policy", "authority_id", "request_id", "session_id"}
+            if set(raw_policy) != required:
+                raise ValueError("protected outcome policy is incomplete")
+            policy = dict(raw_policy)
+            if policy["policy"] not in {_OPTION_B_NOOP_POLICY, _OPTION_B_RETENTION_POLICY}:
+                raise ValueError("protected outcome policy is unknown")
+            if (
+                not isinstance(policy["authority_id"], str)
+                or not policy["authority_id"].strip()
+                or len(policy["authority_id"]) > 128
+            ):
+                raise ValueError("protected outcome policy authority is invalid")
+            if policy["request_id"] != request_id or policy["session_id"] != session_id:
+                raise ValueError("protected outcome policy identity does not match the request")
+        if retention_requested and policy["policy"] == _OPTION_B_NOOP_POLICY:
+            raise ValueError("protected memory_hint requires retention_required policy")
+        return policy
+
+    def _set_protected_policy_conflict(self, reason: str) -> None:
+        """Return a typed application refusal without creating a receipt."""
+        assert self.context is not None
+        self.context.response.success = False
+        self.context.response.answer = "Error: protected outcome policy conflict"
+        self.context.response.metadata.update(
+            {
+                "fermes_refusal_code": _OPTION_B_POLICY_CONFLICT_CODE,
+                "fermes_refusal_reason": reason,
+            },
+        )
+
     @staticmethod
     def _option_b_note_owned_by_session(metadata: object, trusted: dict) -> bool:
         """Require exact session ownership without binding prior notes to a new hash."""
@@ -751,15 +794,35 @@ class AutoMemoryStep(BaseStep):
         return response
 
     @staticmethod
-    def _validate_option_b_noop_receipt_record(record: dict, *, fingerprint: str) -> Response:
-        """Validate a durable no-op receipt without requiring commit evidence."""
-        if not isinstance(record, dict) or record.get("version") != _OPTION_B_VERSION:
-            raise RuntimeError("protected receipt is malformed")
+    def _validate_option_b_noop_receipt_record(
+        record: dict,
+        *,
+        request_id: str,
+        session_id: str,
+        fingerprint: str,
+        authority_id: str,
+        n_messages: int,
+    ) -> Response:
+        """Validate a versioned application-authorized no-op receipt."""
+        if (
+            not isinstance(record, dict)
+            or record.get("version") != _OPTION_B_VERSION
+            or record.get("schema_version") != _OPTION_B_NOOP_SCHEMA_VERSION
+        ):
+            raise RuntimeError("protected no-op receipt schema is malformed")
         if record.get("outcome") != _OPTION_B_NOOP_OUTCOME:
             raise RuntimeError("protected receipt is not a no-op")
-        if record.get("fingerprint") != fingerprint:
+        if (
+            record.get("request_id") != request_id
+            or record.get("session_id") != session_id
+            or record.get("input_fingerprint") != fingerprint
+            or record.get("authority_id") != authority_id
+            or record.get("policy") != _OPTION_B_NOOP_POLICY
+            or record.get("modified") is not False
+            or record.get("n_messages") != n_messages
+        ):
             raise RuntimeError("protected receipt fingerprint does not match its request")
-        if any(key in record for key in ("commit", "note_sha256")) or record.get("changes") != []:
+        if any(key in record for key in ("commit", "note_sha256", "path", "created")) or record.get("changes") != []:
             raise RuntimeError("protected no-op receipt contains commit evidence")
         try:
             response = Response.model_validate(record.get("response"))
@@ -768,9 +831,15 @@ class AutoMemoryStep(BaseStep):
         metadata = response.metadata
         if (
             not response.success
+            or metadata.get("schema_version") != _OPTION_B_NOOP_SCHEMA_VERSION
             or metadata.get("outcome") != _OPTION_B_NOOP_OUTCOME
+            or metadata.get("request_id") != request_id
+            or metadata.get("session_id") != session_id
+            or metadata.get("input_fingerprint") != fingerprint
+            or metadata.get("authority_id") != authority_id
+            or metadata.get("policy") != _OPTION_B_NOOP_POLICY
             or metadata.get("modified") is not False
-            or metadata.get("n_messages") != 0
+            or metadata.get("n_messages") != n_messages
             or any(key in metadata for key in ("commit", "note_sha256", "path", "created"))
         ):
             raise RuntimeError("protected no-op receipt response is malformed")
@@ -1391,16 +1460,28 @@ class AutoMemoryStep(BaseStep):
         assert self.context is not None
         if not isinstance(record, dict) or record.get("version") != _OPTION_B_VERSION:
             raise RuntimeError("protected receipt is malformed")
-        if record.get("fingerprint") != fingerprint:
-            self.context.response.success = False
-            self.context.response.answer = "Error: request_id was already used for different input"
-            return
         if record.get("outcome") == _OPTION_B_NOOP_OUTCOME:
-            response = self._validate_option_b_noop_receipt_record(record, fingerprint=fingerprint)
+            if record.get("input_fingerprint") != fingerprint:
+                self.context.response.success = False
+                self.context.response.answer = "Error: request_id was already used for different input"
+                return
+            policy = self.context.get("_option_b_policy") or {}
+            response = self._validate_option_b_noop_receipt_record(
+                record,
+                request_id=str(self.context.get("request_id")),
+                session_id=session_id,
+                fingerprint=fingerprint,
+                authority_id=str(policy.get("authority_id", "")),
+                n_messages=len(self.context.get("messages") or []),
+            )
             self.context.response.answer = response.answer
             self.context.response.success = response.success
             self.context.response.metadata.update(response.metadata)
             self.context["changes"] = []
+            return
+        if record.get("fingerprint") != fingerprint:
+            self.context.response.success = False
+            self.context.response.answer = "Error: request_id was already used for different input"
             return
         if record.get("outcome", _OPTION_B_COMMIT_OUTCOME) != _OPTION_B_COMMIT_OUTCOME:
             raise RuntimeError("protected receipt has an unknown outcome")
@@ -1454,18 +1535,38 @@ class AutoMemoryStep(BaseStep):
         outcome = self.context.response.metadata.get("outcome", _OPTION_B_COMMIT_OUTCOME)
         if outcome == _OPTION_B_NOOP_OUTCOME:
             metadata = self.context.response.metadata
+            policy = self.context.get("_option_b_policy") or {}
+            request_id = self.context.get("request_id")
+            session_id = self.context.get("session_id")
             if (
                 not self.context.response.success
+                or not isinstance(request_id, str)
+                or not isinstance(session_id, str)
+                or policy.get("policy") != _OPTION_B_NOOP_POLICY
+                or not isinstance(policy.get("authority_id"), str)
+                or metadata.get("schema_version") != _OPTION_B_NOOP_SCHEMA_VERSION
                 or metadata.get("modified") is not False
-                or metadata.get("n_messages") != 0
+                or metadata.get("request_id") != request_id
+                or metadata.get("session_id") != session_id
+                or metadata.get("input_fingerprint") != fingerprint
+                or metadata.get("authority_id") != policy.get("authority_id")
+                or metadata.get("policy") != _OPTION_B_NOOP_POLICY
+                or metadata.get("n_messages") != len(self.context.get("messages") or [])
                 or any(key in metadata for key in ("commit", "note_sha256", "path", "created"))
                 or self.context.get("changes")
             ):
                 raise TypeError("protected no-op has unexpected commit evidence")
             record = {
                 "version": _OPTION_B_VERSION,
+                "schema_version": _OPTION_B_NOOP_SCHEMA_VERSION,
                 "outcome": _OPTION_B_NOOP_OUTCOME,
-                "fingerprint": fingerprint,
+                "request_id": request_id,
+                "session_id": session_id,
+                "input_fingerprint": fingerprint,
+                "authority_id": policy["authority_id"],
+                "policy": _OPTION_B_NOOP_POLICY,
+                "modified": False,
+                "n_messages": len(self.context.get("messages") or []),
                 "response": self.context.response.model_dump(mode="json"),
                 "changes": [],
             }
@@ -1879,9 +1980,25 @@ class AutoMemoryStep(BaseStep):
                 )
                 return
 
+        option_b = self._option_b_enabled()
+        if option_b:
+            try:
+                policy = self._protected_outcome_policy(
+                    request_id=request_id,
+                    session_id=str(self.context.get("session_id", "")),
+                    memory_hint=self.context.get("memory_hint"),
+                )
+            except ValueError as exc:
+                reason = "retention_required" if "memory_hint" in str(exc) else "invalid_policy"
+                self._set_protected_policy_conflict(reason)
+                return
+            self.context["_option_b_policy"] = policy
+
         payload = {
             key: self.context.get(key) for key in ("session_id", "messages", "date", "memory_hint", "include_images")
         }
+        if option_b:
+            payload["noop_policy"] = self.context["_option_b_policy"]
         if payload["messages"]:
             # Keep caller-provided IDs/timestamps; parsing dictionaries would generate defaults on every retry.
             payload["messages"] = [
@@ -1891,7 +2008,6 @@ class AutoMemoryStep(BaseStep):
         fingerprint = hashlib.sha256(
             json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(),
         ).hexdigest()
-        option_b = self._option_b_enabled()
         self.context["_option_b_fingerprint"] = fingerprint
         session_key = hashlib.sha256(str(payload["session_id"]).encode()).hexdigest()
         request_key = hashlib.sha256(request_id.encode()).hexdigest()
@@ -2044,6 +2160,27 @@ class AutoMemoryStep(BaseStep):
 
         protected = self._provenance_enabled()
         option_b = self._option_b_enabled()
+        if option_b and (self.context.get("_option_b_policy") or {}).get("policy") == _OPTION_B_NOOP_POLICY:
+            await self._save_session_messages(session_id, messages)
+            policy = self.context["_option_b_policy"]
+            self.context.response.success = True
+            self.context.response.answer = "Skipped: application-authorized no-op"
+            self.context.response.metadata.update(
+                {
+                    "date": day,
+                    "schema_version": _OPTION_B_NOOP_SCHEMA_VERSION,
+                    "outcome": _OPTION_B_NOOP_OUTCOME,
+                    "request_id": self.context.get("request_id"),
+                    "session_id": session_id,
+                    "input_fingerprint": self.context.get("_option_b_fingerprint"),
+                    "authority_id": policy["authority_id"],
+                    "policy": _OPTION_B_NOOP_POLICY,
+                    "modified": False,
+                    "n_messages": len(messages),
+                },
+            )
+            self.logger.info("[%s] authorized no-op session=%r n=%d", self.name, session_id, len(messages))
+            return
         history_messages, images, reply_kwargs = self._prepare_image_history(messages, day)
         if option_b and images:
             self.context.response.success = False
@@ -2061,6 +2198,9 @@ class AutoMemoryStep(BaseStep):
             return
         await self._save_session_messages(session_id, messages)
         if not messages:
+            if option_b:
+                self._set_protected_policy_conflict("empty_input_requires_explicit_noop")
+                return
             request_id = self.context.get("request_id") if option_b else None
             if option_b and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128):
                 self.context.response.success = False
