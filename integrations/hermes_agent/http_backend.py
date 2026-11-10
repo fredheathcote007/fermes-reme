@@ -29,7 +29,11 @@ class HttpReMeBackend:
         try:
             return self._client.call(action, payload, timeout=timeout)
         except (ReMeServiceError, ValueError) as exc:
-            raise ReMeBackendError(str(exc)) from exc
+            raise ReMeBackendError(
+                str(exc),
+                refusal_code=getattr(exc, "refusal_code", None),
+                refusal_reason=getattr(exc, "refusal_reason", None),
+            ) from exc
 
     def health(self, *, timeout: float) -> dict[str, Any]:
         """Call the action service health check."""
