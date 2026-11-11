@@ -1810,6 +1810,15 @@ class ReMeMemoryProvider(MemoryProvider):
                         raise ReMeBackendError("protected auto_memory returned an unknown receipt outcome")
                 if response.get("answer") and not isinstance(response.get("metadata"), dict):
                     raise ReMeBackendError("auto_memory returned success without a verified commit receipt")
+                if self._protected_option_b_enabled() and metadata.get("outcome", "commit") == "commit":
+                    if metadata.get("index_status") == "degraded":
+                        # The source note/BM25 commit was already verified.
+                        # Surface rebuildable navigation degradation at the
+                        # Hermes provider boundary before the FIFO ACK.
+                        logger.warning(
+                            "Protected ReMe derived daily index degraded after verified durable commit; "
+                            "eligible for FIFO acknowledgement",
+                        )
                 return True
             except ReMeBackendError as exc:
                 self._last_write_failure_kind = _classify_write_failure(exc)
