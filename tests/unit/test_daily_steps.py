@@ -25,6 +25,7 @@ from contextlib import chdir as temp_chdir
 import tempfile
 import warnings
 from pathlib import Path
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import pytest
@@ -617,3 +618,91 @@ async def test_daily_reindex_created_flag_flips_on_rerun():
         assert payload_second["created"] is False
         assert payload_second["notes_count"] == 1
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_write_reports_unreadable_index_without_losing_note(tmp_path):
+    """A successful note write remains durable when its derived index is unreadable."""
+
+    with temp_chdir(tmp_path):
+        store = LocalFileStore(name="t", embedding_store="")
+        index = tmp_path / "daily" / "2026-05-18.md"
+        index.parent.mkdir(parents=True)
+        damaged = b"---\ntags: [\n---\nold index\n"
+        index.write_bytes(damaged)
+        step = await _make_daily_write_step(store, str(tmp_path))
+
+        async def write_note(_specs, **kwargs):
+            note = tmp_path / kwargs["path"]
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text(
+                f"---\nname: {kwargs['name']}\ndescription: {kwargs['description']}\n"
+                f"session_id: {kwargs['metadata']['session_id']}\n---\n{kwargs['content']}\n",
+                encoding="utf-8",
+            )
+            return [SimpleNamespace(success=True, answer="note written")]
+
+        async def failed_refresh(*_args, **_kwargs):
+            return {
+                "date": "2026-05-18",
+                "path": "daily/2026-05-18.md",
+                "notes": [],
+                "created": False,
+                "changed": False,
+                "error": "daily index is unreadable: malformed YAML",
+            }
+
+        step.dispatch_steps = write_note
+
+        with patch("reme.steps.file_io.daily_write.refresh_day_index", new=failed_refresh):
+            await step(
+                name="project-plan",
+                description="Plan note",
+                session_id="session-1",
+                content="body text",
+                date="2026-05-18",
+            )
+
+        response = step.context.response
+        assert response.success is False
+        assert response.answer.startswith("Error: daily index is unreadable")
+        assert "private-page-contents" not in response.answer
+        assert response.metadata["index"]["changed"] is False
+        assert (tmp_path / "daily/2026-05-18/project-plan.md").is_file()
+        assert index.read_bytes() == damaged
+
+
+@pytest.mark.asyncio
+async def test_daily_write_retry_after_index_repair_does_not_duplicate_note(tmp_path):
+    """A failed derived-page refresh does not roll back or append another note."""
+    with temp_chdir(tmp_path):
+        store = await _make_store_with_dailies([])
+        try:
+            index = tmp_path / "daily/2026-05-18.md"
+            index.parent.mkdir(parents=True, exist_ok=True)
+            damaged = b"---\ntags: [\n---\noriginal page\n"
+            index.write_bytes(damaged)
+            step = await _make_daily_write_step(store, str(tmp_path))
+            arguments = {
+                "name": "project-plan",
+                "description": "Durable note",
+                "session_id": "repeat-session",
+                "content": "single durable paragraph",
+                "date": "2026-05-18",
+            }
+            await step(**arguments)
+            first = step.context.response
+            assert not first.success
+            assert first.metadata["path"] == "daily/2026-05-18/project-plan.md"
+            note = tmp_path / "daily/2026-05-18/project-plan.md"
+            original_note = note.read_bytes()
+            assert index.read_bytes() == damaged
+
+            index.write_text("---\nname: 2026-05-18\n---\nrepaired page\n", encoding="utf-8")
+            await step(**arguments)
+            assert step.context.response.success
+            assert note.read_bytes() == original_note
+            assert note.read_text(encoding="utf-8").count("single durable paragraph") == 1
+            assert "project-plan.md" in index.read_text(encoding="utf-8")
+        finally:
+            await store.close()

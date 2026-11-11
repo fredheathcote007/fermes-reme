@@ -7,6 +7,7 @@ from ...steps.evolve import now
 from ..index import normalize_posix_path
 from ._base import _FileIOStep
 from ._daily_index import parse_daily_date, refresh_day_index, validate_session_id
+from ._index_result import refresh_index_result
 from ._path import resolve_path, validate_filename_component
 from ._provenance import ProvenanceError, note_owned_by_session, trusted_provenance
 
@@ -129,10 +130,14 @@ class DailyWriteStep(_FileIOStep):
             )
             return self.context.response
 
-        index_payload = await refresh_day_index(self.file_store, day, daily_dir)
+        index_payload = await refresh_index_result(refresh_day_index, self.file_store, day, daily_dir)
 
-        self.context.response.success = True
-        self.context.response.answer = write_answer
+        self.context.response.success = "error" not in index_payload
+        self.context.response.answer = (
+            write_answer
+            if self.context.response.success
+            else (f"Error: {index_payload['error']}; daily note was written, derived index needs repair")
+        )
         self.context.response.metadata.update(
             {
                 "date": day,

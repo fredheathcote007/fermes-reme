@@ -18,6 +18,7 @@ from watchfiles import Change
 from ...components.runtime_context import RuntimeContext
 from ..base_step import BaseStep
 from ..file_io import refresh_day_index, validate_filename_component
+from ..file_io._index_result import refresh_index_result
 from ..file_io._path import is_relative_to, resolve_path
 from ._evolve import agent_reply_result_text, now
 
@@ -272,7 +273,7 @@ class BaseAutoResourceStep(BaseStep):
         """Refresh and return the derived daily index for a resource-note change."""
         daily_dir = self.config_value("daily_dir")
         self.logger.info(f"[{self.name}] refresh index start date={day} daily_dir={daily_dir}")
-        index_payload = await refresh_day_index(self.file_store, day, daily_dir)
+        index_payload = await refresh_index_result(refresh_day_index, self.file_store, day, daily_dir)
         self.logger.info(f"[{self.name}] refresh index done date={day}")
         return index_payload
 
@@ -429,8 +430,13 @@ class BaseAutoResourceStep(BaseStep):
             added,
             metadata=note_metadata,
         )
-        self.context.response.success = True
-        self.context.response.answer = agent_reply_result_text(result)
+        index_result = self.context.response.metadata.get("index") or {}
+        self.context.response.success = "error" not in index_result
+        self.context.response.answer = (
+            agent_reply_result_text(result)
+            if self.context.response.success
+            else (f"Error: {index_result['error']}; resource note retained, derived index needs repair")
+        )
         if note_path is None:
             self.logger.info(f"[{self.name}] done without note file_path={file_path} modified=False")
             return None
@@ -635,6 +641,11 @@ class BaseAutoResourceStep(BaseStep):
                 "index": index_payload,
             },
         )
+        if "error" in index_payload:
+            self.context.response.success = False
+            self.context.response.answer = (
+                f"Error: {index_payload['error']}; resource note retained, derived index needs repair"
+            )
         self._validate_resource_note(note_path, file_path, state.before_bytes)
         return note_path
 
@@ -677,8 +688,12 @@ class BaseAutoResourceStep(BaseStep):
         self.logger.info(f"[{self.name}] catalog delete done note={note_rel}")
         index_payload = await self._refresh_day_index(date_str)
 
-        self.context.response.success = True
-        self.context.response.answer = f"Deleted resource note: {note_rel}"
+        self.context.response.success = "error" not in index_payload
+        self.context.response.answer = (
+            f"Deleted resource note: {note_rel}"
+            if self.context.response.success
+            else f"Error: {index_payload['error']}; resource delete processed, derived index needs repair"
+        )
         self.context.response.metadata["index"] = index_payload
 
     @abstractmethod
