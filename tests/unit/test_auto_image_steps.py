@@ -1057,3 +1057,31 @@ async def test_auto_image_delete_retry_is_benign_after_index_failure(auto_resour
     assert second.metadata["results"][0]["metadata"]["modified"] is False
     assert not note.exists()
     assert index.read_bytes() == b"\xff\xfe\xfd\n"
+
+
+@pytest.mark.asyncio
+async def test_auto_image_batch_recovers_success_after_previous_index_error(auto_resource_env):
+    """Per-item resource success must reset after an earlier failed item."""
+    env = auto_resource_env
+    first_source = env.write_binary("resource/2026-01-01/failed.png", _png_bytes())
+    second_source = env.write_binary("resource/2026-01-02/succeeded.png", _png_bytes())
+    damaged_index = env.workspace / "daily/2026-01-01.md"
+    damaged_index.parent.mkdir(parents=True, exist_ok=True)
+    damaged_index.write_bytes(b"---\ntags: [\n---\ncorrupt day\n")
+
+    response = await env.run(
+        env.processor(_FakeImageAgentWrapper(_caption_fields("red-square", "Red", "A red square."))),
+        [
+            {"change": "added", "path": str(first_source)},
+            {"change": "added", "path": str(second_source)},
+        ],
+    )
+    outcomes = response.metadata["results"]
+    assert len(outcomes) == 2
+    assert outcomes[0]["success"] is False
+    assert outcomes[0]["metadata"]["index"]["error_kind"] == "content"
+    assert outcomes[1]["success"] is True
+    assert "error" not in outcomes[1]["metadata"]["index"]
+    assert (env.workspace / "daily/2026-01-01/red-square.md").is_file()
+    assert (env.workspace / "daily/2026-01-02/red-square.md").is_file()
+    assert response.success is False

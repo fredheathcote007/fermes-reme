@@ -89,3 +89,14 @@ async def test_refresh_index_result_drops_untrusted_extra_fields():
     assert "notes" not in result
     assert "debug" not in result
     assert "PRIVATE" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_refresh_programming_error_is_not_silently_reclassified():
+    """Unexpected programmer faults remain exceptions, not ordinary I/O status."""
+
+    async def broken_implementation(*_args):
+        raise TypeError("synthetic contract violation")
+
+    with pytest.raises(TypeError, match="synthetic contract violation"):
+        await refresh_index_result(broken_implementation, object(), "2026-05-18", "daily")
