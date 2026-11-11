@@ -88,7 +88,7 @@ test("Studio bundles Monaco with the pinned DOMPurify sanitizer", async () => {
       if (!content.includes(SANITIZER_MARKER)) continue;
       foundSanitizer = true;
       const versions = [
-        ...content.matchAll(/\bversion\s*=\s*([`'\"])([^`'\"]+)\1/g),
+        ...content.matchAll(/\bversion\s*=\s*([`'"])([^`'"]+)\1/g),
       ].map((match) => match[2]);
       assert.ok(
         versions.length > 0,
