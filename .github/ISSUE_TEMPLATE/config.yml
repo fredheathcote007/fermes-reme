@@ -3,6 +3,12 @@ contact_links:
   - name: ReMe documentation
     url: https://reme.agentscope.io
     about: Read the installation, configuration, and usage guides.
-  - name: Existing issues
+  - name: Fermes ReMe issues
+    url: https://github.com/fredheathcote007/fermes-reme/issues
+    about: Report Fermes-specific bugs and requests here after searching this fork's issues.
+  - name: Fermes ReMe security advisories
+    url: https://github.com/fredheathcote007/fermes-reme/security/advisories/new
+    about: Privately report security vulnerabilities in the Fermes ReMe fork.
+  - name: Upstream ReMe issues
     url: https://github.com/agentscope-ai/ReMe/issues
-    about: Search for existing reports and discussions before opening a new issue.
+    about: Search upstream reports for behavior that is unchanged from AgentScope ReMe.
