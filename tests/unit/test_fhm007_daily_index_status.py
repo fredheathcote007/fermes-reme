@@ -319,3 +319,20 @@ async def test_option_b_orphaned_commit_recovers_degraded_index_without_model_re
         assert third == second
         assert receipts[0].read_bytes() == original_receipt
         assert model_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_invalid_utf8_daily_index_is_degraded_without_replacing_bytes(tmp_path):
+    """Invalid UTF-8 in rebuildable navigation is content degradation, not I/O."""
+    path = tmp_path / "daily/2026-05-18.md"
+    path.parent.mkdir(parents=True)
+    unreadable = b"---\nname: 2026-05-18\n---\ninvalid-utf8-\xff\xfe"
+    path.write_bytes(unreadable)
+    payload = await refresh_day_index(
+        SimpleNamespace(workspace_path=tmp_path),
+        "2026-05-18",
+        "daily",
+    )
+    assert payload["error_kind"] == "content"
+    assert payload["error"] == "daily index is unreadable: UnicodeDecodeError"
+    assert path.read_bytes() == unreadable

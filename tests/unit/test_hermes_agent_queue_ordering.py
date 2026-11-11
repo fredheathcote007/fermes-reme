@@ -789,3 +789,59 @@ def test_protected_index_failure_never_acknowledges(monkeypatch, result):
     assert provider._record_payload(payload, request_id="protected-degraded-1") is False
     assert backend.request_ids == ["protected-degraded-1"]
     assert provider._last_write_failure_kind != ""
+
+
+def test_protected_index_io_failure_is_retryable_not_permanently_quarantined():
+    """Approved D2/D4: I/O failure cannot ACK and stays eligible for retry."""
+    from hermes_agent.config import STAGE1_CONFIG_NAME
+
+    backend = FakeBackend()
+    outcomes = iter(
+        [
+            {"success": False, "answer": "protected daily index I/O failure"},
+            {
+                "success": True,
+                "metadata": {"outcome": "commit", "commit": {"request_id": "synthetic-io-1"}},
+            },
+        ],
+    )
+
+    def auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, messages, timeout
+        backend.request_ids.append(request_id)
+        return next(outcomes)
+
+    backend.auto_memory = auto_memory
+    provider = ReMeMemoryProvider()
+    provider._config = ReMeConfig(mode="embedded", reme_config=STAGE1_CONFIG_NAME, allow_custom_config=False)
+    provider._backend = backend
+    provider._backend_available = True
+    payload = {"session_id": "synthetic-session", "messages": [{"role": "user", "content": "synthetic"}]}
+
+    assert provider._record_payload(payload, request_id="synthetic-io-1") is False
+    assert provider._last_write_failure_kind == "retryable"
+    assert provider._next_write_attempt > time.monotonic()
+    # The queue calls _record_payload again after the configured backoff.
+    provider._next_write_attempt = 0
+    assert provider._record_payload(payload, request_id="synthetic-io-1") is True
+    assert backend.request_ids == ["synthetic-io-1", "synthetic-io-1"]
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"outcome": "commit", "commit": {"request_id": "synthetic-ok"}}])
+def test_protected_commit_missing_metadata_or_legacy_status(monkeypatch, caplog, metadata):
+    """Reject unverified commits; older verified receipts need no status field."""
+    from hermes_agent.config import STAGE1_CONFIG_NAME
+
+    backend = FakeBackend()
+    backend.auto_memory = lambda *_args, **_kwargs: {"success": True, "metadata": metadata}
+    provider = ReMeMemoryProvider()
+    provider._config = ReMeConfig(mode="embedded", reme_config=STAGE1_CONFIG_NAME, allow_custom_config=False)
+    provider._backend = backend
+    provider._backend_available = True
+    monkeypatch.setattr(provider, "_defer_write_retry", lambda: None)
+    payload = {"session_id": "synthetic-session", "messages": [{"role": "user", "content": "synthetic"}]}
+
+    with caplog.at_level("WARNING"):
+        acknowledged = provider._record_payload(payload, request_id="synthetic-ok")
+    assert acknowledged is (metadata is not None and bool(metadata))
+    assert "derived daily index degraded" not in caplog.text.lower()
