@@ -33,16 +33,16 @@ Development dependency scope does not establish that the package is unreachable.
 
 ## Other npm audit findings
 
-- ReMe Studio candidate: zero critical/high, 11 moderate. Node 24 npm ci, 52/52 unit, static build and Vinext server build pass.
+- ReMe Studio candidate: zero critical/high, 11 moderate. Node 24 npm ci, 52/52 unit, static/demo and Vinext server builds, and Cloudflare worker-rendered distribution checks pass. Monaco 0.55.1 embedded DOMPurify 3.2.7 despite a patched lockfile; candidate now upgrades Monaco to 0.57.0 and replaces its embedded 3.4.15 sanitizer module with pinned DOMPurify 3.4.17 through a shared Vite plugin. A production-bundle regression test checks the final static, demo and Vinext client assets. These changes require fresh independent review.
 - OpenClaw candidate: zero critical, two high (openclaw and zod); seven moderate. Node 24 npm ci, typecheck and 11/11 tests pass. npm suggests incompatible version rollback for OpenClaw, which has not been adopted.
 - DSH optional integration: 13 high and 7 moderate in inherited pinned dependencies; major-version changes required. These are not accepted exceptions.
 - Codex status-app: two high (@openai/mcp-extensions and zod) and no known npm audit fix; these are not accepted exceptions.
-- GitHub Pages candidate: zero critical/high; one moderate.
+- GitHub Pages candidate: zero critical/high/moderate on VitePress 2.0.0-alpha.21 with supported Vite 8 dependency. The previous VitePress 1.6.4 plus Vite 6.4.4 override was out of its declared range and rejected by independent review. The prerelease VitePress dependency is a new stability/support risk: docs tests and build/40-artifact verification pass, but release approval and broader compatibility checks remain necessary.
 
 ## Closure gates
 
 FHM-007 Python test result: 174 passed, 4 skipped on exact candidate.
-Await independent security review and GitHub CI; validate remaining documentation/status-app builds as applicable.
+Initial independent reviewer returned REQUEST_CHANGES (bundled Monaco sanitizer and VitePress/Vite contract). Both have candidate corrections and require a second independent review and rerun of GitHub CI. Current first GitHub run passed 15 checks and failed Studio distribution; the corrected Cloudflare worker-harness distribution test passes locally. Documentation and status-app builds were also validated locally.
 Confirm actual runtime use and reachability for Studio Vinext, OpenClaw, DSH and Codex status-app.
 Record explicit owner-approved dispositions for unresolved critical/high findings; do not dismiss advisories or claim zero risk.
 After merge, refresh live GitHub Dependabot counts. Issue must remain open until all acceptance checks pass.

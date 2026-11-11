@@ -14,10 +14,8 @@
     "test": "npm run content && node --test tests/*.test.mjs"
   },
   "devDependencies": {
-    "vitepress": "1.6.4",
+    "vitepress": "2.0.0-alpha.21",
     "yaml": "^2.8.1"
   },
-  "overrides": {
-    "vite": "6.4.4"
-  }
+  "overrides": {}
 }
