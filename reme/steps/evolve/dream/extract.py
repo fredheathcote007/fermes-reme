@@ -4,6 +4,7 @@ import json
 
 from ...base_step import BaseStep
 from ...file_io import refresh_day_index
+from ...file_io._index_result import refresh_index_result
 from .._evolve import agent_reply_result_text
 from ....components import R
 from ....enumeration import DreamBucketEnum
@@ -49,10 +50,32 @@ class DreamExtractStep(BaseStep):
             f"[{self.name}] start date={day} dates={','.join(dates)} scan_days={scan_days} "
             f"max_units={max_units} hint={bool(hint)}",
         )
+        index_errors = []
+        failed_index_days = []
         for scan_day in dates:
             self.logger.info(f"[{self.name}] refresh index start date={scan_day} daily_dir={daily}")
-            await refresh_day_index(self.file_store, scan_day, daily)
+            index_payload = await refresh_index_result(refresh_day_index, self.file_store, scan_day, daily)
+            if "error" in index_payload:
+                index_errors.append(f"{scan_day}: {index_payload['error']}")
+                failed_index_days.append(scan_day)
             self.logger.info(f"[{self.name}] refresh index done date={scan_day}")
+
+        if index_errors:
+            # Without a trustworthy derived page, do not extract or checkpoint
+            # any input from this scan window. Otherwise DreamFinishStep could
+            # persist an mtime that prevents later retry of a changed source.
+            errors = [f"daily index refresh failed: {error}" for error in index_errors]
+            state = DreamState(
+                date=day,
+                dates=dates,
+                scan_days=scan_days,
+                hint=hint,
+                daily_dir=daily,
+                workspace=str(workspace),
+                errors=errors,
+                failed_paths=[f"{daily}/{scan_day}.md" for scan_day in failed_index_days],
+            )
+            return self._finish(state, False, "; ".join(errors))
 
         existing = self._existing(
             workspace,

@@ -1,5 +1,7 @@
 """LLM model wrappers for AgentScope."""
 
+import asyncio
+
 from agentscope.credential import (
     AnthropicCredential,
     CredentialBase,
@@ -27,11 +29,67 @@ class BaseAsLLM(BaseComponent):
 
     component_type = ComponentEnum.AS_LLM
     credential_cls: type[CredentialBase]
+    _protect_owned_model_lifecycle = False
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._model: ChatModelBase | None = None
         self._owns_model = False
+        self._closed = False
+        self._closing_depth = 0
+        # Serialize the complete public lifecycle transition, not just the
+        # inner BaseComponent lock region. Otherwise an intervening start can
+        # complete in the gap between checking state and base close().
+        self._lifecycle_gate = asyncio.Lock()
+
+    async def start(self) -> None:
+        """Start without cleaning up resources owned by another lifecycle call."""
+        async with self._lifecycle_gate:
+            await super().start()
+            if not self._closing_depth:
+                self._closed = False
+
+    async def _rollback_start(
+        self,
+        start_hook_entered: bool,
+        started_owned: list[BaseComponent],
+    ) -> None:
+        """Fence lazy model access during every startup rollback path."""
+        # BaseComponent.start() holds the lifecycle lock, but the synchronous
+        # model getter does not. Both dependency and hook failures can yield
+        # while releasing an owned client, so temporarily forbid construction.
+        self._closing_depth += 1
+        self._closed = True
+        try:
+            await super()._rollback_start(start_hook_entered, started_owned)
+            if not start_hook_entered and self._owns_model and self._model is not None:
+                try:
+                    await self._close()
+                except BaseException:
+                    self.logger.exception("Failed to clean up model after startup failure")
+        finally:
+            self._closing_depth -= 1
+            if not self._closing_depth:
+                # A failed start is retryable, unless another close is pending.
+                self._closed = False
+
+    async def close(self) -> None:
+        """Fence lazy models and serialize shutdown with public startup."""
+        self._closing_depth += 1
+        self._closed = True
+        try:
+            async with self._lifecycle_gate:
+                async with self._lock:
+                    if not self._is_started:
+                        await self._close()
+                        return
+                await super().close()
+        finally:
+            self._closing_depth -= 1
+            # If cancellation occurred before the gate was acquired, a
+            # previously started component remains live. Do not leave its
+            # synchronous model getter permanently fenced in that case.
+            self._closed = self._closing_depth > 0 or not self._is_started
 
     async def _start(self) -> None:
         """Keep service startup independent of provider credentials."""
@@ -51,6 +109,8 @@ class BaseAsLLM(BaseComponent):
 
     def initialize_model(self) -> None:
         """Construct the configured provider once, without making a remote request."""
+        if self._protect_owned_model_lifecycle and self._closed and (self._owns_model or self._model is None):
+            raise RuntimeError("Start the LLM component before accessing its model after close.")
         if self._model is not None:
             return
         kwargs = dict(self.kwargs)
@@ -67,14 +127,38 @@ class OpenAIAsLLM(BaseAsLLM):
     """OpenAI chat model wrapper."""
 
     credential_cls = OpenAICredential
+    _protect_owned_model_lifecycle = True
+
+    @BaseAsLLM.model.setter
+    def model(self, value: ChatModelBase | None) -> None:
+        """Reject replacement while an internally owned client is still live."""
+        if value is self._model:
+            return
+        if self._owns_model:
+            raise RuntimeError("Close the OpenAI component before replacing its owned model.")
+        BaseAsLLM.model.fset(self, value)
 
     async def _close(self) -> None:
-        """Close an internally owned asynchronous client during application shutdown."""
+        """Close an internally owned async client without losing cancellation-safe cleanup."""
         if not self._owns_model or self._model is None:
             return
+        cleanup = asyncio.create_task(self._release_model())
+        cancellation: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+        cleanup.result()
+        if cancellation is not None:
+            raise cancellation
+
+    async def _release_model(self) -> None:
+        """Release the owned model and clear state even when provider close fails."""
         model = self._model
-        client = getattr(model, "client", None)
         try:
+            client = getattr(model, "client", None)
             if client is not None:
                 await client.close()
         finally:
