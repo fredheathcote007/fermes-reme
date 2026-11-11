@@ -124,7 +124,9 @@ def scan_notes(workspace_dir: Path, date: str, daily_dir: str) -> list[dict]:
 async def refresh_day_index(file_store, date: str, daily_dir: str) -> dict:
     """Rebuild ``<daily_dir>/<date>.md`` from the current state of its notes.
 
-    Returns ``{date, path, notes, created}``.
+    Returns date/path/notes/created/changed. Unreadable derived content is
+    reported via a redacted error and error_kind=content without replacing
+    the existing index bytes. Filesystem I/O errors propagate to callers.
     """
     workspace_dir = Path(file_store.workspace_path or ".").resolve()
     index_rel = f"{daily_dir}/{date}.md"
@@ -136,7 +138,8 @@ async def refresh_day_index(file_store, date: str, daily_dir: str) -> dict:
             "notes": [],
             "created": False,
             "changed": False,
-            "error": err or "invalid path",
+            "error": "invalid daily index path",
+            "error_kind": "invalid_path",
         }
     notes = scan_notes(workspace_dir, date, daily_dir)
 
@@ -170,7 +173,8 @@ async def refresh_day_index(file_store, date: str, daily_dir: str) -> dict:
                 "notes": notes_payload,
                 "created": False,
                 "changed": False,
-                "error": f"daily index is unreadable: {exc}",
+                "error": f"daily index is unreadable: {type(exc).__name__}",
+                "error_kind": "content",
             }
         new_body = _rebuild_body(post.content, notes_block)
         merged = dict(post.metadata or {})

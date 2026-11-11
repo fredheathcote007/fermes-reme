@@ -928,11 +928,7 @@ class AutoMemoryStep(BaseStep):
                 agent_scope=self._option_b_scope(),
             )
             committed_day = Path(relative).parts[-2]
-            index_payload = await refresh_day_index(
-                self.file_store,
-                committed_day,
-                self.config_value("daily_dir"),
-            )
+            index_payload, index_status = await self._refresh_option_b_day_index(committed_day)
             self.context["changes"] = [
                 {"change": "added" if committed_marker["created"] else "modified", "path": relative},
             ]
@@ -945,6 +941,7 @@ class AutoMemoryStep(BaseStep):
                 answer="Recovered durable memory commit without model replay",
             )
             self.context.response.metadata["index"] = index_payload
+            self.context.response.metadata["index_status"] = index_status
             self.context.response.metadata["note_sha256"] = hashlib.sha256(committed_raw).hexdigest()
             return True
 
@@ -985,7 +982,7 @@ class AutoMemoryStep(BaseStep):
                 ),
                 agent_scope=self._option_b_scope(),
             )
-            index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+            index_payload, index_status = await self._refresh_option_b_day_index(day)
             self.context["changes"] = [
                 {
                     "change": "added" if committed_marker["created"] else "modified",
@@ -1001,6 +998,7 @@ class AutoMemoryStep(BaseStep):
                 answer="Recovered durable memory commit without model replay",
             )
             self.context.response.metadata["index"] = index_payload
+            self.context.response.metadata["index_status"] = index_status
             self.context.response.metadata["note_sha256"] = hashlib.sha256(committed_raw).hexdigest()
             return True
 
@@ -1015,6 +1013,42 @@ class AutoMemoryStep(BaseStep):
             agent_scope=self._option_b_scope(),
         )
         return False
+
+    @staticmethod
+    def _option_b_index_status(index_payload: dict) -> str:
+        """Distinguish a durable commit from its rebuildable daily navigation.
+
+        Content corruption is reported as degraded while the validated note and
+        BM25 publication remain durable. Invalid paths and I/O failures must not
+        be acknowledged as successful protected memory operations.
+        """
+        if not isinstance(index_payload, dict):
+            raise RuntimeError("protected daily index returned invalid status")
+        if "error" not in index_payload:
+            return "ok"
+        if index_payload.get("error_kind") == "content":
+            return "degraded"
+        raise RuntimeError("protected daily index refresh failed")
+
+    async def _refresh_option_b_day_index(self, day: str) -> tuple[dict, str]:
+        """Capture derived-index health for the commit-time receipt snapshot.
+
+        The receipt replay path must return that original response verbatim;
+        this status is NOT a current-health check on subsequent replays.
+        """
+        try:
+            payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+        except OSError as exc:
+            # Retain diagnosability without exposing host paths or the
+            # provider's exception message through the protected response.
+            self.logger.warning(
+                f"[{self.name}] protected daily index I/O failure day={day} " f"type={type(exc).__name__}",
+            )
+            raise RuntimeError("protected daily index I/O failure") from None
+        status = self._option_b_index_status(payload)
+        if status == "degraded":
+            self.logger.warning(f"[{self.name}] derived daily index degraded day={day}; durable note retained")
+        return payload, status
 
     async def _publish_option_b_index(self) -> None:
         """Publish protected note changes before reporting a successful commit.
@@ -1182,7 +1216,7 @@ class AutoMemoryStep(BaseStep):
                 source_hash=provenance["source_hash"],
                 agent_scope=agent_scope,
             )
-            index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+            index_payload, index_status = await self._refresh_option_b_day_index(day)
             self.context["changes"] = [
                 {
                     "change": "added" if marker["created"] else "modified",
@@ -1198,6 +1232,7 @@ class AutoMemoryStep(BaseStep):
                 answer="Recovered durable memory commit without model replay",
             )
             self.context.response.metadata["index"] = index_payload
+            self.context.response.metadata["index_status"] = index_status
             self.context.response.metadata["note_sha256"] = hashlib.sha256(raw).hexdigest()
             return True
         if existing_marker is not None:
@@ -1434,7 +1469,7 @@ class AutoMemoryStep(BaseStep):
         else:
             raise RuntimeError(f"cannot allocate unique note name for: {name!r}")
         self.context["changes"] = [{"change": "added" if created else "modified", "path": expected_path}]
-        index_payload = await refresh_day_index(self.file_store, day, self.config_value("daily_dir"))
+        index_payload, index_status = await self._refresh_option_b_day_index(day)
         await self._publish_option_b_index()
         self.context.response.success = True
         self.context.response.answer = "Committed one durable memory revision"
@@ -1448,6 +1483,7 @@ class AutoMemoryStep(BaseStep):
                 "source_conversation": self._session_link(session_id),
                 "source_hash": provenance["source_hash"],
                 "index": index_payload,
+                "index_status": index_status,
                 "commit": committed_marker,
                 "note_sha256": hashlib.sha256(raw).hexdigest(),
                 "image_sources": image_sources,
@@ -1525,6 +1561,8 @@ class AutoMemoryStep(BaseStep):
         expected_changes = [{"change": "added" if marker["created"] else "modified", "path": note_path}]
         self.context["changes"] = expected_changes
         await self._publish_option_b_index()
+        # The stored response is authoritative: replay must remain identical
+        # even when rebuildable daily navigation later changes.
         self.context.response.answer = response.answer
         self.context.response.success = response.success
         self.context.response.metadata.update(response.metadata)
