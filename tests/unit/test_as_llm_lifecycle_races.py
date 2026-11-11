@@ -109,3 +109,59 @@ async def test_non_openai_lazy_wrapper_semantics_unchanged_after_close():
     await llm.close()
     assert llm.model is model
     credential.return_value.get_chat_model_class.return_value.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["resolve", "hook"])
+async def test_startup_rollback_preserves_original_error_after_cleanup_cancellation(failure_stage):
+    """BaseComponent preserves the original startup exception after rollback.
+
+    Cancellation during best-effort rollback must not strand an owned client.
+    A future change to the shared BaseComponent contract requires separate review.
+    """
+
+    class FailingOpenAIAsLLM(OpenAIAsLLM):
+        """Fail before/after the _start hook without modifying the base class."""
+
+        async def _resolve_bindings(self):
+            if failure_stage == "resolve":
+                raise RuntimeError("original start failure")
+            await super()._resolve_bindings()
+
+        async def _start(self):
+            raise RuntimeError("original start failure")
+
+    llm = FailingOpenAIAsLLM(backend="openai", model="synthetic")
+    model, credential_cls = _owned_model(llm)
+    replacement = Mock()
+    model.client.close = AsyncMock()
+    replacement.client.close = AsyncMock()
+    credential_cls.return_value.get_chat_model_class.return_value.side_effect = [model, replacement]
+    assert llm.model is model
+    released = asyncio.Event()
+    resume = asyncio.Event()
+    release_original = llm._release_model
+
+    async def gated_release():
+        await release_original()
+        released.set()
+        await resume.wait()
+
+    llm._release_model = gated_release
+    starting = asyncio.create_task(llm.start())
+    await asyncio.wait_for(released.wait(), 2)
+    assert not starting.done()
+    starting.cancel()
+    resume.set()
+
+    with pytest.raises(RuntimeError, match="original start failure"):
+        await asyncio.wait_for(starting, 2)
+    model.client.close.assert_awaited_once_with()
+    assert not llm.is_started
+    assert llm._closing_depth == 0
+    assert not llm._closed
+    assert llm._model is None
+    assert llm.model is replacement
+    assert credential_cls.return_value.get_chat_model_class.return_value.call_count == 2
+    await llm.close()
+    replacement.client.close.assert_awaited_once_with()
