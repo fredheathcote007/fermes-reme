@@ -226,3 +226,96 @@ def test_invalid_protected_index_path_is_not_a_degraded_success():
         AutoMemoryStep._option_b_index_status(
             {"error_kind": "invalid_path", "error": "invalid daily index path"},
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cross_day", [False, True], ids=["same_day", "cross_day"])
+async def test_option_b_orphaned_commit_recovers_degraded_index_without_model_replay(
+    tmp_path,
+    monkeypatch,
+    cross_day,
+):
+    """A lost receipt and newly corrupt derived page cannot duplicate the note."""
+    from datetime import datetime
+
+    from reme.steps.evolve import auto_memory as auto_memory_module
+    from reme.steps.evolve.auto_memory import AutoMemoryStep
+
+    workspace = tmp_path / "workspace"
+    config_path = Path(__file__).resolve().parents[2] / "reme/config/fermes-hermes-stage1.yaml"
+    config = resolve_app_config(config=str(config_path), workspace_dir=str(workspace), log_config=False)
+    times = iter(
+        [
+            datetime(2026, 10, 21),
+            datetime(2026, 10, 22 if cross_day else 21),
+        ],
+    )
+    model_calls = []
+    receipt_calls = []
+    write_receipt = AutoMemoryStep._write_option_b_receipt
+
+    async def proposal(_self, _inputs, **_kwargs):
+        model_calls.append(1)
+        return {
+            "result": json.dumps(
+                {
+                    "path": "daily/2026-10-21/recovered-degraded.md",
+                    "name": "recovered-degraded",
+                    "description": "Synthetic orphaned receipt recovery",
+                    "content": "Durable recovery survives a damaged daily page.",
+                },
+            ),
+            "tool_execution": [],
+        }
+
+    async def lose_first_receipt(step, path, fingerprint):
+        receipt_calls.append(1)
+        if len(receipt_calls) == 1:
+            raise OSError("synthetic interrupted receipt write")
+        await write_receipt(step, path, fingerprint)
+
+    monkeypatch.setattr(AsAgentWrapper, "reply", proposal)
+    monkeypatch.setattr(auto_memory_module, "now", lambda _tz: next(times))
+    monkeypatch.setattr(AutoMemoryStep, "_messages_day", staticmethod(lambda _messages, _timezone=None: None))
+    monkeypatch.setattr(AutoMemoryStep, "_write_option_b_receipt", lose_first_receipt)
+    if not cross_day:
+        monkeypatch.setattr(AutoMemoryStep, "_find_cross_day_option_b_marker", lambda *_args, **_kwargs: None)
+
+    request = {
+        "request_id": f"degraded-recovery-{cross_day}",
+        "session_id": "degraded-recovery-session",
+        "messages": [{"id": "m1", "name": "user", "role": "user", "content": "Retention proof"}],
+    }
+    note = workspace / "daily/2026-10-21/recovered-degraded.md"
+    index = workspace / "daily/2026-10-21.md"
+    damaged = b"---\nprivate: [BROKEN-RECOVERY-PAGE\n---\nunchanged\n"
+
+    async with Application(**config) as app:
+        first = await app.run_job("auto_memory", **request)
+        assert first.success is False
+        original_note = note.read_bytes()
+        assert len(model_calls) == 1
+        assert not list((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+
+        index.write_bytes(damaged)
+        second = await app.run_job("auto_memory", **request)
+        assert second.success
+        assert second.metadata["index_status"] == "degraded"
+        assert second.metadata["index"]["error_kind"] == "content"
+        assert "BROKEN-RECOVERY-PAGE" not in second.metadata["index"]["error"]
+        assert second.metadata["path"] == "daily/2026-10-21/recovered-degraded.md"
+        assert note.read_bytes() == original_note
+        assert index.read_bytes() == damaged
+        assert model_calls == [1]
+        assert receipt_calls == [1, 1]
+        receipts = list((workspace / "metadata/auto_memory_requests").rglob("*.json"))
+        assert len(receipts) == 1
+        original_receipt = receipts[0].read_bytes()
+
+        # Repeated request must use the frozen receipt, never a second model
+        # operation, even if the derived page later gets repaired.
+        index.write_text("---\nname: 2026-10-21\n---\nrepaired\n", encoding="utf-8")
+        third = await app.run_job("auto_memory", **request)
+        assert third == second
+        assert receipts[0].read_bytes() == original_receipt
+        assert model_calls == [1]
