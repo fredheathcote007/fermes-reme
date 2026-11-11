@@ -165,3 +165,92 @@ async def test_startup_rollback_preserves_original_error_after_cleanup_cancellat
     assert credential_cls.return_value.get_chat_model_class.return_value.call_count == 2
     await llm.close()
     replacement.client.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_queued_restart_after_close_retains_started_state():
+    """A close must not drop the lifecycle lock before a queued restart.
+
+    An intervening start was previously allowed to return while the original
+    component was still marked started; the older close then closed it.
+    """
+    llm = OpenAIAsLLM(backend="openai", model="synthetic")
+    first, credential = _owned_model(llm)
+    first.client.close = AsyncMock()
+    replacement = Mock()
+    replacement.client.close = AsyncMock()
+    credential.return_value.get_chat_model_class.return_value.side_effect = [first, replacement]
+
+    await llm.start()
+    assert llm.model is first
+
+    # Both lifecycle tasks queue behind the same lock in a known FIFO order.
+    async with llm._lock:
+        closing = asyncio.create_task(llm.close())
+        await asyncio.sleep(0)
+        starting = asyncio.create_task(llm.start())
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(asyncio.gather(closing, starting), 3)
+    assert llm.is_started, "Earlier close invalidated the queued restart"
+    assert not llm._closed
+    assert llm.model is replacement
+    first.client.close.assert_awaited_once_with()
+    await llm.close()
+    replacement.client.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_queued_start_close_start_preserves_latest_start():
+    """A close queued behind startup must not later invalidate the next start."""
+    llm = OpenAIAsLLM(backend="openai", model="synthetic")
+    first, credential = _owned_model(llm)
+    first.client.close = AsyncMock()
+    replacement = Mock()
+    replacement.client.close = AsyncMock()
+    credential.return_value.get_chat_model_class.return_value.side_effect = [first, replacement]
+
+    # All three public lifecycle calls are FIFO queued while not started.
+    async with llm._lock:
+        starting_first = asyncio.create_task(llm.start())
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(llm.close())
+        await asyncio.sleep(0)
+        starting_second = asyncio.create_task(llm.start())
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(asyncio.gather(starting_first, closing, starting_second), 3)
+    assert llm.is_started, "Queued close invalidated later startup"
+    assert not llm._closed
+    assert llm.model is first
+    first.client.close.assert_not_awaited()
+    credential.return_value.get_chat_model_class.return_value.assert_called_once()
+    await llm.close()
+    first.client.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waiting_for_gate_keeps_started_model_accessible():
+    """A queued shutdown that never got the gate must not fence a live model."""
+    llm = OpenAIAsLLM(backend="openai", model="synthetic")
+    model, _ = _owned_model(llm)
+    model.client.close = AsyncMock()
+    await llm.start()
+    assert llm.model is model
+
+    async with llm._lifecycle_gate:
+        closing = asyncio.create_task(llm.close())
+        await asyncio.sleep(0)
+        assert llm._closing_depth == 1
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(closing, 2)
+
+    assert llm._closing_depth == 0
+    assert not llm._lifecycle_gate.locked()
+    assert llm.is_started
+    assert not llm._closed, "Cancelled queued close must not leave started component fenced"
+    assert llm.model is model
+    model.client.close.assert_not_awaited()
+    await llm.close()
+    model.client.close.assert_awaited_once_with()

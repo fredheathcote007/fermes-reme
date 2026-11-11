@@ -37,12 +37,17 @@ class BaseAsLLM(BaseComponent):
         self._owns_model = False
         self._closed = False
         self._closing_depth = 0
+        # Serialize the complete public lifecycle transition, not just the
+        # inner BaseComponent lock region. Otherwise an intervening start can
+        # complete in the gap between checking state and base close().
+        self._lifecycle_gate = asyncio.Lock()
 
     async def start(self) -> None:
         """Start without cleaning up resources owned by another lifecycle call."""
-        await super().start()
-        if not self._closing_depth:
-            self._closed = False
+        async with self._lifecycle_gate:
+            await super().start()
+            if not self._closing_depth:
+                self._closed = False
 
     async def _rollback_start(
         self,
@@ -69,18 +74,22 @@ class BaseAsLLM(BaseComponent):
                 self._closed = False
 
     async def close(self) -> None:
-        """Prevent lazy construction throughout started or pre-start shutdown."""
+        """Fence lazy models and serialize shutdown with public startup."""
         self._closing_depth += 1
         self._closed = True
         try:
-            async with self._lock:
-                if not self._is_started:
-                    await self._close()
-                    return
-            await super().close()
+            async with self._lifecycle_gate:
+                async with self._lock:
+                    if not self._is_started:
+                        await self._close()
+                        return
+                await super().close()
         finally:
-            self._closed = True
             self._closing_depth -= 1
+            # If cancellation occurred before the gate was acquired, a
+            # previously started component remains live. Do not leave its
+            # synchronous model getter permanently fenced in that case.
+            self._closed = self._closing_depth > 0 or not self._is_started
 
     async def _start(self) -> None:
         """Keep service startup independent of provider credentials."""
