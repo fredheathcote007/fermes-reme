@@ -16,6 +16,5 @@
   "devDependencies": {
     "vitepress": "2.0.0-alpha.21",
     "yaml": "^2.8.1"
-  },
-  "overrides": {}
+  }
 }
