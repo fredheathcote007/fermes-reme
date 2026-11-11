@@ -759,6 +759,150 @@ def test_protected_degraded_commit_ack_is_operator_visible(monkeypatch, caplog):
     assert "synthetic-session" not in caplog.text
 
 
+@pytest.mark.parametrize("index_status", [None, "ok", "degraded"], ids=["legacy-none", "ok", "degraded"])
+def test_protected_commit_ack_accepts_known_index_status(monkeypatch, caplog, index_status):
+    """Verified commits with legacy or known index status values may ACK."""
+    from hermes_agent.config import STAGE1_CONFIG_NAME
+
+    backend = FakeBackend()
+
+    def known_status_auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, messages, timeout
+        backend.request_ids.append(request_id)
+        return {
+            "success": True,
+            "answer": "Committed one durable memory revision",
+            "metadata": {
+                "outcome": "commit",
+                "commit": {"request_id": request_id},
+                "index_status": index_status,
+            },
+        }
+
+    backend.auto_memory = known_status_auto_memory
+    provider = ReMeMemoryProvider()
+    provider._config = ReMeConfig(mode="embedded", reme_config=STAGE1_CONFIG_NAME, allow_custom_config=False)
+    provider._backend = backend
+    provider._backend_available = True
+    monkeypatch.setattr(provider, "_defer_write_retry", lambda: pytest.fail("unexpected retry for known status"))
+    payload = {"session_id": "synthetic-session", "messages": [{"role": "user", "content": "synthetic"}]}
+
+    with caplog.at_level("WARNING"):
+        assert provider._record_payload(payload, request_id="known-status") is True
+    assert provider._last_write_failure_kind == ""
+    if index_status == "degraded":
+        assert "derived daily index degraded" in caplog.text.lower()
+    else:
+        assert "derived daily index degraded" not in caplog.text.lower()
+
+
+@pytest.mark.parametrize(
+    "index_status",
+    ["unrecognized-status", "unknown_anomaly", {"unexpected": "mapping"}, ["unexpected"], {"unexpected"}, 1, True],
+    ids=["unrecognized-status", "unknown-anomaly", "dict", "list", "set", "int", "bool"],
+)
+def test_protected_commit_unknown_index_status_fails_closed(monkeypatch, index_status):
+    """Unknown or malformed index status values must remain retryable and unacknowledged."""
+    from hermes_agent.config import STAGE1_CONFIG_NAME
+
+    backend = FakeBackend()
+    backend.auto_memory = lambda *_args, **_kwargs: {
+        "success": True,
+        "answer": "Committed one durable memory revision",
+        "metadata": {
+            "outcome": "commit",
+            "commit": {"request_id": "unknown-status"},
+            "index_status": index_status,
+        },
+    }
+    provider = ReMeMemoryProvider()
+    provider._config = ReMeConfig(mode="embedded", reme_config=STAGE1_CONFIG_NAME, allow_custom_config=False)
+    provider._backend = backend
+    provider._backend_available = True
+    monkeypatch.setattr(provider, "_defer_write_retry", lambda: None)
+    payload = {"session_id": "synthetic-session", "messages": [{"role": "user", "content": "synthetic"}]}
+
+    assert provider._record_payload(payload, request_id="unknown-status") is False
+    assert provider._last_write_failure_kind == "retryable"
+
+
+def test_protected_commit_unknown_index_status_replays_fifo_record(monkeypatch, tmp_path):
+    """An unknown status keeps the FIFO record queued until a valid replay succeeds."""
+    from hermes_agent.config import STAGE1_CONFIG_NAME
+
+    backend = FakeBackend()
+    first_failure_seen = threading.Event()
+    replay_succeeded = threading.Event()
+    failure_kinds = []
+
+    def response_auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, messages, timeout
+        backend.request_ids.append(request_id)
+        if len(backend.request_ids) == 1:
+            return {
+                "success": True,
+                "answer": "Committed one durable memory revision",
+                "metadata": {
+                    "outcome": "commit",
+                    "commit": {"request_id": request_id},
+                    "index_status": "unknown_anomaly",
+                },
+            }
+        replay_succeeded.set()
+        return {
+            "success": True,
+            "answer": "Committed one durable memory revision",
+            "metadata": {
+                "outcome": "commit",
+                "commit": {"request_id": request_id},
+                "index_status": "ok",
+            },
+        }
+
+    backend.auto_memory = response_auto_memory
+    monkeypatch.setattr(
+        PLUGIN_MODULE,
+        "load_config",
+        lambda home=None: ReMeConfig(
+            mode="embedded",
+            workspace_dir=str(tmp_path / "workspace"),
+            reme_config=STAGE1_CONFIG_NAME,
+            allow_custom_config=False,
+            health_retry_seconds=0.01,
+        ),
+    )
+    monkeypatch.setattr(PLUGIN_MODULE, "_backend_for", lambda config: backend)
+    provider = ReMeMemoryProvider()
+    provider.initialize(
+        "session",
+        hermes_home=tmp_path,
+        agent_identity="profile",
+    )
+    original_defer = provider._defer_write_retry
+
+    def capture_retry():
+        failure_kinds.append(provider._last_write_failure_kind)
+        first_failure_seen.set()
+        original_defer()
+
+    monkeypatch.setattr(provider, "_defer_write_retry", capture_retry)
+    provider.sync_turn("user", "assistant")
+
+    assert first_failure_seen.wait(timeout=1)
+    pending = config_path(tmp_path).parent / "pending-writes.jsonl"
+    assert pending.read_text(encoding="utf-8").strip()
+    assert failure_kinds == ["retryable"]
+    assert replay_succeeded.wait(timeout=2)
+    deadline = time.monotonic() + 1
+    while pending.read_text(encoding="utf-8").strip() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    provider.shutdown()
+
+    assert len(backend.request_ids) == 2
+    assert backend.request_ids[0] == backend.request_ids[1]
+    assert pending.read_text(encoding="utf-8") == ""
+
+
 @pytest.mark.parametrize(
     "result",
     [
