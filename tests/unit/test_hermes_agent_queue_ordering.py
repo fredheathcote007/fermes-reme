@@ -721,3 +721,71 @@ def test_disk_append_failure_does_not_acknowledge_or_queue_turn(monkeypatch, tmp
     assert not provider._pending_path.exists()
     assert "spool write failed" in caplog.text
     assert "shutting down" not in caplog.text
+
+
+def test_protected_degraded_commit_ack_is_operator_visible(monkeypatch, caplog):
+    """Approved D1/D2: ACK a verified degraded commit but warn the operator."""
+    from hermes_agent.config import STAGE1_CONFIG_NAME
+
+    backend = FakeBackend()
+
+    def degraded_auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, messages, timeout
+        backend.request_ids.append(request_id)
+        return {
+            "success": True,
+            "answer": "Committed one durable memory revision",
+            "metadata": {
+                "outcome": "commit",
+                "commit": {"request_id": request_id},
+                "index_status": "degraded",
+                "index": {"error_kind": "content", "error": "daily index is unreadable"},
+            },
+        }
+
+    backend.auto_memory = degraded_auto_memory
+    provider = ReMeMemoryProvider()
+    provider._config = ReMeConfig(mode="embedded", reme_config=STAGE1_CONFIG_NAME, allow_custom_config=False)
+    provider._backend = backend
+    provider._backend_available = True
+    monkeypatch.setattr(provider, "_defer_write_retry", lambda: pytest.fail("unexpected retry for verified commit"))
+    payload = {"session_id": "synthetic-session", "messages": [{"role": "user", "content": "synthetic"}]}
+
+    with caplog.at_level("WARNING"):
+        assert provider._record_payload(payload, request_id="protected-degraded-1")
+    assert backend.request_ids == ["protected-degraded-1"]
+    assert provider._last_write_failure_kind == ""
+    assert "derived daily index degraded" in caplog.text.lower()
+    assert "synthetic-session" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"success": False, "answer": "protected daily index I/O failure"},
+        {"success": True, "metadata": {"outcome": "commit", "commit": {"request_id": "wrong-request"}}},
+    ],
+    ids=["io_failure", "unbound_receipt"],
+)
+def test_protected_index_failure_never_acknowledges(monkeypatch, result):
+    """Approved D2/D4: failed I/O and forged/unbound receipts cannot ACK."""
+    from hermes_agent.config import STAGE1_CONFIG_NAME
+
+    backend = FakeBackend()
+
+    def response_auto_memory(session_id, messages, *, timeout, request_id=None):
+        del session_id, messages, timeout
+        backend.request_ids.append(request_id)
+        return result
+
+    backend.auto_memory = response_auto_memory
+    provider = ReMeMemoryProvider()
+    provider._config = ReMeConfig(mode="embedded", reme_config=STAGE1_CONFIG_NAME, allow_custom_config=False)
+    provider._backend = backend
+    provider._backend_available = True
+    monkeypatch.setattr(provider, "_defer_write_retry", lambda: None)
+    payload = {"session_id": "synthetic-session", "messages": [{"role": "user", "content": "synthetic"}]}
+
+    assert provider._record_payload(payload, request_id="protected-degraded-1") is False
+    assert backend.request_ids == ["protected-degraded-1"]
+    assert provider._last_write_failure_kind != ""
