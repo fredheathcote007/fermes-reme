@@ -983,3 +983,105 @@ async def test_auto_image_converts_heic_request_when_extra_is_installed(auto_res
     note = frontmatter.loads((env.workspace / "daily/2026-01-01/phone.md").read_text(encoding="utf-8"))
     assert note.metadata["media_type"] == "image/heic"
     assert "converted caption" in note.content
+
+
+@pytest.mark.asyncio
+async def test_auto_image_reports_unreadable_index_after_note_write(auto_resource_env):
+    """A malformed derived index fails the resource result without losing its note."""
+    env = auto_resource_env
+    source = env.write_binary("resource/2026-01-01/img.png", _png_bytes())
+    index = env.workspace / "daily/2026-01-01.md"
+    damaged = b"---\ntags: [\n---\nold index\n"
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_bytes(damaged)
+    model = _FakeImageAgentWrapper(_caption_fields("red-square", "Red", "A red square."))
+
+    response = await env.run(env.processor(model), [{"change": "added", "path": str(source)}])
+
+    result = response.metadata["results"][0]
+    assert response.success is False
+    assert result["success"] is False
+    assert result["metadata"]["modified"] is True
+    assert result["metadata"]["index"]["changed"] is False
+    assert (env.workspace / "daily/2026-01-01/red-square.md").is_file()
+    assert index.read_bytes() == damaged
+
+
+@pytest.mark.asyncio
+async def test_auto_image_delete_reports_unreadable_index_after_note_delete(auto_resource_env):
+    """A malformed index does not roll back a durable resource-note deletion."""
+    env = auto_resource_env
+    source = env.workspace / "resource/2026-01-01/img.png"
+    note = env.write_note("daily/2026-01-01/red-square.md", "[[resource/2026-01-01/img.png]]")
+    index = env.workspace / "daily/2026-01-01.md"
+    damaged = b"\xff\xfe\xfd\n"
+    index.write_bytes(damaged)
+
+    response = await env.run(
+        env.processor(_FakeImageAgentWrapper()),
+        [{"change": "deleted", "path": str(source)}],
+    )
+
+    result = response.metadata["results"][0]
+    assert response.success is False
+    assert result["success"] is False
+    assert result["metadata"]["action"] == "deleted"
+    assert result["metadata"]["modified"] is True
+    assert not note.exists()
+    assert index.read_bytes() == damaged
+
+
+@pytest.mark.asyncio
+async def test_auto_image_delete_retry_is_benign_after_index_failure(auto_resource_env):
+    """Retrying a completed deletion reports skipped instead of deleting twice."""
+    env = auto_resource_env
+    source = env.workspace / "resource/2026-01-01/retry.png"
+    note = env.write_note("daily/2026-01-01/retry.md", "[[resource/2026-01-01/retry.png]]")
+    index = env.workspace / "daily/2026-01-01.md"
+    index.write_bytes(b"\xff\xfe\xfd\n")
+
+    first = await env.run(
+        env.processor(_FakeImageAgentWrapper()),
+        [{"change": "deleted", "path": str(source)}],
+    )
+    assert first.success is False
+    assert not note.exists()
+    assert first.metadata["results"][0]["metadata"]["modified"] is True
+
+    second = await env.run(
+        env.processor(_FakeImageAgentWrapper()),
+        [{"change": "deleted", "path": str(source)}],
+    )
+    assert second.success is True
+    assert second.metadata["results"][0]["metadata"]["action"] == "skipped"
+    assert second.metadata["results"][0]["metadata"]["modified"] is False
+    assert not note.exists()
+    assert index.read_bytes() == b"\xff\xfe\xfd\n"
+
+
+@pytest.mark.asyncio
+async def test_auto_image_batch_recovers_success_after_previous_index_error(auto_resource_env):
+    """Per-item resource success must reset after an earlier failed item."""
+    env = auto_resource_env
+    first_source = env.write_binary("resource/2026-01-01/failed.png", _png_bytes())
+    second_source = env.write_binary("resource/2026-01-02/succeeded.png", _png_bytes())
+    damaged_index = env.workspace / "daily/2026-01-01.md"
+    damaged_index.parent.mkdir(parents=True, exist_ok=True)
+    damaged_index.write_bytes(b"---\ntags: [\n---\ncorrupt day\n")
+
+    response = await env.run(
+        env.processor(_FakeImageAgentWrapper(_caption_fields("red-square", "Red", "A red square."))),
+        [
+            {"change": "added", "path": str(first_source)},
+            {"change": "added", "path": str(second_source)},
+        ],
+    )
+    outcomes = response.metadata["results"]
+    assert len(outcomes) == 2
+    assert outcomes[0]["success"] is False
+    assert outcomes[0]["metadata"]["index"]["error_kind"] == "content"
+    assert outcomes[1]["success"] is True
+    assert "error" not in outcomes[1]["metadata"]["index"]
+    assert (env.workspace / "daily/2026-01-01/red-square.md").is_file()
+    assert (env.workspace / "daily/2026-01-02/red-square.md").is_file()
+    assert response.success is False

@@ -18,6 +18,7 @@ import tempfile
 import warnings
 import weakref
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -2109,3 +2110,89 @@ async def test_log_changes_step():
     resp = await step(ctx)
     assert resp.success is True
     assert resp.metadata["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_memory_reports_unreadable_index_after_durable_note_write():
+    """Auto-memory fails its response without removing the written note or transcript."""
+
+    with tempfile.TemporaryDirectory() as tmpdir, temp_chdir(tmpdir):
+        cwd = Path.cwd()
+        app_ctx = _make_app_context(cwd)
+        wrapper = _FakeAgentWrapper()
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        note_path = f"daily/{today}/memory.md"
+        note = cwd / note_path
+        note.parent.mkdir(parents=True)
+        old_note_text = "\n".join(
+            (
+                "---",
+                "name: memory",
+                "session_id: s1",
+                "source_conversation: '[[session/dialog/s1.jsonl]]'",
+                "---",
+                "old body",
+                "",
+            ),
+        )
+        note.write_text(old_note_text, encoding="utf-8")
+        index = cwd / "daily" / f"{today}.md"
+        damaged = b"---\ntags: [\n---\nold index\n"
+        index.write_bytes(damaged)
+
+        async def save_session(session_id, _messages):
+            write_file(cwd / "session" / "dialog" / f"{session_id}.jsonl", "session\n")
+
+        async def list_note(_day, _session_id):
+            return {"path": note_path}
+
+        async def ensure_frontmatter(*_args):
+            return None
+
+        async def rename_note(path, _day):
+            return path
+
+        new_note_text = "\n".join(
+            (
+                "---",
+                "name: memory",
+                "session_id: s1",
+                "source_conversation: '[[session/dialog/s1.jsonl]]'",
+                "---",
+                "new body",
+                "",
+            ),
+        )
+        wrapper.on_reply = lambda *_: note.write_text(new_note_text, encoding="utf-8")
+        step = AutoMemoryStep(app_context=app_ctx, agent_wrapper=wrapper)
+        step.file_store = SimpleNamespace(workspace_path=cwd)
+        step._save_session_messages = save_session
+        step._list_session_note = list_note
+        step._ensure_session_frontmatter = ensure_frontmatter
+        step._rename_from_frontmatter_name = rename_note
+
+        async def failed_refresh(*_args, **_kwargs):
+            return {
+                "date": today,
+                "path": f"daily/{today}.md",
+                "notes": [],
+                "created": False,
+                "changed": False,
+                "error": "daily index is unreadable: malformed YAML",
+            }
+
+        with patch("reme.steps.evolve.auto_memory.refresh_day_index", new=failed_refresh):
+            response = await step(
+                RuntimeContext(
+                    messages=[{"name": "user", "role": "user", "content": "remember project detail"}],
+                    session_id="s1",
+                ),
+            )
+        response = response or step.context.response
+
+        assert response.success is False
+        assert response.answer.startswith("Error: daily index is unreadable")
+        assert "private-page-contents" not in response.answer
+        assert note.read_text(encoding="utf-8").endswith("new body\n")
+        assert (cwd / "session" / "dialog" / "s1.jsonl").is_file()
+        assert index.read_bytes() == damaged

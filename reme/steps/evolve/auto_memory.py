@@ -40,6 +40,7 @@ from ..file_io import (
     write_file_durable,
     write_file_safe,
 )
+from ..file_io._index_result import refresh_index_result
 from ..file_io._path import IMAGE_MIME_BY_EXT, _check_path_permission, resolve_path
 from ..file_io._provenance import (
     PROVENANCE_SESSION_KEY,
@@ -2440,12 +2441,16 @@ class AutoMemoryStep(BaseStep):
             self.context["changes"] = [{"change": "added" if created else "modified", "path": note_path}]
         daily_dir = self.config_value("daily_dir")
         self.logger.info(f"[{self.name}] refresh index start date={day} daily_dir={daily_dir}")
-        index_payload = await refresh_day_index(self.file_store, day, daily_dir)
+        index_payload = await refresh_index_result(refresh_day_index, self.file_store, day, daily_dir)
         self.logger.info(f"[{self.name}] refresh index done path={note_path}")
 
         source_conversation = self._session_link(session_id)
-        self.context.response.success = True
-        self.context.response.answer = agent_reply_result_text(result)
+        self.context.response.success = "error" not in index_payload
+        self.context.response.answer = (
+            agent_reply_result_text(result)
+            if self.context.response.success
+            else (f"Error: {index_payload['error']}; memory note retained, derived index needs repair")
+        )
         self.context.response.metadata.update(
             {
                 "date": day,

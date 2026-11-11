@@ -17,6 +17,7 @@ Always idempotent and safe to re-run.
 """
 
 from ._daily_index import refresh_day_index
+from ._index_result import refresh_index_result
 from ..base_step import BaseStep
 from ...components import R
 from ...steps.evolve import now
@@ -62,4 +63,4 @@ class DailyReindexStep(BaseStep):
     async def execute(self):
         """Trigger the index rebuild and stamp the response."""
         day, daily_dir = self._collect_params()
-        self._apply_result(await refresh_day_index(self.file_store, day, daily_dir))
+        self._apply_result(await refresh_index_result(refresh_day_index, self.file_store, day, daily_dir))
