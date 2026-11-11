@@ -1811,6 +1811,13 @@ class ReMeMemoryProvider(MemoryProvider):
                 if response.get("answer") and not isinstance(response.get("metadata"), dict):
                     raise ReMeBackendError("auto_memory returned success without a verified commit receipt")
                 if self._protected_option_b_enabled() and metadata.get("outcome", "commit") == "commit":
+                    index_status = metadata.get("index_status")
+                    if index_status is not None and (
+                        not isinstance(index_status, str) or index_status not in ("ok", "degraded")
+                    ):
+                        raise ReMeBackendError(
+                            f"protected auto_memory returned an unrecognized index_status: {index_status!r}",
+                        )
                     if metadata.get("index_status") == "degraded":
                         # The source note/BM25 commit was already verified.
                         # Surface rebuildable navigation degradation at the
