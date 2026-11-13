@@ -385,7 +385,12 @@ class IntentJournal:
                 highest = max(highest, int(match.group(1)))
         return highest + 1
 
-    async def _snapshot_updates_async(self, items: list[_PendingItem], sequence: int) -> None:
+    def _plan_update_snapshots(
+        self,
+        items: list[_PendingItem],
+        sequence: int,
+    ) -> list[tuple[Path, bytes]]:
+        planned_snapshots: list[tuple[Path, bytes]] = []
         for item in items:
             if item.action != "update":
                 continue
@@ -410,9 +415,10 @@ class IntentJournal:
                     snapshot_exists = True
                     break
             if not snapshot_exists:
-                await write_file_durable(backup, old)
+                planned_snapshots.append((backup, old))
             item.history_path = f".reme/history/{backup.name}"
             sequence += 1
+        return planned_snapshots
 
     def _validate_preconditions(self, items: list[_PendingItem]) -> None:
         """Re-check admission conditions after taking the workspace lock."""
@@ -450,6 +456,7 @@ class IntentJournal:
         expected_old = item.get("expected_old_digest")
         if isinstance(expected_old, str) and not (
             _sha256_bytes(original) == expected_old
+            or self._digest_matches(backup, expected_old)
             or self._known_record_digest_matches(str(item["note_path"]), expected_old, original)
         ):
             raise JournalCorruptionError("immutable history snapshot does not match pending intent")
@@ -569,6 +576,8 @@ class IntentJournal:
                 states[batch_id] = status
             elif status in {"committed", "rolled_back"}:
                 states[batch_id] = status
+            else:
+                raise JournalCorruptionError(f"journal entry has invalid status: {status!r}")
         for batch_id, entry in pending.items():
             if states.get(batch_id) != "pending":
                 continue
@@ -849,7 +858,7 @@ class IntentJournal:
                 raise TypedJournalError("authoritative typed indexing must be supplied before commit")
             sequence = self._history_sequence()
             self._validate_preconditions(normalized)
-            await self._snapshot_updates_async(normalized, sequence)
+            planned_snapshots = self._plan_update_snapshots(normalized, sequence)
             commits = [
                 {
                     "memory_id": item.memory_id,
@@ -889,6 +898,8 @@ class IntentJournal:
             }
             self._append_locked(entry)
             try:
+                for backup_path, old_bytes in planned_snapshots:
+                    await write_file_durable(backup_path, old_bytes)
                 for item in normalized:
                     await write_file_durable(self._note_path(item.note_path), item.body)
                 if indexer is not None:

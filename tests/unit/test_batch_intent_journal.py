@@ -8,11 +8,14 @@ normal package imports so the suite cannot pollute the interpreter module regist
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import hashlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -37,6 +40,8 @@ from reme.schema.typed_memory import (
     compute_body_sha256,
     sha256_canonical,
 )
+from reme.application import Application
+from reme import application as application_module
 from reme.steps.file_io import _file_io as file_io_module
 
 
@@ -167,6 +172,42 @@ def test_public_journal_exports_are_the_production_contract() -> None:
     assert JournalCorruptionError is journal_module.JournalCorruptionError
 
 
+def test_application_start_reconciles_configured_workspace_for_partial_mock(monkeypatch, tmp_path: Path) -> None:
+    configured_workspace = tmp_path / "configured-workspace"
+    observed: list[Path] = []
+
+    def reconcile(path: Path) -> None:
+        observed.append(Path(path).absolute())
+
+    async def complete_direct(func, *args):
+        return func(*args)
+
+    async def run() -> None:
+        app = object.__new__(Application)
+        context = SimpleNamespace(
+            app_config=SimpleNamespace(
+                thread_pool_max_workers=0,
+                workspace_dir=str(configured_workspace),
+            ),
+            jobs={},
+            thread_pool=None,
+        )
+        app.context = context
+        app.app_context = context
+        app._started_components = []
+        app._component_mutation_lock = asyncio.Lock()
+        app._topological_order = lambda: []
+
+        await Application._start(app)
+
+    monkeypatch.setattr(application_module, "complete_in_thread", complete_direct)
+    monkeypatch.setattr(application_module, "reconcile_workspace", reconcile)
+    asyncio.run(run())
+
+    assert configured_workspace.absolute() != Path.cwd()
+    assert observed == [configured_workspace.absolute()]
+
+
 def test_journal_fsync_precedes_any_note_write(journal, tmp_path: Path, monkeypatch) -> None:
     note_write_seen = False
     real_write = journal_module.write_file_durable
@@ -191,6 +232,44 @@ def test_journal_fsync_precedes_any_note_write(journal, tmp_path: Path, monkeypa
         indexer=lambda commits: None,
     )
     assert note_write_seen
+
+
+def test_update_intent_is_durable_before_history_backup_write(journal, tmp_path: Path, monkeypatch) -> None:
+    record = _record(tmp_path)
+    note = tmp_path / record.note_path
+    note.parent.mkdir(parents=True)
+    previous = b"previous note revision\n"
+    note.write_bytes(previous)
+    journal_path = tmp_path / ".reme" / "intent_journal.jsonl"
+    history_write_seen = False
+    real_write = journal_module.write_file_durable
+
+    async def observe_write(path, content, encoding="utf-8"):
+        nonlocal history_write_seen
+        if str(path).endswith(".bak"):
+            history_write_seen = True
+            pending = [json.loads(line) for line in journal_path.read_text().splitlines()]
+            assert any(entry.get("status") == "pending" for entry in pending)
+        return await real_write(path, content, encoding)
+
+    monkeypatch.setattr(journal_module, "write_file_durable", observe_write)
+    journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [
+            {
+                "record": record,
+                "action": "update",
+                "expected_old_digest": hashlib.sha256(previous).hexdigest(),
+            },
+        ],
+        indexer=lambda commits: None,
+    )
+
+    assert history_write_seen
 
 
 def _hold_lock(workspace: str, ready, release) -> None:

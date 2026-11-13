@@ -196,7 +196,10 @@ class Application(BaseComponent):
                 # accept a request.  The scanner is synchronous by design and
                 # runs outside the event loop so fsync/recovery cannot starve
                 # the service loop.
-                await complete_in_thread(reconcile_workspace, self.workspace_path)
+                cfg = getattr(self, "config", None)
+                workspace_dir = getattr(cfg, "workspace_dir", None) if cfg else None
+                if workspace_dir:
+                    await complete_in_thread(reconcile_workspace, Path(workspace_dir).absolute())
                 pool_size = self.config.thread_pool_max_workers
                 if pool_size > 0:
                     self.context.thread_pool = ThreadPoolExecutor(max_workers=pool_size)
@@ -234,12 +237,14 @@ class Application(BaseComponent):
 
     async def _close_started_components(self) -> None:
         """Close resources while the caller serializes component mutations."""
-        for c in reversed(self._started_components):
-            try:
-                await c.close()
-            except Exception as e:
-                self.logger.exception(f"Failed to close {component_type_name(c.component_type)}:{c.name}: {e}")
-        self._started_components.clear()
+        started = getattr(self, "_started_components", None)
+        if started:
+            for c in reversed(list(started)):
+                try:
+                    await c.close()
+                except Exception as e:
+                    self.logger.exception(f"Failed to close component {c.name}: {e}")
+            started.clear()
         if self.context.thread_pool is not None:
             self.context.thread_pool.shutdown(wait=True)
             self.context.thread_pool = None

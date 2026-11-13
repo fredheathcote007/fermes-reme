@@ -254,6 +254,16 @@ def test_complete_malformed_line_fails_closed_without_truncation(journal, tmp_pa
     assert path.read_bytes() == raw
 
 
+def test_canonical_unknown_status_fails_closed_without_truncation(journal, tmp_path: Path) -> None:
+    path = _write_journal(tmp_path, [{"batch_id": "b1", "status": "bogus"}])
+    before = path.read_bytes()
+
+    with pytest.raises(JournalCorruptionError):
+        journal.reconcile_sync()
+
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize("window", ["CW-2", "CW-3", "CW-4a"])
 def test_receiptless_recovery_removes_only_intended_creates_and_restores_updates(
     window: str,
@@ -318,6 +328,46 @@ def test_cw4a_missing_receipt_rolls_back_creates_and_restores_updates(journal, t
 
     assert note.read_bytes() == old
     assert not create.exists()
+
+
+def test_rollback_update_accepts_matching_frontmatter_digest_marker(journal, tmp_path: Path) -> None:
+    expected_old_digest = "a" * 64
+    restored = (
+        b"---\n"
+        + b"record_digest: "
+        + expected_old_digest.encode("ascii")
+        + b"\n---\n"
+        + b"prior note body\n"
+    )
+    current = b"published replacement\n"
+    assert hashlib.sha256(restored).hexdigest() != expected_old_digest
+    note = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-1.md"
+    note.parent.mkdir(parents=True)
+    note.write_bytes(current)
+    history_rel = ".reme/history/mem-semantic-1.rev1.aaaaaaaa.bak"
+    history = tmp_path / history_rel
+    history.parent.mkdir(parents=True)
+    history.write_bytes(restored)
+    update = {
+        "memory_id": "mem-semantic-1",
+        "record_type": "semantic",
+        "note_path": "memory/typed/semantic/mem-semantic-1.md",
+        "action": "update",
+        "record_digest": "b" * 64,
+        "body_sha256": hashlib.sha256(current).hexdigest(),
+        "expected_old_digest": expected_old_digest,
+        "prior_history_path": history_rel,
+    }
+    _write_journal(tmp_path, [_intent(records=[update])])
+
+    _recover(journal)
+
+    assert note.read_bytes() == restored
+    statuses = [
+        json.loads(line)["status"]
+        for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
+    ]
+    assert statuses[-1] == "rolled_back"
 
 
 def test_cw3_partial_publication_never_unlinks_update_target(journal, tmp_path: Path) -> None:
