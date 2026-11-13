@@ -182,6 +182,96 @@ def test_source_uri_admission_confines_workspace_and_session_context(tmp_path: P
         admit_source_uri(file_uri, workspace_dir=tmp_path / "missing")
 
 
+def test_source_uri_admission_symlink_boundaries(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    ancestor_sym = tmp_path / "ancestor-sym"
+    ancestor_sym.symlink_to(real_parent, target_is_directory=True)
+    workspace_unresolved = ancestor_sym / "workspace"
+    workspace_unresolved.mkdir()
+    workspace_resolved = real_parent / "workspace"
+
+    assert (
+        admit_source_uri(
+            f"file://{workspace_unresolved}/file.txt",
+            workspace_dir=workspace_unresolved,
+        )
+        == workspace_unresolved / "file.txt"
+    )
+    assert (
+        admit_source_uri(
+            f"file://{workspace_resolved}/file.txt",
+            workspace_dir=workspace_unresolved,
+        )
+        == workspace_resolved / "file.txt"
+    )
+
+    real_workspace = tmp_path / "real-workspace"
+    real_workspace.mkdir()
+    workspace_sym = tmp_path / "workspace-sym"
+    workspace_sym.symlink_to(real_workspace, target_is_directory=True)
+    assert (
+        admit_source_uri(
+            f"file://{workspace_sym}/file.txt",
+            workspace_dir=workspace_sym,
+        )
+        == workspace_sym / "file.txt"
+    )
+
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("outside", encoding="utf-8")
+    bad_link = real_workspace / "bad-link"
+    bad_link.symlink_to(outside_file)
+    with pytest.raises(ValueError, match="Symlink rejected"):
+        admit_source_uri(f"file://{bad_link}", workspace_dir=real_workspace)
+
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    bad_dir = real_workspace / "bad-dir"
+    bad_dir.symlink_to(outside_dir, target_is_directory=True)
+    with pytest.raises(ValueError, match="Symlink rejected"):
+        admit_source_uri(f"file://{bad_dir}/file.txt", workspace_dir=real_workspace)
+
+    internal_file = real_workspace / "file.txt"
+    internal_file.write_text("inside", encoding="utf-8")
+    internal_link = real_workspace / "internal-link"
+    internal_link.symlink_to(internal_file)
+    with pytest.raises(ValueError, match="Symlink rejected"):
+        admit_source_uri(f"file://{internal_link}", workspace_dir=real_workspace)
+
+    with pytest.raises(ValueError, match="escapes workspace_dir"):
+        admit_source_uri("file:///etc/passwd", workspace_dir=real_workspace)
+    for uri in (
+        f"file://{real_workspace}/../outside",
+        f"file://{real_workspace}/%2e%2e/outside",
+    ):
+        with pytest.raises(ValueError):
+            admit_source_uri(uri, workspace_dir=real_workspace)
+    with pytest.raises(ValueError, match="existing directory"):
+        admit_source_uri(
+            f"file://{real_workspace}/file.txt",
+            workspace_dir=tmp_path / "missing-workspace",
+        )
+
+    session_id = "symlink-boundary-session"
+    authority = hashlib.sha256(session_id.encode()).hexdigest()
+    session_uri = f"session://{authority}/dialog.jsonl"
+    assert admit_source_uri(session_uri, workspace_dir=real_workspace, session_id=session_id) == (
+        real_workspace / ".reme" / "sessions" / authority / "dialog.jsonl"
+    )
+    with pytest.raises(ValueError, match="authority mismatch"):
+        admit_source_uri(f"session://{'a' * 64}/dialog.jsonl", workspace_dir=real_workspace, session_id=session_id)
+
+    session_root = real_workspace / ".reme" / "sessions"
+    session_root.mkdir(parents=True)
+    internal_session_dir = real_workspace / "internal-session"
+    internal_session_dir.mkdir()
+    session_authority_link = session_root / authority
+    session_authority_link.symlink_to(internal_session_dir, target_is_directory=True)
+    with pytest.raises(ValueError, match="Symlink rejected"):
+        admit_source_uri(session_uri, workspace_dir=real_workspace, session_id=session_id)
+
+
 def test_uri_syntax_is_structural_only() -> None:
     assert _SCHEMA.validate_workspace_containment("file:///workspace/source.txt")
     assert _SCHEMA.validate_workspace_containment(f"session://{'a' * 64}/dialog.jsonl")

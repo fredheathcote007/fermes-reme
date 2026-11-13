@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import os
 import re
 import urllib.parse
 from pathlib import Path
@@ -133,8 +134,9 @@ def admit_source_uri(
     if parsed.query or parsed.fragment or parsed.username or parsed.password:
         raise ValueError(f"source URI may not contain query, fragment, or credentials: {source_uri!r}")
     _reject_windows_or_unsafe_uri_path(parsed.path)
-    ws_path = Path(workspace_dir).resolve()
-    if not ws_path.is_dir():
+    ws_unresolved = Path(os.path.abspath(workspace_dir))
+    ws_resolved = ws_unresolved.resolve()
+    if not ws_resolved.is_dir():
         raise ValueError(f"Application workspace_dir must be an existing directory: {workspace_dir!r}")
 
     if parsed.scheme == "file":
@@ -143,13 +145,21 @@ def admit_source_uri(
         if not parsed.path.startswith("/"):
             raise ValueError(f"file URI must have an absolute local path: {source_uri!r}")
         raw_path = Path(urllib.parse.unquote(parsed.path))
-        if not raw_path.is_relative_to(ws_path):
-            raise ValueError(f"file URI escapes workspace_dir: {raw_path!r} outside {ws_path!r}")
+        if raw_path.is_relative_to(ws_unresolved):
+            boundary = ws_unresolved
+        elif raw_path.is_relative_to(ws_resolved):
+            boundary = ws_resolved
+        else:
+            raise ValueError(f"file URI escapes workspace_dir: {raw_path!r} outside {ws_resolved!r}")
+
         curr = raw_path
-        while curr not in (ws_path, curr.parent):
+        while curr != boundary and curr != curr.parent:
             if curr.is_symlink():
                 raise ValueError(f"Symlink rejected in workspace path: {curr!r}")
             curr = curr.parent
+
+        if not raw_path.resolve().is_relative_to(ws_resolved):
+            raise ValueError(f"file URI escapes workspace_dir: {raw_path!r} outside {ws_resolved!r}")
         return raw_path
 
     if not re.fullmatch(r"[a-f0-9]{64}", parsed.netloc or ""):
@@ -161,11 +171,11 @@ def admit_source_uri(
     expected_authority = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
     if parsed.netloc != expected_authority:
         raise ValueError(f"Session URI authority mismatch: expected {expected_authority}, got {parsed.netloc}")
-    raw_target = ws_path / ".reme" / "sessions" / parsed.netloc / "dialog.jsonl"
-    if not raw_target.is_relative_to(ws_path):
+    raw_target = ws_unresolved / ".reme" / "sessions" / parsed.netloc / "dialog.jsonl"
+    if not raw_target.resolve().is_relative_to(ws_resolved):
         raise ValueError(f"session URI escapes workspace_dir: {raw_target!r}")
     curr = raw_target
-    while curr not in (ws_path, curr.parent):
+    while curr != ws_unresolved and curr != curr.parent:
         if curr.is_symlink():
             raise ValueError(f"Symlink rejected in workspace path: {curr!r}")
         curr = curr.parent
