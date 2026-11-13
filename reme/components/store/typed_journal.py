@@ -235,6 +235,8 @@ class IntentJournal:
             raise JournalCorruptionError("intent journal is a symlink")
         raw = self.journal_path.read_bytes()
         entries: list[dict[str, Any]] = []
+        seen_pending: set[str] = set()
+        terminal_batches: set[str] = set()
         offset = 0
         lines = raw.splitlines(keepends=True)
         for line in lines:
@@ -248,28 +250,45 @@ class IntentJournal:
                 value = json.loads(candidate.decode("utf-8"))
                 if not isinstance(value, dict) or canonical_jcs_bytes(value) != candidate:
                     raise ValueError("line is not RFC 8785 canonical JSON")
-                status = value.get("status")
-                batch_id = value.get("batch_id")
-                if not isinstance(batch_id, str) or not batch_id:
-                    raise JournalCorruptionError("journal entry has no valid batch_id")
-                if not isinstance(status, str) or status not in {"pending", "committed", "rolled_back"}:
-                    raise JournalCorruptionError(f"journal entry has invalid status: {status!r}")
-                if status == "committed" and not isinstance(value.get("receipt_digest"), str):
-                    raise JournalCorruptionError("committed journal entry missing receipt_digest")
-                if status == "pending":
-                    for req_field in (
-                        "request_id",
-                        "session_id",
-                        "workspace_id",
-                        "profile_id",
-                        "records",
-                        "payload_digest",
-                        "receipt_digest",
-                    ):
-                        if req_field not in value:
-                            raise JournalCorruptionError(f"pending journal entry missing {req_field}")
             except (UnicodeError, RecursionError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise JournalCorruptionError(f"interior intent journal corruption at byte {offset}") from exc
+            status = value.get("status")
+            batch_id = value.get("batch_id")
+            if not isinstance(status, str) or status not in {"pending", "committed", "rolled_back"}:
+                raise JournalCorruptionError(f"unknown intent journal status at byte {offset}")
+            if not isinstance(batch_id, str) or not _SAFE_ID_RE.fullmatch(batch_id):
+                raise JournalCorruptionError(f"invalid journal batch_id at byte {offset}")
+            if status == "pending":
+                request = value.get("request_id")
+                records = value.get("records")
+                if batch_id in seen_pending or batch_id in terminal_batches:
+                    raise JournalCorruptionError(f"duplicate pending journal batch at byte {offset}")
+                if not isinstance(request, str) or not _SAFE_ID_RE.fullmatch(request):
+                    raise JournalCorruptionError(f"invalid pending journal request at byte {offset}")
+                if not isinstance(records, list) or not 1 <= len(records) <= 100:
+                    raise JournalCorruptionError(f"invalid pending journal record count at byte {offset}")
+                if value.get("n_records", len(records)) != len(records):
+                    raise JournalCorruptionError(f"pending journal record count mismatch at byte {offset}")
+                for item in records:
+                    if not isinstance(item, dict):
+                        raise JournalCorruptionError(f"invalid pending journal record at byte {offset}")
+                    if item.get("action") not in {"create", "update"}:
+                        raise JournalCorruptionError(f"invalid pending journal action at byte {offset}")
+                    if not isinstance(item.get("note_path"), str):
+                        raise JournalCorruptionError(f"invalid pending journal path at byte {offset}")
+                    for field in ("body_sha256", "record_digest"):
+                        digest = item.get(field)
+                        if not isinstance(digest, str) or not _HEX64_RE.fullmatch(digest):
+                            raise JournalCorruptionError(f"invalid pending journal {field} at byte {offset}")
+                seen_pending.add(batch_id)
+            else:
+                if batch_id not in seen_pending or batch_id in terminal_batches:
+                    raise JournalCorruptionError(f"invalid journal status transition at byte {offset}")
+                if status == "committed" and not (
+                    isinstance(value.get("receipt_digest"), str) and _HEX64_RE.fullmatch(value["receipt_digest"])
+                ):
+                    raise JournalCorruptionError(f"committed journal entry lacks receipt digest at byte {offset}")
+                terminal_batches.add(batch_id)
             entries.append(value)
             offset += len(line)
         return entries
@@ -409,8 +428,9 @@ class IntentJournal:
         self,
         items: list[_PendingItem],
         sequence: int,
-    ) -> list[tuple[Path, bytes]]:
-        planned_snapshots: list[tuple[Path, bytes]] = []
+    ) -> list[tuple[_PendingItem, Path, bytes]]:
+        """Plan history paths without mutating storage before the pending intent."""
+        planned: list[tuple[_PendingItem, Path, bytes]] = []
         for item in items:
             if item.action != "update":
                 continue
@@ -420,25 +440,31 @@ class IntentJournal:
             if not self._digest_matches(target, expected) and not self._known_record_digest_matches(
                 item.note_path,
                 expected,
-                target.read_bytes(),
+                old,
             ):
                 raise JournalConflictError(f"expected_old_digest does not match {item.note_path}")
-            actual_digest = _sha256_bytes(old)
-            old_digest_prefix = (item.expected_old_digest or actual_digest)[:8]
-            backup = self.history_dir / f"{item.memory_id}.rev{sequence}.{old_digest_prefix}.bak"
-            snapshot_exists = False
+            digest = _sha256_bytes(old)
+            backup = self.history_dir / f"{item.memory_id}.rev{sequence}.{digest[:8]}.bak"
             while backup.exists():
-                if backup.is_symlink() or backup.read_bytes() != old:
-                    sequence += 1
-                    backup = self.history_dir / f"{item.memory_id}.rev{sequence}.{old_digest_prefix}.bak"
-                else:
-                    snapshot_exists = True
-                    break
-            if not snapshot_exists:
-                planned_snapshots.append((backup, old))
+                sequence += 1
+                backup = self.history_dir / f"{item.memory_id}.rev{sequence}.{digest[:8]}.bak"
             item.history_path = f".reme/history/{backup.name}"
+            planned.append((item, backup, old))
             sequence += 1
-        return planned_snapshots
+        return planned
+
+    async def _persist_update_snapshots(
+        self,
+        planned: list[tuple[_PendingItem, Path, bytes]],
+    ) -> None:
+        """Fsync immutable old bytes only after their pending intent is durable."""
+        for item, backup, old in planned:
+            target = self._note_path(item.note_path)
+            if not target.is_file() or target.is_symlink() or target.read_bytes() != old:
+                raise JournalConflictError("update target changed before history snapshot")
+            if backup.exists():
+                raise JournalConflictError("reserved immutable history path already exists")
+            await write_file_durable(backup, old)
 
     def _validate_preconditions(self, items: list[_PendingItem]) -> None:
         """Re-check admission conditions after taking the workspace lock."""
@@ -468,19 +494,19 @@ class IntentJournal:
             raise JournalCorruptionError("pending update has no immutable history snapshot")
         backup = self._history_path(history)
         target = self._note_path(str(item["note_path"]))
-        expected_old = item.get("expected_old_digest")
-        if not backup.is_file() or backup.is_symlink():
-            if target.is_file() and not target.is_symlink():
-                current = target.read_bytes()
-                if isinstance(expected_old, str) and (
-                    self._digest_matches(target, expected_old)
-                    or self._known_record_digest_matches(str(item["note_path"]), expected_old, current)
-                ):
-                    return
-            raise JournalCorruptionError(f"history snapshot is missing: {history}")
         if not target.is_file() or target.is_symlink():
             raise JournalConflictError("pending update target is missing or unsafe")
+        previous_sha = item.get("prior_body_sha256")
+        if previous_sha is not None and (not isinstance(previous_sha, str) or not _HEX64_RE.fullmatch(previous_sha)):
+            raise JournalCorruptionError("pending update history digest is malformed")
+        if not backup.is_file() or backup.is_symlink():
+            if previous_sha and _sha256_bytes(target.read_bytes()) == previous_sha:
+                return  # Crash after pending, before immutable history was created.
+            raise JournalCorruptionError(f"history snapshot is missing: {history}")
         original = backup.read_bytes()
+        if previous_sha is not None and _sha256_bytes(original) != previous_sha:
+            raise JournalCorruptionError("immutable history snapshot digest mismatch")
+        expected_old = item.get("expected_old_digest")
         if isinstance(expected_old, str) and not (
             _sha256_bytes(original) == expected_old
             or self._digest_matches(backup, expected_old)
@@ -603,8 +629,6 @@ class IntentJournal:
                 states[batch_id] = status
             elif status in {"committed", "rolled_back"}:
                 states[batch_id] = status
-            else:
-                raise JournalCorruptionError(f"journal entry has invalid status: {status!r}")
         for batch_id, entry in pending.items():
             if states.get(batch_id) != "pending":
                 continue
@@ -885,7 +909,8 @@ class IntentJournal:
                 raise TypedJournalError("authoritative typed indexing must be supplied before commit")
             sequence = self._history_sequence()
             self._validate_preconditions(normalized)
-            planned_snapshots = self._plan_update_snapshots(normalized, sequence)
+            planned = self._plan_update_snapshots(normalized, sequence)
+            old_shas = {item.note_path: _sha256_bytes(old) for item, _path, old in planned}
             commits = [
                 {
                     "memory_id": item.memory_id,
@@ -921,12 +946,17 @@ class IntentJournal:
                 "n_records": len(normalized),
                 "receipt_digest": receipt.receipt_digest,
                 "payload_digest": payload_digest,
-                "records": [item.journal_dict() for item in normalized],
+                "records": [
+                    {
+                        **item.journal_dict(),
+                        **({"prior_body_sha256": old_shas[item.note_path]} if item.action == "update" else {}),
+                    }
+                    for item in normalized
+                ],
             }
             self._append_locked(entry)
             try:
-                for backup_path, old_bytes in planned_snapshots:
-                    await write_file_durable(backup_path, old_bytes)
+                await self._persist_update_snapshots(planned)
                 for item in normalized:
                     await write_file_durable(self._note_path(item.note_path), item.body)
                 if indexer is not None:

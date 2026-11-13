@@ -106,6 +106,8 @@ def _intent(*, batch_id: str = "batch-1", request_id: str = "request-1", records
         "timestamp_utc": "2026-11-13T01:02:03Z",
         "status": "pending",
         "n_records": len(records),
+        "payload_digest": "0" * 64,
+        "receipt_digest": "1" * 64,
         "records": records,
     }
 
@@ -424,8 +426,8 @@ def test_pending_update_preserves_newer_unowned_note(journal, tmp_path: Path) ->
             "session_id": "session-1",
             "workspace_id": "workspace-1",
             "profile_id": "profile-1",
-            "payload_digest": "p" * 64,
-            "receipt_digest": "r" * 64,
+            "payload_digest": "0" * 64,
+            "receipt_digest": "1" * 64,
             "records": [
                 {
                     "action": "update",
@@ -443,3 +445,122 @@ def test_pending_update_preserves_newer_unowned_note(journal, tmp_path: Path) ->
     with pytest.raises(journal_module.JournalConflictError):
         journal.reconcile_sync()
     assert target.read_bytes() == unrelated
+
+
+def test_write_ahead_pending_intent_precedes_immutable_update_snapshot(
+    journal,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    record = _record(tmp_path)
+    original = b"existing note before update\n"
+    old_sha = hashlib.sha256(original).hexdigest()
+    note = tmp_path / record.note_path
+    note.parent.mkdir(parents=True)
+    note.write_bytes(original)
+    real_write = journal_module.write_file_durable
+    observed: list[str] = []
+
+    async def observe_write(path, content, *args, **kwargs):
+        path = Path(path)
+        if path.parent == tmp_path / ".reme" / "history":
+            entries = [
+                json.loads(line) for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
+            ]
+            assert entries[0]["status"] == "pending"
+            entry = entries[0]["records"][0]
+            assert entry["prior_history_path"] == f".reme/history/{path.name}"
+            assert entry["prior_body_sha256"] == old_sha
+            observed.append("pending-before-history")
+        return await real_write(path, content, *args, **kwargs)
+
+    monkeypatch.setattr(journal_module, "write_file_durable", observe_write)
+    journal.commit_batch_sync(
+        "request1",
+        "batch1",
+        "session1",
+        "workspace1",
+        "profile1",
+        [{"record": record, "action": "update", "expected_old_digest": old_sha}],
+        indexer=lambda _: None,
+    )
+    assert observed == ["pending-before-history"]
+
+
+def test_crash_after_pending_before_history_preserves_original_update(
+    journal,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    record = _record(tmp_path)
+    original = b"existing old note must survive pending-only crash\n"
+    old_sha = hashlib.sha256(original).hexdigest()
+    note = tmp_path / record.note_path
+    note.parent.mkdir(parents=True)
+    note.write_bytes(original)
+    real_write = journal_module.write_file_durable
+
+    async def fail_history_write(path, content, *args, **kwargs):
+        if Path(path).parent == tmp_path / ".reme" / "history":
+            raise OSError("simulated crash before immutable snapshot")
+        return await real_write(path, content, *args, **kwargs)
+
+    monkeypatch.setattr(journal_module, "write_file_durable", fail_history_write)
+    with pytest.raises(OSError, match="simulated crash"):
+        journal.commit_batch_sync(
+            "request1",
+            "batch1",
+            "session1",
+            "workspace1",
+            "profile1",
+            [{"record": record, "action": "update", "expected_old_digest": old_sha}],
+            indexer=lambda _: None,
+        )
+    assert note.read_bytes() == original
+    assert not (tmp_path / ".reme/receipts/request1.json").exists()
+    statuses = [
+        json.loads(line)["status"] for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
+    ]
+    assert statuses == ["pending", "rolled_back"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"batch_id": "batch1", "status": "bogus"},
+        {"batch_id": "batch1", "status": "pending", "request_id": "request1"},
+        {
+            "batch_id": "batch1",
+            "status": "pending",
+            "request_id": "request1",
+            "records": "invalid",
+        },
+        {"batch_id": "batch1", "status": "rolled_back"},
+        {"batch_id": "batch1", "status": "committed", "receipt_digest": "a" * 64},
+    ],
+)
+def test_semantically_invalid_canonical_journal_fails_closed_without_truncation(
+    journal,
+    tmp_path: Path,
+    entry: dict[str, Any],
+) -> None:
+    journal.append(entry)
+    path = tmp_path / ".reme/intent_journal.jsonl"
+    before = path.read_bytes()
+    with pytest.raises(JournalCorruptionError):
+        journal.reconcile_sync()
+    assert path.read_bytes() == before
+
+
+def test_duplicate_pending_or_terminal_transition_fails_closed(
+    journal,
+    tmp_path: Path,
+) -> None:
+    first = _intent(batch_id="batch1", request_id="request1")
+    journal.append(first)
+    journal.append(first)
+    path = tmp_path / ".reme/intent_journal.jsonl"
+    before = path.read_bytes()
+    with pytest.raises(JournalCorruptionError):
+        journal.reconcile_sync()
+    assert path.read_bytes() == before

@@ -356,12 +356,12 @@ def test_cron_uses_configured_timezone(monkeypatch):
     assert seen["timezone"] == "America/New_York"
 
 
-def test_application_starts_jobs_base_stream_background_cron():
+def test_application_starts_jobs_base_stream_background_cron(tmp_path):
     async def run():
         order = []
         app = object.__new__(Application)
         app.context = SimpleNamespace(
-            app_config=SimpleNamespace(thread_pool_max_workers=0),
+            app_config=SimpleNamespace(thread_pool_max_workers=0, workspace_dir=str(tmp_path)),
             jobs={
                 "cron": CronJob(cron="* * * * *", name="cron"),
                 "background": BackgroundJob(name="background"),
@@ -451,7 +451,7 @@ def test_application_can_call_non_servable_job():
     asyncio.run(run())
 
 
-def test_application_start_failure_propagates_and_closes_started_components():
+def test_application_start_failure_propagates_and_closes_started_components(tmp_path):
     async def run():
         class GoodComponent(BaseComponent):
             component_type = ComponentEnum.TOKENIZER
@@ -473,7 +473,7 @@ def test_application_start_failure_propagates_and_closes_started_components():
         bad = BrokenComponent(name="bad")
         app = object.__new__(Application)
         app.context = SimpleNamespace(
-            app_config=SimpleNamespace(thread_pool_max_workers=0),
+            app_config=SimpleNamespace(thread_pool_max_workers=0, workspace_dir=str(tmp_path)),
             jobs={},
             thread_pool=None,
         )
@@ -487,5 +487,22 @@ def test_application_start_failure_propagates_and_closes_started_components():
 
         assert good.closed is True
         assert not app._started_components
+
+    asyncio.run(run())
+
+
+def test_application_fails_closed_on_missing_workspace_config(tmp_path):
+    async def run():
+        app = object.__new__(Application)
+        app.context = SimpleNamespace(
+            app_config=SimpleNamespace(thread_pool_max_workers=0),
+            jobs={},
+            thread_pool=None,
+        )
+        app._component_mutation_lock = asyncio.Lock()
+        app._started_components = []
+        app._topological_order = lambda: pytest.fail("jobs must not start")
+        with pytest.raises(ValueError, match="configured workspace_dir"):
+            await Application._start(app)
 
     asyncio.run(run())

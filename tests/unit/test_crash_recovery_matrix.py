@@ -90,8 +90,8 @@ def _intent(
         "timestamp_utc": "2026-11-13T01:02:03Z",
         "status": "pending",
         "n_records": len(records),
-        "payload_digest": "p" * 64,
-        "receipt_digest": "r" * 64,
+        "payload_digest": "0" * 64,
+        "receipt_digest": "1" * 64,
         "records": records,
     }
 
@@ -224,16 +224,16 @@ def test_public_journal_exports_are_the_production_contract() -> None:
 
 
 def test_cw1_trailing_torn_line_is_truncated_without_losing_prior_history(journal, tmp_path: Path) -> None:
-    history = {
-        "batch_id": "batch-history",
-        "status": "committed",
-        "receipt_digest": "r" * 64,
-    }
-    path = _write_journal(tmp_path, [history], trailing=b'{"status":"pending"')
-    expected = rfc8785.dumps(history)
-    expected = expected if isinstance(expected, bytes) else expected.encode()
+    pending = _intent(batch_id="batch-history", request_id="request-history")
+    history = {"batch_id": "batch-history", "status": "rolled_back"}
+    path = _write_journal(
+        tmp_path,
+        [pending, history],
+        trailing=b'{"status":"pending"',
+    )
+    expected = b"".join(rfc8785.dumps(entry) + b"\n" for entry in (pending, history))
     _recover(journal)
-    assert path.read_bytes() == expected + b"\n"
+    assert path.read_bytes() == expected
 
 
 def test_torn_suffix_also_reconciles_surviving_pending_intent(journal, tmp_path: Path) -> None:
@@ -404,6 +404,7 @@ def test_rollback_allows_missing_snapshot_if_target_unaltered(journal, tmp_path:
     note.parent.mkdir(parents=True)
     note.write_bytes(old)
     update = _update_record(old)
+    update["prior_body_sha256"] = update["expected_old_digest"]
     history = tmp_path / update["prior_history_path"]
     assert not history.exists()
     _write_journal(tmp_path, [_intent(records=[update])])

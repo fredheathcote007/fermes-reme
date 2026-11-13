@@ -198,8 +198,9 @@ class Application(BaseComponent):
                 # the service loop.
                 cfg = getattr(self, "config", None)
                 workspace_dir = getattr(cfg, "workspace_dir", None) if cfg else None
-                if workspace_dir:
-                    await complete_in_thread(reconcile_workspace, Path(workspace_dir).absolute())
+                if not isinstance(workspace_dir, str) or not workspace_dir:
+                    raise ValueError("typed journal startup requires configured workspace_dir")
+                await complete_in_thread(reconcile_workspace, Path(workspace_dir).absolute())
                 pool_size = self.config.thread_pool_max_workers
                 if pool_size > 0:
                     self.context.thread_pool = ThreadPoolExecutor(max_workers=pool_size)
