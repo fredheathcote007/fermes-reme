@@ -273,6 +273,10 @@ class IntentJournal:
                     raise JournalCorruptionError(f"invalid pending journal record count at byte {offset}")
                 if value.get("n_records", len(records)) != len(records):
                     raise JournalCorruptionError(f"pending journal record count mismatch at byte {offset}")
+                for d_field in ("payload_digest", "receipt_digest"):
+                    d_val = value.get(d_field)
+                    if not isinstance(d_val, str) or not _HEX64_RE.fullmatch(d_val):
+                        raise JournalCorruptionError(f"invalid pending journal {d_field} at byte {offset}")
                 for item in records:
                     if not isinstance(item, dict):
                         raise JournalCorruptionError(f"invalid pending journal record at byte {offset}")
@@ -282,18 +286,14 @@ class IntentJournal:
                     if not isinstance(mem_id, str) or not _SAFE_ID_RE.fullmatch(mem_id):
                         raise JournalCorruptionError(f"invalid pending journal memory_id at byte {offset}")
                     record_type = item.get("record_type")
-                    if record_type is not None and (
-                        not isinstance(record_type, str)
-                        or record_type not in {"semantic", "episodic", "procedural"}
-                    ):
+                    if not isinstance(record_type, str) or record_type not in {
+                        "semantic",
+                        "episodic",
+                        "procedural",
+                    }:
                         raise JournalCorruptionError(f"invalid pending journal record_type at byte {offset}")
                     note_path = item.get("note_path")
-                    if (
-                        not isinstance(note_path, str)
-                        or not note_path
-                        or note_path.startswith(("/", "../"))
-                        or "\\" in note_path
-                    ):
+                    if not isinstance(note_path, str) or not _TYPED_NOTE_RE.fullmatch(note_path):
                         raise JournalCorruptionError(f"invalid pending journal path at byte {offset}")
                     for field in ("body_sha256", "record_digest"):
                         digest = item.get(field)

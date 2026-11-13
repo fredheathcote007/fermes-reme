@@ -647,11 +647,44 @@ def test_pending_entry_rejects_invalid_scope_without_truncation(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("payload_digest", "bad"),
+        ("payload_digest", "0" * 63),
+        ("payload_digest", "g" * 64),
+        ("payload_digest", ""),
+        ("receipt_digest", "bad"),
+        ("receipt_digest", "0" * 63),
+        ("receipt_digest", "g" * 64),
+        ("receipt_digest", ""),
+    ],
+)
+def test_pending_entry_rejects_invalid_digest_without_truncation(
+    journal,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    entry = _intent()
+    entry[field] = value
+    journal.append(entry)
+    path = tmp_path / ".reme/intent_journal.jsonl"
+    before = path.read_bytes()
+
+    with pytest.raises(JournalCorruptionError):
+        journal.reconcile_sync()
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
         ("memory_id", "bad space"),
         ("memory_id", "../../"),
         ("memory_id", ""),
         ("record_type", "unknown"),
         ("note_path", "../escape.md"),
+        ("note_path", "memory/typed/semantic/foo/../bar.md"),
+        ("note_path", "untyped/note.md"),
         ("note_path", "/abs.md"),
         ("note_path", ""),
     ],
