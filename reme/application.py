@@ -10,12 +10,14 @@ from typing import Any, AsyncGenerator, TypeVar
 
 from . import __version__
 from .components import ApplicationContext, BaseComponent
+from .components.store.typed_journal import reconcile_workspace
 from .components.job import BackgroundJob, BaseJob, CronJob, StreamJob
 from .components.service import BaseService
 from .enumeration import ComponentEnum, ComponentType, component_type_name
 from .plugin import resolve_plugin_runtime
 from .schema import ComponentConfig, Response, StreamChunk
 from .utils import execute_stream_task, print_logo, get_logger
+from .utils.async_utils import complete_in_thread
 
 T = TypeVar("T", bound=BaseComponent)
 _NodeKey = tuple[str, str]
@@ -189,11 +191,16 @@ class Application(BaseComponent):
     async def _start(self) -> None:
         """Start components, then jobs as base > stream > background > cron."""
         async with self._component_mutation_lock:
-            pool_size = self.config.thread_pool_max_workers
-            if pool_size > 0:
-                self.context.thread_pool = ThreadPoolExecutor(max_workers=pool_size)
-                self.logger.info(f"Thread pool created with max_workers={pool_size}")
             try:
+                # Resolve durable typed batches before any component or job can
+                # accept a request.  The scanner is synchronous by design and
+                # runs outside the event loop so fsync/recovery cannot starve
+                # the service loop.
+                await complete_in_thread(reconcile_workspace, self.workspace_path)
+                pool_size = self.config.thread_pool_max_workers
+                if pool_size > 0:
+                    self.context.thread_pool = ThreadPoolExecutor(max_workers=pool_size)
+                    self.logger.info(f"Thread pool created with max_workers={pool_size}")
                 components = self._topological_order()
                 jobs = list(self.context.jobs.values())
                 base_jobs = [j for j in jobs if not isinstance(j, (StreamJob, BackgroundJob))]
