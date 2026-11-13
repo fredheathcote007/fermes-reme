@@ -29,6 +29,7 @@ except ImportError:  # Native Windows does not support POSIX flock.
 from reme.components.store import typed_journal as journal_module
 from reme.components.store.typed_journal import (
     IntentJournal,
+    JournalConflictError,
     JournalCorruptionError,
     TypedBatchIntentJournal,
     reconcile_workspace,
@@ -522,6 +523,155 @@ def test_crash_after_pending_before_history_preserves_original_update(
         json.loads(line)["status"] for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
     ]
     assert statuses == ["pending", "rolled_back"]
+
+
+def test_live_update_race_after_snapshot_preserves_third_party_edit(
+    journal,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    record = _record(tmp_path)
+    original = b"original note before race\n"
+    third_party = b"third-party edit after snapshot\n"
+    old_sha = hashlib.sha256(original).hexdigest()
+    note = tmp_path / record.note_path
+    note.parent.mkdir(parents=True)
+    note.write_bytes(original)
+    real_write = journal_module.write_file_durable
+    history_written = False
+
+    async def race_after_snapshot(path, content, *args, **kwargs):
+        nonlocal history_written
+        path = Path(path)
+        result = await real_write(path, content, *args, **kwargs)
+        if path.parent == tmp_path / ".reme" / "history":
+            history_written = True
+            note.write_bytes(third_party)
+        return result
+
+    monkeypatch.setattr(journal_module, "write_file_durable", race_after_snapshot)
+    with pytest.raises(JournalConflictError):
+        journal.commit_batch_sync(
+            "request-race-after",
+            "batch-race-after",
+            "session-race",
+            "workspace-race",
+            "profile-race",
+            [{"record": record, "action": "update", "expected_old_digest": old_sha}],
+            indexer=lambda _: None,
+        )
+
+    assert history_written
+    assert note.read_bytes() == third_party
+    statuses = [
+        json.loads(line)["status"] for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
+    ]
+    assert statuses == ["pending", "rolled_back"]
+
+
+def test_live_update_race_before_snapshot_preserves_third_party_edit(
+    journal,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    record = _record(tmp_path)
+    original = b"original note before pre-snapshot race\n"
+    third_party = b"third-party edit before snapshot\n"
+    old_sha = hashlib.sha256(original).hexdigest()
+    note = tmp_path / record.note_path
+    note.parent.mkdir(parents=True)
+    note.write_bytes(original)
+    edited = False
+
+    real_persist = journal._persist_update_snapshots
+
+    async def race_before_snapshot(planned):
+        nonlocal edited
+        if not edited:
+            edited = True
+            note.write_bytes(third_party)
+        return await real_persist(planned)
+
+    monkeypatch.setattr(journal, "_persist_update_snapshots", race_before_snapshot)
+    with pytest.raises(JournalConflictError):
+        journal.commit_batch_sync(
+            "request-race-before",
+            "batch-race-before",
+            "session-race",
+            "workspace-race",
+            "profile-race",
+            [{"record": record, "action": "update", "expected_old_digest": old_sha}],
+            indexer=lambda _: None,
+        )
+
+    assert edited
+    assert note.read_bytes() == third_party
+    statuses = [
+        json.loads(line)["status"] for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
+    ]
+    assert statuses == ["pending", "rolled_back"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("session_id", "bad space"),
+        ("session_id", "../../"),
+        ("session_id", ""),
+        ("workspace_id", "bad space"),
+        ("workspace_id", "../../"),
+        ("workspace_id", ""),
+        ("profile_id", "bad space"),
+        ("profile_id", "../../"),
+        ("profile_id", ""),
+    ],
+)
+def test_pending_entry_rejects_invalid_scope_without_truncation(
+    journal,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    entry = _intent()
+    entry[field] = value
+    journal.append(entry)
+    path = tmp_path / ".reme/intent_journal.jsonl"
+    before = path.read_bytes()
+
+    with pytest.raises(JournalCorruptionError):
+        journal.reconcile_sync()
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("memory_id", "bad space"),
+        ("memory_id", "../../"),
+        ("memory_id", ""),
+        ("record_type", "unknown"),
+        ("note_path", "../escape.md"),
+        ("note_path", "/abs.md"),
+        ("note_path", ""),
+    ],
+)
+def test_pending_entry_rejects_invalid_record_without_truncation(
+    journal,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    entry = _intent()
+    entry["records"][0][field] = value
+    journal.append(entry)
+    path = tmp_path / ".reme/intent_journal.jsonl"
+    before = path.read_bytes()
+
+    with pytest.raises(JournalCorruptionError):
+        journal.reconcile_sync()
+
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize(

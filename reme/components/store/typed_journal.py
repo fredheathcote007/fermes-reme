@@ -265,6 +265,10 @@ class IntentJournal:
                     raise JournalCorruptionError(f"duplicate pending journal batch at byte {offset}")
                 if not isinstance(request, str) or not _SAFE_ID_RE.fullmatch(request):
                     raise JournalCorruptionError(f"invalid pending journal request at byte {offset}")
+                for field in ("session_id", "workspace_id", "profile_id"):
+                    val = value.get(field)
+                    if not isinstance(val, str) or not _SAFE_ID_RE.fullmatch(val):
+                        raise JournalCorruptionError(f"invalid pending journal {field} at byte {offset}")
                 if not isinstance(records, list) or not 1 <= len(records) <= 100:
                     raise JournalCorruptionError(f"invalid pending journal record count at byte {offset}")
                 if value.get("n_records", len(records)) != len(records):
@@ -274,7 +278,22 @@ class IntentJournal:
                         raise JournalCorruptionError(f"invalid pending journal record at byte {offset}")
                     if item.get("action") not in {"create", "update"}:
                         raise JournalCorruptionError(f"invalid pending journal action at byte {offset}")
-                    if not isinstance(item.get("note_path"), str):
+                    mem_id = item.get("memory_id")
+                    if not isinstance(mem_id, str) or not _SAFE_ID_RE.fullmatch(mem_id):
+                        raise JournalCorruptionError(f"invalid pending journal memory_id at byte {offset}")
+                    record_type = item.get("record_type")
+                    if record_type is not None and (
+                        not isinstance(record_type, str)
+                        or record_type not in {"semantic", "episodic", "procedural"}
+                    ):
+                        raise JournalCorruptionError(f"invalid pending journal record_type at byte {offset}")
+                    note_path = item.get("note_path")
+                    if (
+                        not isinstance(note_path, str)
+                        or not note_path
+                        or note_path.startswith(("/", "../"))
+                        or "\\" in note_path
+                    ):
                         raise JournalCorruptionError(f"invalid pending journal path at byte {offset}")
                     for field in ("body_sha256", "record_digest"):
                         digest = item.get(field)
@@ -494,15 +513,18 @@ class IntentJournal:
             raise JournalCorruptionError("pending update has no immutable history snapshot")
         backup = self._history_path(history)
         target = self._note_path(str(item["note_path"]))
-        if not target.is_file() or target.is_symlink():
-            raise JournalConflictError("pending update target is missing or unsafe")
         previous_sha = item.get("prior_body_sha256")
         if previous_sha is not None and (not isinstance(previous_sha, str) or not _HEX64_RE.fullmatch(previous_sha)):
             raise JournalCorruptionError("pending update history digest is malformed")
         if not backup.is_file() or backup.is_symlink():
-            if previous_sha and _sha256_bytes(target.read_bytes()) == previous_sha:
-                return  # Crash after pending, before immutable history was created.
-            raise JournalCorruptionError(f"history snapshot is missing: {history}")
+            if target.is_file() and not target.is_symlink():
+                current = target.read_bytes()
+                published_sha = item.get("body_sha256")
+                if isinstance(published_sha, str) and _sha256_bytes(current) == published_sha:
+                    raise JournalCorruptionError(f"history snapshot is missing: {history}")
+            return
+        if not target.is_file() or target.is_symlink():
+            raise JournalConflictError("pending update target is missing or unsafe")
         original = backup.read_bytes()
         if previous_sha is not None and _sha256_bytes(original) != previous_sha:
             raise JournalCorruptionError("immutable history snapshot digest mismatch")
@@ -958,7 +980,16 @@ class IntentJournal:
             try:
                 await self._persist_update_snapshots(planned)
                 for item in normalized:
-                    await write_file_durable(self._note_path(item.note_path), item.body)
+                    target = self._note_path(item.note_path)
+                    if item.action == "update":
+                        expected_old = old_shas.get(item.note_path)
+                        if (
+                            not target.is_file()
+                            or target.is_symlink()
+                            or (expected_old and _sha256_bytes(target.read_bytes()) != expected_old)
+                        ):
+                            raise JournalConflictError(f"update target changed before publication: {item.note_path}")
+                    await write_file_durable(target, item.body)
                 if indexer is not None:
                     result = indexer(commits)
                     if inspect.isawaitable(result):
@@ -970,6 +1001,11 @@ class IntentJournal:
             except BaseException:
                 try:
                     await self._rollback_entry(entry)
+                except JournalConflictError:
+                    # An update target was independently modified; safe rollback refrained
+                    # from overwriting the external note edit. Terminalize as rolled_back
+                    # and propagate the primary conflict error.
+                    self._append_locked({"batch_id": entry["batch_id"], "status": "rolled_back"})
                 except BaseException as rollback_error:
                     raise TypedJournalError(
                         "typed batch failed and safe rollback could not complete",
