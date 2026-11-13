@@ -102,6 +102,7 @@ class _PendingItem:
         self.revision_seq = revision_seq
 
     def journal_dict(self) -> dict[str, Any]:
+        """Return the immutable intent summary for this typed record."""
         result: dict[str, Any] = {
             "memory_id": self.memory_id,
             "record_type": self.record_type,
@@ -294,10 +295,7 @@ class IntentJournal:
 
     def _known_record_digest_matches(self, relative: str, expected: str, raw: bytes) -> bool:
         """Match a prior committed record commitment without trusting note text."""
-        try:
-            entries = self._read_entries_locked()
-        except JournalCorruptionError:
-            raise
+        entries = self._read_entries_locked()
         statuses = {
             str(entry.get("batch_id")): entry.get("status")
             for entry in entries
@@ -338,8 +336,10 @@ class IntentJournal:
         else:
             record = TypedMemoryRecord.model_validate(record_value)
         body_value = item_data.get("body")
-        body = render_markdown_body(record).encode("utf-8") if body_value is None else (
-            body_value.encode("utf-8") if isinstance(body_value, str) else bytes(body_value)
+        body = (
+            render_markdown_body(record).encode("utf-8")
+            if body_value is None
+            else (body_value.encode("utf-8") if isinstance(body_value, str) else bytes(body_value))
         )
         if _sha256_bytes(body) != record.body_sha256:
             raise ValueError("typed note body does not match body_sha256")
@@ -443,7 +443,22 @@ class IntentJournal:
         backup = self._history_path(history)
         if not backup.is_file() or backup.is_symlink():
             raise JournalCorruptionError(f"history snapshot is missing: {history}")
-        await write_file_durable(self._note_path(str(item["note_path"])), backup.read_bytes())
+        target = self._note_path(str(item["note_path"]))
+        if not target.is_file() or target.is_symlink():
+            raise JournalConflictError("pending update target is missing or unsafe")
+        original = backup.read_bytes()
+        expected_old = item.get("expected_old_digest")
+        if isinstance(expected_old, str) and not (
+            _sha256_bytes(original) == expected_old
+            or self._known_record_digest_matches(str(item["note_path"]), expected_old, original)
+        ):
+            raise JournalCorruptionError("immutable history snapshot does not match pending intent")
+        current = target.read_bytes()
+        if current == original:
+            return
+        if _sha256_bytes(current) != item.get("body_sha256"):
+            raise JournalConflictError("pending update target changed independently; refusing rollback")
+        await write_file_durable(target, original)
 
     async def _remove_create_if_owned(self, item: Mapping[str, Any]) -> None:
         target = self._note_path(str(item["note_path"]))
@@ -598,7 +613,7 @@ class IntentJournal:
         roots = [root for root in (self.reme_dir, self.workspace / "memory" / "typed") if root.exists()]
         for scan_root in roots:
             for root, dirs, files in os.walk(scan_root, followlinks=False):
-                dirs[:] = [name for name in dirs if not (Path(root, name).is_symlink())]
+                dirs[:] = [name for name in dirs if not Path(root, name).is_symlink()]
                 for name in files:
                     if not (name.endswith(".tmp") or ".tmp." in name):
                         continue
@@ -722,9 +737,7 @@ class IntentJournal:
     ) -> TypedOptionBReceipt | None:
         entries = self._read_entries_locked()
         committed_batches = {
-            str(entry.get("batch_id")): entry
-            for entry in entries
-            if entry.get("status") == "committed"
+            str(entry.get("batch_id")): entry for entry in entries if entry.get("status") == "committed"
         }
         for entry in entries:
             if entry.get("status") != "pending":
@@ -832,6 +845,8 @@ class IntentJournal:
             )
             if replay is not None:
                 return replay
+            if indexer is None:
+                raise TypedJournalError("authoritative typed indexing must be supplied before commit")
             sequence = self._history_sequence()
             self._validate_preconditions(normalized)
             await self._snapshot_updates_async(normalized, sequence)

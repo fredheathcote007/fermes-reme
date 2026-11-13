@@ -405,8 +405,7 @@ class AutoMemoryStep(BaseStep):
         workspace_id = workspace_id or context.get("workspace_id")
         profile_id = profile_id or context.get("profile_id")
         if not all(
-            isinstance(value, str) and value
-            for value in (request_id, batch_id, session_id, workspace_id, profile_id)
+            isinstance(value, str) and value for value in (request_id, batch_id, session_id, workspace_id, profile_id)
         ):
             raise ValueError(
                 "typed batch commit requires request_id, batch_id, session_id, workspace_id, and profile_id",

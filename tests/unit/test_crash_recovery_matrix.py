@@ -1,6 +1,6 @@
 """FHM007-B.3 crash-window, replay, rollback, and receipt-integrity tests."""
 
-# pylint: disable=missing-function-docstring,redefined-outer-name
+# pylint: disable=missing-function-docstring,redefined-outer-name,inconsistent-return-statements,protected-access
 
 from __future__ import annotations
 
@@ -369,27 +369,67 @@ def test_cw4b_reconciles_valid_receipt_to_committed_without_rewriting_notes(
 
 def test_cw5_replay_returns_persisted_receipt_without_a_second_publication(journal, tmp_path: Path) -> None:
     record = _record(tmp_path)
-    first = journal.commit_batch_sync("request-1", "batch-1", "session-1", "workspace-1", "profile-1", [record])
+    first = journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [record],
+        indexer=lambda _: None,
+    )
     note = tmp_path / record.note_path
     before = note.read_bytes()
-    replay = journal.commit_batch_sync("request-1", "batch-1", "session-1", "workspace-1", "profile-1", [record])
+    replay = journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [record],
+        indexer=lambda _: None,
+    )
     assert replay == first
     assert note.read_bytes() == before
 
 
 def test_same_request_replays_valid_immutable_receipt_without_rewriting(journal, tmp_path: Path) -> None:
     record = _record(tmp_path)
-    first = journal.commit_batch_sync("request-1", "batch-1", "session-1", "workspace-1", "profile-1", [record])
+    first = journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [record],
+        indexer=lambda _: None,
+    )
     note = tmp_path / record.note_path
     before = note.stat().st_mtime_ns
-    replay = journal.commit_batch_sync("request-1", "batch-1", "session-1", "workspace-1", "profile-1", [record])
+    replay = journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [record],
+        indexer=lambda _: None,
+    )
     assert replay.receipt_digest == first.receipt_digest
     assert note.stat().st_mtime_ns == before
 
 
 def test_divergent_payload_is_409_with_zero_mutation(journal, tmp_path: Path) -> None:
     first_record = _record(tmp_path)
-    journal.commit_batch_sync("request-1", "batch-1", "session-1", "workspace-1", "profile-1", [first_record])
+    journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [first_record],
+        indexer=lambda _: None,
+    )
     note = tmp_path / first_record.note_path
     before = note.read_bytes()
     with pytest.raises(JournalConflictError) as exc_info:
@@ -416,7 +456,15 @@ def test_cross_scope_replay_is_rejected_without_mutation(
     tmp_path: Path,
 ) -> None:
     record = _record(tmp_path)
-    journal.commit_batch_sync("request-1", "batch-1", "session-1", "workspace-1", "profile-1", [record])
+    journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [record],
+        indexer=lambda _: None,
+    )
     note = tmp_path / record.note_path
     before = note.read_bytes()
     scope = {"session_id": "session-1", "workspace_id": "workspace-1", "profile_id": "profile-1"}

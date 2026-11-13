@@ -4,12 +4,11 @@ These tests intentionally exercise the production journal module through its
 normal package imports so the suite cannot pollute the interpreter module registry.
 """
 
-# pylint: disable=missing-function-docstring,redefined-outer-name
+# pylint: disable=missing-function-docstring,redefined-outer-name,inconsistent-return-statements,protected-access
 
 from __future__ import annotations
 
 import datetime as dt
-import fcntl
 import json
 import multiprocessing
 import os
@@ -18,6 +17,11 @@ from typing import Any
 
 import pytest
 import rfc8785
+
+try:
+    import fcntl
+except ImportError:  # Native Windows does not support POSIX flock.
+    fcntl = None
 
 from reme.components.store import typed_journal as journal_module
 from reme.components.store.typed_journal import (
@@ -128,9 +132,7 @@ def _record(workspace: Path, *, fact: str = "The café is open"):
     values["body_sha256"] = compute_body_sha256(draft)
     draft = TypedMemoryRecord.model_construct(**values)
     digest_input = {
-        key: value
-        for key, value in draft.model_dump(mode="json", exclude_none=False).items()
-        if key != "record_digest"
+        key: value for key, value in draft.model_dump(mode="json", exclude_none=False).items() if key != "record_digest"
     }
     values["record_digest"] = sha256_canonical(digest_input)
     return TypedMemoryRecord(**values)
@@ -186,6 +188,7 @@ def test_journal_fsync_precedes_any_note_write(journal, tmp_path: Path, monkeypa
         "workspace-1",
         "profile-1",
         [_record(tmp_path)],
+        indexer=lambda commits: None,
     )
     assert note_write_seen
 
@@ -197,6 +200,7 @@ def _hold_lock(workspace: str, ready, release) -> None:
         release.wait(10)
 
 
+@pytest.mark.skipif(fcntl is None or os.name != "posix", reason="requires POSIX flock/fork")
 def test_multiple_writers_are_serialized_by_advisory_lock(tmp_path: Path) -> None:
     journal = IntentJournal(tmp_path)
     context = multiprocessing.get_context("fork")
@@ -228,4 +232,103 @@ def test_failed_durable_primitives_fail_closed(journal, monkeypatch: pytest.Monk
             "workspace-1",
             "profile-1",
             [_record(journal.workspace)],
+            indexer=lambda commits: None,
         )
+
+
+def test_missing_authoritative_indexer_fails_before_publication(journal, tmp_path: Path) -> None:
+    record = _record(tmp_path)
+    for status in ("ok", "degraded", None):
+        with pytest.raises(journal_module.TypedJournalError, match="indexing"):
+            journal.commit_batch_sync(
+                "request-1",
+                "batch-1",
+                "session-1",
+                "workspace-1",
+                "profile-1",
+                [record],
+                index_status=status,
+            )
+        assert not (tmp_path / record.note_path).exists()
+        assert not (tmp_path / ".reme/receipts/request-1.json").exists()
+
+
+def test_indexer_called_after_note_before_receipt(journal, tmp_path: Path) -> None:
+    record = _record(tmp_path)
+    seen = []
+
+    def indexer(commits):
+        assert (tmp_path / record.note_path).is_file()
+        assert not (tmp_path / ".reme/receipts/request-1.json").exists()
+        seen.extend(commits)
+
+    receipt = journal.commit_batch_sync(
+        "request-1",
+        "batch-1",
+        "session-1",
+        "workspace-1",
+        "profile-1",
+        [record],
+        indexer=indexer,
+    )
+    assert receipt.index_status == "ok"
+    assert len(seen) == 1
+    assert (tmp_path / ".reme/receipts/request-1.json").exists()
+
+
+def test_indexer_failure_rolls_back_without_receipt(journal, tmp_path: Path) -> None:
+    record = _record(tmp_path)
+
+    def fail_indexer(_commits):
+        raise RuntimeError("injected index update failure")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        journal.commit_batch_sync(
+            "request-1",
+            "batch-1",
+            "session-1",
+            "workspace-1",
+            "profile-1",
+            [record],
+            indexer=fail_indexer,
+        )
+    assert not (tmp_path / record.note_path).exists()
+    assert not (tmp_path / ".reme/receipts/request-1.json").exists()
+
+
+def test_pending_update_preserves_newer_unowned_note(journal, tmp_path: Path) -> None:
+    import hashlib
+
+    rel = "memory/typed/semantic/mem_semantic_aaaaaaaaaaaaaaaa.md"
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True)
+    previous = b"prior known note\n"
+    unrelated = b"newer independently modified note\n"
+    target.write_bytes(unrelated)
+    prior_sha = hashlib.sha256(previous).hexdigest()
+    hist_rel = f".reme/history/mem_semantic_aaaaaaaaaaaaaaaa.rev1.{prior_sha[:8]}.bak"
+    history = tmp_path / hist_rel
+    history.parent.mkdir(parents=True)
+    history.write_bytes(previous)
+    journal.append(
+        {
+            "status": "pending",
+            "batch_id": "batch-1",
+            "request_id": "request-1",
+            "records": [
+                {
+                    "action": "update",
+                    "memory_id": "mem_semantic_aaaaaaaaaaaaaaaa",
+                    "record_type": "semantic",
+                    "note_path": rel,
+                    "record_digest": "a" * 64,
+                    "body_sha256": "b" * 64,
+                    "expected_old_digest": prior_sha,
+                    "prior_history_path": hist_rel,
+                },
+            ],
+        },
+    )
+    with pytest.raises(journal_module.JournalConflictError):
+        journal.reconcile_sync()
+    assert target.read_bytes() == unrelated
