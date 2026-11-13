@@ -19,7 +19,6 @@ from typing import Any
 
 import pytest
 
-
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "fhm007_b1_normative_excerpt.txt"
 DESIGN = Path("/srv/scratch/fhm007-phase-b-design-20261112/plans/detailed-design-typed-memory.md")
 FIXTURE_SHA256 = "224617442e0dd63ad27f6ef7a7e57af0d44ddcccd97708eef7288c1b65f07e2a"
@@ -100,7 +99,8 @@ def test_normative_fixture_is_frozen_and_compilable(normative_module: types.Modu
 
 
 def test_runtime_models_have_exact_normative_schema_parity(
-    normative_module: types.ModuleType, runtime_module: types.ModuleType
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
 ) -> None:
     for name in MODEL_NAMES:
         normative_model = getattr(normative_module, name)
@@ -110,7 +110,7 @@ def test_runtime_models_have_exact_normative_schema_parity(
             runtime_field = runtime_model.model_fields[field_name]
             assert normative_field.is_required() == runtime_field.is_required(), f"{name}.{field_name} required"
             assert repr(normative_field.annotation).replace("_fhm007_b1_normative_extracted", "") == repr(
-                runtime_field.annotation
+                runtime_field.annotation,
             ).replace("reme.schema.typed_memory", ""), f"{name}.{field_name} annotation"
         assert _schema_without_documentation(normative_model) == _schema_without_documentation(runtime_model), name
 
@@ -123,7 +123,9 @@ def test_runtime_models_have_exact_normative_schema_parity(
     ],
 )
 def test_runtime_jcs_bytes_and_digests_match_normative(
-    value: dict[str, Any], normative_module: types.ModuleType, runtime_module: types.ModuleType
+    value: dict[str, Any],
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
 ) -> None:
     assert runtime_module.canonical_jcs_bytes(value) == normative_module.canonical_jcs_bytes(value)
     assert runtime_module.sha256_canonical(value) == normative_module.sha256_canonical(value)
@@ -180,7 +182,8 @@ def _receipt(module: types.ModuleType, *, timestamp: str = "2026-11-13T01:00:00Z
 
 
 def test_deliberate_schema_negative_probes_fail_closed(
-    normative_module: types.ModuleType, runtime_module: types.ModuleType
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
 ) -> None:
     _assert_both_reject(
         normative_module,
@@ -211,7 +214,9 @@ def test_deliberate_schema_negative_probes_fail_closed(
 
 
 def test_admit_source_uri_confinement_parity(
-    normative_module: types.ModuleType, runtime_module: types.ModuleType, tmp_path: Path
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
+    tmp_path: Path,
 ) -> None:
     for index, module in enumerate((normative_module, runtime_module)):
         workspace = tmp_path / f"workspace-{index}"
@@ -223,9 +228,14 @@ def test_admit_source_uri_confinement_parity(
         session_id = "session-1"
         authority = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
         expected = workspace / ".reme" / "sessions" / authority / "dialog.jsonl"
-        assert module.admit_source_uri(
-            f"session://{authority}/dialog.jsonl", workspace_dir=workspace, session_id=session_id
-        ) == expected
+        assert (
+            module.admit_source_uri(
+                f"session://{authority}/dialog.jsonl",
+                workspace_dir=workspace,
+                session_id=session_id,
+            )
+            == expected
+        )
 
         with pytest.raises(ValueError, match="escapes workspace_dir"):
             module.admit_source_uri("file:///etc/passwd", workspace_dir=workspace)
@@ -234,7 +244,9 @@ def test_admit_source_uri_confinement_parity(
                 module.admit_source_uri(uri, workspace_dir=workspace)
         with pytest.raises(ValueError, match="[Aa]uthority mismatch"):
             module.admit_source_uri(
-                f"session://{'a' * 64}/dialog.jsonl", workspace_dir=workspace, session_id=session_id
+                f"session://{'a' * 64}/dialog.jsonl",
+                workspace_dir=workspace,
+                session_id=session_id,
             )
         with pytest.raises(ValueError, match="session_id"):
             module.admit_source_uri(f"session://{authority}/dialog.jsonl", workspace_dir=workspace, session_id="")
@@ -303,7 +315,8 @@ def _oversized_record_payload(module: types.ModuleType) -> dict[str, Any]:
 
 
 def test_record_envelope_over_64_kib_is_rejected(
-    normative_module: types.ModuleType, runtime_module: types.ModuleType
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
 ) -> None:
     for module in (normative_module, runtime_module):
         with pytest.raises(ValueError, match="64 KB|64 KiB|65536"):
@@ -311,7 +324,8 @@ def test_record_envelope_over_64_kib_is_rejected(
 
 
 def test_receipt_batch_over_512_kib_is_rejected(
-    normative_module: types.ModuleType, runtime_module: types.ModuleType
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
 ) -> None:
     for module in (normative_module, runtime_module):
         commit = module.OptionBReceiptCommit(
@@ -343,7 +357,8 @@ def test_receipt_batch_over_512_kib_is_rejected(
 
 
 def test_duplicate_memory_id_in_batch_receipt_is_rejected(
-    normative_module: types.ModuleType, runtime_module: types.ModuleType
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
 ) -> None:
     for module in (normative_module, runtime_module):
         with pytest.raises(ValueError, match="Duplicate memory_id"):
@@ -351,7 +366,8 @@ def test_duplicate_memory_id_in_batch_receipt_is_rejected(
 
 
 def test_invalid_iso8601_utc_timestamp_is_rejected(
-    normative_module: types.ModuleType, runtime_module: types.ModuleType
+    normative_module: types.ModuleType,
+    runtime_module: types.ModuleType,
 ) -> None:
     for module in (normative_module, runtime_module):
         with pytest.raises(ValueError, match="Invalid committed_at_utc"):

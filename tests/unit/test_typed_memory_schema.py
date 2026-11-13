@@ -15,7 +15,8 @@ import pytest
 from pydantic import ValidationError
 
 _SCHEMA_SPEC = importlib.util.spec_from_file_location(
-    "reme.schema.typed_memory", Path(__file__).parents[2] / "reme" / "schema" / "typed_memory.py"
+    "reme.schema.typed_memory",
+    Path(__file__).parents[2] / "reme" / "schema" / "typed_memory.py",
 )
 assert _SCHEMA_SPEC is not None and _SCHEMA_SPEC.loader is not None
 _SCHEMA = importlib.util.module_from_spec(_SCHEMA_SPEC)
@@ -275,7 +276,7 @@ def test_record_and_batch_bounds(tmp_path: Path) -> None:
     draft = TypedMemoryRecord.model_construct(**values)
     dumped = draft.model_dump(mode="json", exclude_none=False)
     values["record_digest"] = sha256_canonical(
-        {key: value for key, value in dumped.items() if key != "record_digest"}
+        {key: value for key, value in dumped.items() if key != "record_digest"},
     )
     with pytest.raises(ValidationError, match="Record envelope"):
         TypedMemoryRecord(**values)
@@ -302,7 +303,7 @@ def test_record_and_batch_bounds(tmp_path: Path) -> None:
     draft = TypedOptionBReceipt.model_construct(**values)
     dumped = draft.model_dump(mode="json", exclude_none=False)
     values["receipt_digest"] = sha256_canonical(
-        {key: value for key, value in dumped.items() if key != "receipt_digest"}
+        {key: value for key, value in dumped.items() if key != "receipt_digest"},
     )
     assert TypedOptionBReceipt(**values).index_status is None
     with pytest.raises(ValidationError, match="Invalid committed_at_utc"):
@@ -313,7 +314,7 @@ def test_record_and_batch_bounds(tmp_path: Path) -> None:
     utc_draft = TypedOptionBReceipt.model_construct(**utc_values)
     utc_dumped = utc_draft.model_dump(mode="json", exclude_none=False)
     utc_values["receipt_digest"] = sha256_canonical(
-        {key: value for key, value in utc_dumped.items() if key != "receipt_digest"}
+        {key: value for key, value in utc_dumped.items() if key != "receipt_digest"},
     )
     assert TypedOptionBReceipt(**utc_values).committed_at_utc.endswith("+00:00")
     with pytest.raises(ValidationError):

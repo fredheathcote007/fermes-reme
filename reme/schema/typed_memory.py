@@ -5,6 +5,8 @@ application-owned contracts and pure structural URI validation, but does not
 activate filesystem admission, typed-batch writes, retrieval, or authority runtime.
 """
 
+# pylint: disable=missing-function-docstring,consider-using-in
+
 from __future__ import annotations
 
 import datetime
@@ -17,7 +19,6 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 import rfc8785
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationInfo, field_validator, model_validator
 
-
 SafeId = Annotated[
     str,
     StringConstraints(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_\-]+$"),
@@ -29,7 +30,7 @@ SafePath = Annotated[
 ]
 
 TypedNotePathRegex = re.compile(
-    r"^memory/typed/(semantic|episodic|procedural|failure_lesson)/[a-zA-Z0-9_\-]+\.md$"
+    r"^memory/typed/(semantic|episodic|procedural|failure_lesson)/[a-zA-Z0-9_\-]+\.md$",
 )
 
 StatusType = Literal["active", "superseded", "retracted", "archived"]
@@ -127,7 +128,7 @@ def admit_source_uri(
     if parsed.scheme not in ALLOWED_URI_SCHEMES:
         raise ValueError(
             f"Invalid source_uri scheme: {source_uri!r}. Permitted schemes: {ALLOWED_URI_SCHEMES}. "
-            "git://, http://, https://, and ftp:// are strictly prohibited."
+            "git://, http://, https://, and ftp:// are strictly prohibited.",
         )
     if parsed.query or parsed.fragment or parsed.username or parsed.password:
         raise ValueError(f"source URI may not contain query, fragment, or credentials: {source_uri!r}")
@@ -145,7 +146,7 @@ def admit_source_uri(
         if not raw_path.is_relative_to(ws_path):
             raise ValueError(f"file URI escapes workspace_dir: {raw_path!r} outside {ws_path!r}")
         curr = raw_path
-        while curr != ws_path and curr != curr.parent:
+        while curr not in (ws_path, curr.parent):
             if curr.is_symlink():
                 raise ValueError(f"Symlink rejected in workspace path: {curr!r}")
             curr = curr.parent
@@ -164,7 +165,7 @@ def admit_source_uri(
     if not raw_target.is_relative_to(ws_path):
         raise ValueError(f"session URI escapes workspace_dir: {raw_target!r}")
     curr = raw_target
-    while curr != ws_path and curr != curr.parent:
+    while curr not in (ws_path, curr.parent):
         if curr.is_symlink():
             raise ValueError(f"Symlink rejected in workspace path: {curr!r}")
         curr = curr.parent
@@ -321,9 +322,11 @@ def format_field_val(value: Any) -> str:
     if isinstance(value, list):
         return "[" + ", ".join(format_field_val(item) for item in value) + "]"
     if isinstance(value, dict):
-        return "{" + ", ".join(
-            f"{escape_markdown(str(key))}={format_field_val(item)}" for key, item in sorted(value.items())
-        ) + "}"
+        return (
+            "{"
+            + ", ".join(f"{escape_markdown(str(key))}={format_field_val(item)}" for key, item in sorted(value.items()))
+            + "}"
+        )
     if isinstance(value, str):
         return f'"{escape_markdown(value)}"'
     return str(value)
@@ -443,7 +446,7 @@ class TypedMemoryRecord(BaseModel):
     def validate_record_invariants(self) -> "TypedMemoryRecord":
         if self.typed_content.record_type != self.record_type:
             raise ValueError(
-                f"Content record_type ({self.typed_content.record_type}) != record_type ({self.record_type})"
+                f"Content record_type ({self.typed_content.record_type}) != record_type ({self.record_type})",
             )
         if self.trust_tier == "owner_approved":
             if not self.authority_entry_id:
@@ -494,11 +497,11 @@ class TypedMemoryProposal(BaseModel):
     def validate_proposal(self) -> "TypedMemoryProposal":
         if self.source_class in ("owner_preference", "constitutional_rule"):
             raise ValueError(
-                f"SourceClass {self.source_class!r} creation is strictly prohibited in Phase B (Owner Gate Q3)"
+                f"SourceClass {self.source_class!r} creation is strictly prohibited in Phase B (Owner Gate Q3)",
             )
         if self.typed_content.record_type != self.record_type:
             raise ValueError(
-                f"Content record_type ({self.typed_content.record_type}) != proposal record_type ({self.record_type})"
+                f"Content record_type ({self.typed_content.record_type}) != proposal record_type ({self.record_type})",
             )
         return self
 
@@ -567,7 +570,7 @@ class TypedOptionBReceipt(BaseModel):
                 raise ValueError("committed_at_utc must include timezone")
             if timestamp.utcoffset() != datetime.timedelta(0):
                 raise ValueError(
-                    f"committed_at_utc must have UTC offset (+00:00 or Z), got {self.committed_at_utc!r}"
+                    f"committed_at_utc must have UTC offset (+00:00 or Z), got {self.committed_at_utc!r}",
                 )
         except Exception as exc:
             raise ValueError(f"Invalid committed_at_utc ISO-8601 timestamp: {self.committed_at_utc!r}") from exc
