@@ -499,3 +499,42 @@ def test_existing_noop_outcome_remains_backward_compatible() -> None:
 
     assert provider._record_payload(_payload(), request_id="request-1", noop_policy=policy) is True
     assert provider._last_write_failure_kind == ""
+
+
+class _ExplodingReprStatus:
+    def __repr__(self) -> str:
+        raise RuntimeError("Untrusted index_status.__repr__ must never run")
+
+
+@pytest.mark.parametrize("outcome", ["commit", "typed_batch"])
+def test_invalid_index_status_with_exploding_repr_fails_closed(outcome: str) -> None:
+    backend = FakeBackend()
+    if outcome == "commit":
+        metadata = {
+            "outcome": "commit",
+            "commit": {"request_id": "request-1"},
+            "index_status": _ExplodingReprStatus(),
+        }
+    else:
+        metadata = _typed_batch_receipt()
+        metadata["index_status"] = _ExplodingReprStatus()
+    backend.auto_memory = lambda *_args, **_kwargs: {"success": True, "metadata": metadata}
+    provider = _provider(backend)
+    provider._workspace_id = "workspace-1"
+    provider._profile_id = "profile-1"
+
+    assert provider._record_payload(_payload(), request_id="request-1") is False
+    assert provider._last_write_failure_kind == "retryable"
+
+
+def test_refused_degraded_typed_batch_never_logs_ack_eligibility(caplog) -> None:
+    backend = FakeBackend()
+    metadata = _typed_batch_receipt(index_status="degraded")
+    backend.auto_memory = lambda *_args, **_kwargs: {"success": True, "metadata": metadata}
+    provider = _provider(backend)
+    provider._workspace_id = "workspace-1"
+    provider._profile_id = "profile-1"
+
+    assert provider._record_payload(_payload(), request_id="request-1") is False
+    assert provider._last_write_failure_kind == "retryable"
+    assert "eligible for FIFO acknowledgement" not in caplog.text

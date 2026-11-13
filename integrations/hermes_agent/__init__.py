@@ -1862,9 +1862,9 @@ class ReMeMemoryProvider(MemoryProvider):
                         type(index_status) is not str or index_status not in ("ok", "degraded")
                     ):
                         raise ReMeBackendError(
-                            f"protected auto_memory returned an unrecognized index_status: {index_status!r}",
+                            "protected auto_memory returned an unrecognized index_status",
                         )
-                    if metadata.get("index_status") == "degraded":
+                    if outcome == "commit" and index_status == "degraded":
                         # The source note/BM25 commit was already verified.
                         # Surface rebuildable navigation degradation at the
                         # Hermes provider boundary before the FIFO ACK.
