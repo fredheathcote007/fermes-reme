@@ -1701,6 +1701,41 @@ class ReMeMemoryProvider(MemoryProvider):
             and not config.allow_custom_config,
         )
 
+    def _validate_typed_batch_receipt(
+        self,
+        metadata: dict[str, Any],
+        payload: dict[str, Any],
+        request_id: str | None,
+    ) -> Any:
+        """Validate a B.1 receipt and bind it to trusted provider context."""
+        if type(metadata.get("schema_version")) is not int or metadata.get("schema_version") != 2:
+            raise ReMeBackendError("protected auto_memory returned an invalid typed_batch receipt: schema_version")
+        receipt_data = dict(metadata)
+        receipt_data.pop("schema_version", None)
+        try:
+            from reme.schema.typed_memory import TypedOptionBReceipt
+
+            receipt = TypedOptionBReceipt.model_validate(receipt_data)
+        except Exception as exc:
+            raise ReMeBackendError(
+                f"protected auto_memory returned an invalid typed_batch receipt: {exc}",
+            ) from exc
+        expected_bindings = {
+            "request_id": request_id,
+            "session_id": payload.get("session_id"),
+            "workspace_id": getattr(self, "_workspace_id", None),
+            "profile_id": self._profile_id,
+        }
+        for field, expected in expected_bindings.items():
+            if type(expected) is not str or not expected:
+                raise ReMeBackendError(
+                    f"protected auto_memory returned an unbound typed_batch receipt: {field} "
+                    "(trusted identity unavailable)",
+                )
+            if getattr(receipt, field) != expected:
+                raise ReMeBackendError(f"protected auto_memory returned an unbound typed_batch receipt: {field}")
+        return receipt
+
     def _record_payload(
         self,
         payload: dict[str, Any],
@@ -1777,6 +1812,7 @@ class ReMeMemoryProvider(MemoryProvider):
                         ),
                         refusal_reason=refusal_reason if isinstance(refusal_reason, str) else None,
                     )
+                outcome = None
                 if self._protected_option_b_enabled():
                     metadata = response.get("metadata")
                     if not isinstance(metadata, dict):
@@ -1806,19 +1842,29 @@ class ReMeMemoryProvider(MemoryProvider):
                             or "commit" in metadata
                         ):
                             raise ReMeBackendError("protected auto_memory returned an invalid no-op receipt")
+                    elif outcome == "typed_batch":
+                        self._validate_typed_batch_receipt(metadata, payload, request_id)
                     else:
                         raise ReMeBackendError("protected auto_memory returned an unknown receipt outcome")
+                elif isinstance(response.get("metadata"), dict):
+                    metadata = response["metadata"]
+                    outcome = metadata.get("outcome", "commit")
+                    if outcome == "typed_batch":
+                        self._validate_typed_batch_receipt(metadata, payload, request_id)
                 if response.get("answer") and not isinstance(response.get("metadata"), dict):
                     raise ReMeBackendError("auto_memory returned success without a verified commit receipt")
-                if self._protected_option_b_enabled() and metadata.get("outcome", "commit") == "commit":
+                if self._protected_option_b_enabled() and metadata.get("outcome", "commit") in (
+                    "commit",
+                    "typed_batch",
+                ):
                     index_status = metadata.get("index_status")
                     if index_status is not None and (
-                        not isinstance(index_status, str) or index_status not in ("ok", "degraded")
+                        type(index_status) is not str or index_status not in ("ok", "degraded")
                     ):
                         raise ReMeBackendError(
-                            f"protected auto_memory returned an unrecognized index_status: {index_status!r}",
+                            "protected auto_memory returned an unrecognized index_status",
                         )
-                    if metadata.get("index_status") == "degraded":
+                    if outcome == "commit" and index_status == "degraded":
                         # The source note/BM25 commit was already verified.
                         # Surface rebuildable navigation degradation at the
                         # Hermes provider boundary before the FIFO ACK.
@@ -1826,6 +1872,11 @@ class ReMeMemoryProvider(MemoryProvider):
                             "Protected ReMe derived daily index degraded after verified durable commit; "
                             "eligible for FIFO acknowledgement",
                         )
+                if outcome == "typed_batch":
+                    raise ReMeBackendError(
+                        "typed_batch receipts require Task B.3 crash-consistent intent journal; "
+                        "live typed ACK is disabled",
+                    )
                 return True
             except ReMeBackendError as exc:
                 self._last_write_failure_kind = _classify_write_failure(exc)
