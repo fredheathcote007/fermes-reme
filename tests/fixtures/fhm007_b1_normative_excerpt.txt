@@ -1,0 +1,1566 @@
+"""Candidate Normative Code Block for Detailed Design §3."""
+
+from __future__ import annotations
+
+import base64
+import datetime
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import urllib.parse
+from pathlib import Path
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+
+# ---------------------------------------------------------------------------
+# Strict ID and Path Constraints
+# ---------------------------------------------------------------------------
+
+SafeId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-zA-Z0-9_\-]+$",
+    ),
+]
+
+SafePath = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[a-zA-Z0-9_\-\./]+$",
+    ),
+]
+
+TypedNotePathRegex = re.compile(
+    r"^memory/typed/(semantic|episodic|procedural|failure_lesson)/[a-zA-Z0-9_\-]+\.md$"
+)
+
+# ---------------------------------------------------------------------------
+# RFC 8785 JSON Canonicalization Scheme (JCS) Implementation
+# ---------------------------------------------------------------------------
+
+try:
+    import rfc8785
+    _HAS_RFC8785 = True
+except ImportError:
+    _HAS_RFC8785 = False
+
+def to_canonical_json_dict(obj: Any) -> Any:
+    """Recursively convert Pydantic models, dates, datetimes, and complex types to JSON-compatible primitives."""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(mode="json", exclude_none=False)
+    if isinstance(obj, (datetime.date, datetime.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: to_canonical_json_dict(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_canonical_json_dict(v) for v in obj]
+    return obj
+
+def canonical_jcs_bytes(data: Any) -> bytes:
+    """Serialize data into RFC 8785 JSON Canonicalization Scheme (JCS) UTF-8 bytes."""
+    if not _HAS_RFC8785:
+        raise RuntimeError("Operational error: rfc8785==0.1.4 package is required for typed memory integrity")
+    json_data = to_canonical_json_dict(data)
+    encoded = rfc8785.dumps(json_data)
+    return encoded if isinstance(encoded, bytes) else encoded.encode("utf-8")
+
+def sha256_canonical(data: Any) -> str:
+    """Compute SHA-256 hex digest of RFC 8785 canonical JSON bytes."""
+    return hashlib.sha256(canonical_jcs_bytes(data)).hexdigest()
+
+# ---------------------------------------------------------------------------
+# Workspace Containment & Structural URI Admission
+# ---------------------------------------------------------------------------
+
+ALLOWED_URI_SCHEMES = ("file", "session")
+WINDOWS_DRIVE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|/[A-Za-z]:[\\/])")
+
+def _reject_windows_or_unsafe_uri_path(path: str) -> None:
+    decoded = urllib.parse.unquote(path)
+    if "\\" in decoded:
+        raise ValueError("backslash/Windows path syntax is not accepted")
+    if decoded.startswith(("//?/", "\\\\?\\")) or decoded.startswith("//"):
+        raise ValueError("UNC or extended Windows path syntax is not accepted")
+    if WINDOWS_DRIVE_RE.match(decoded):
+        raise ValueError("Windows drive path syntax is not accepted")
+    parts = decoded.split("/")
+    if parts and parts[0] == "":
+        parts = parts[1:]
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("URI path contains an unsafe component")
+
+def admit_source_uri(
+    source_uri: str,
+    *,
+    workspace_dir: str | Path,
+    session_id: Optional[str] = None,
+) -> Path:
+    """Mandatory application-level source URI admission and workspace confinement."""
+    if not source_uri or not isinstance(source_uri, str):
+        raise ValueError("URI must be a non-empty string")
+    if not isinstance(workspace_dir, (str, Path)) or not str(workspace_dir):
+        raise ValueError("workspace_dir is mandatory application admission context")
+
+    parsed = urllib.parse.urlsplit(source_uri)
+    if parsed.scheme not in ALLOWED_URI_SCHEMES:
+        raise ValueError(
+            f"Invalid source_uri scheme: {source_uri!r}. Permitted schemes: {ALLOWED_URI_SCHEMES}. "
+            "git://, http://, https://, and ftp:// are strictly prohibited."
+        )
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError(f"source URI may not contain query, fragment, or credentials: {source_uri!r}")
+
+    _reject_windows_or_unsafe_uri_path(parsed.path)
+    ws_path = Path(workspace_dir).resolve()
+    if not ws_path.is_dir():
+        raise ValueError(f"Application workspace_dir must be an existing directory: {workspace_dir!r}")
+
+    if parsed.scheme == "file":
+        if parsed.netloc not in {"", "localhost"}:
+            raise ValueError(f"file URI must not name a remote host: {source_uri!r}")
+        if not parsed.path.startswith("/"):
+            raise ValueError(f"file URI must have an absolute local path: {source_uri!r}")
+        raw_path = Path(urllib.parse.unquote(parsed.path))
+        if not raw_path.is_relative_to(ws_path):
+            raise ValueError(f"file URI escapes workspace_dir: {raw_path!r} outside {ws_path!r}")
+        curr = raw_path
+        while curr != ws_path and curr != curr.parent:
+            if curr.is_symlink():
+                raise ValueError(f"Symlink rejected in workspace path: {curr!r}")
+            curr = curr.parent
+        return raw_path
+
+    elif parsed.scheme == "session":
+        if not re.fullmatch(r"[a-f0-9]{64}", parsed.netloc or ""):
+            raise ValueError(f"session URI authority must be a lowercase SHA-256: {source_uri!r}")
+        if urllib.parse.unquote(parsed.path) != "/dialog.jsonl":
+            raise ValueError(f"session URI path must be /dialog.jsonl: {source_uri!r}")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is mandatory for session URI admission")
+        expected_authority = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        if parsed.netloc != expected_authority:
+            raise ValueError(f"Session URI authority mismatch: expected {expected_authority}, got {parsed.netloc}")
+        raw_target = ws_path / ".reme" / "sessions" / parsed.netloc / "dialog.jsonl"
+        if not raw_target.is_relative_to(ws_path):
+            raise ValueError(f"session URI escapes workspace_dir: {raw_target!r}")
+        curr = raw_target
+        while curr != ws_path and curr != curr.parent:
+            if curr.is_symlink():
+                raise ValueError(f"Symlink rejected in session path: {curr!r}")
+            curr = curr.parent
+        return raw_target
+
+    raise ValueError(f"Unhandled URI scheme: {source_uri!r}")
+
+def safe_open_source(
+    path_or_uri: Path | str,
+    *,
+    workspace_dir: Path | str,
+    operation: str = "load",
+    session_id: Optional[str] = None,
+) -> int:
+    """Open verified source path with descriptor-relative component walking and O_NOFOLLOW to prevent TOCTOU symlink traversal."""
+    if operation not in ("commit", "load"):
+        raise ValueError("operation must be 'commit' or 'load'")
+    ws_path = Path(workspace_dir).resolve()
+    if isinstance(path_or_uri, str) and ("://" in path_or_uri or path_or_uri.startswith("file:") or path_or_uri.startswith("session:")):
+        target = admit_source_uri(path_or_uri, workspace_dir=ws_path, session_id=session_id)
+    else:
+        p = Path(path_or_uri)
+        if p.is_absolute():
+            if not p.is_relative_to(ws_path):
+                raise ValueError(f"Security violation: absolute path outside workspace: {p}")
+            target = p
+        else:
+            if ".." in p.parts or "." in p.parts:
+                raise ValueError(f"Security violation: path traversal components '.' or '..' detected: {path_or_uri!r}")
+            target = ws_path / p
+        if not target.is_relative_to(ws_path):
+            raise ValueError(f"Security violation: path outside workspace: {target}")
+        curr = target
+        while curr != ws_path and curr != curr.parent:
+            if curr.is_symlink():
+                raise ValueError(f"Security violation: symlink rejected in source path: {curr}")
+            curr = curr.parent
+    
+    rel = target.relative_to(ws_path)
+    flags_dir = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.open(ws_path, flags_dir)
+    try:
+        parts = rel.parts
+        for part in parts[:-1]:
+            next_fd = os.open(part, flags_dir | getattr(os, "O_NOFOLLOW", 0), dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        flags_file = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        file_fd = os.open(parts[-1], flags_file, dir_fd=current_fd)
+        return file_fd
+    finally:
+        try:
+            os.close(current_fd)
+        except OSError:
+            pass
+
+def safe_write_note(
+    rel_note_path: str,
+    content: str,
+    *,
+    workspace_dir: Path | str,
+) -> Path:
+    """Safely commit a note file using descriptor-relative component walking and O_NOFOLLOW to prevent symlink traversal."""
+    if not rel_note_path or not isinstance(rel_note_path, str):
+        raise ValueError("rel_note_path must be a non-empty string")
+    ws_path = Path(workspace_dir).resolve()
+    raw_rel = Path(rel_note_path)
+    if raw_rel.is_absolute():
+        raise ValueError(f"Security violation: commit path must be workspace-relative, got absolute path: {rel_note_path}")
+    
+    parts = raw_rel.parts
+    if not parts or any(p in ("..", ".", "") for p in parts):
+        raise ValueError(f"Security violation: traversal component in commit path: {rel_note_path}")
+    
+    curr_check = ws_path
+    for part in parts[:-1]:
+        curr_check = curr_check / part
+        if curr_check.is_symlink():
+            raise ValueError(f"Security violation: parent directory in commit path is a symlink: {curr_check}")
+    
+    target_file = (ws_path / raw_rel).resolve()
+    if not target_file.is_relative_to(ws_path):
+        raise ValueError(f"Security violation: commit path escapes workspace: {rel_note_path}")
+    
+    flags_dir = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.open(ws_path, flags_dir)
+    try:
+        curr_dir = ws_path
+        for part in parts[:-1]:
+            curr_dir = curr_dir / part
+            if curr_dir.is_symlink():
+                raise ValueError(f"Security violation: parent directory in commit path is a symlink: {curr_dir}")
+            curr_dir.mkdir(parents=True, exist_ok=True)
+            next_fd = os.open(part, flags_dir | getattr(os, "O_NOFOLLOW", 0), dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        
+        if target_file.is_symlink():
+            raise ValueError(f"Security violation: target note path is a symlink: {target_file}")
+            
+        tmp_name = f".{parts[-1]}.{os.getpid()}.tmp"
+        flags_create = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        file_fd = os.open(tmp_name, flags_create, 0o644, dir_fd=current_fd)
+        try:
+            with os.fdopen(file_fd, "wb") as handle:
+                handle.write(content.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+            raise
+            
+        tmp_path = target_file.parent / tmp_name
+        os.replace(tmp_path, target_file)
+        os.fsync(current_fd)
+        return target_file
+    finally:
+        try:
+            os.close(current_fd)
+        except OSError:
+            pass
+
+def validate_workspace_containment(uri: str, info: Optional[ValidationInfo] = None) -> str:
+    """Pydantic-layer field validator invoking admit_source_uri when context is present."""
+    if not uri or not isinstance(uri, str):
+        raise ValueError("URI must be a non-empty string")
+    parsed = urllib.parse.urlsplit(uri)
+    if parsed.scheme not in ALLOWED_URI_SCHEMES:
+        raise ValueError(f"Invalid scheme: {uri!r}. Permitted: {ALLOWED_URI_SCHEMES}")
+    if info is not None and info.context and "workspace_dir" in info.context:
+        admit_source_uri(uri, workspace_dir=info.context["workspace_dir"], session_id=info.context.get("session_id"))
+    return uri
+
+def admit_and_commit_record(
+    record: Any,
+    *,
+    workspace_dir: Path | str,
+    session_id: Optional[str] = None,
+    ledger_entries: Optional[Dict[str, HmacLedgerEntry]] = None,
+    key_manager: Optional[ExternalKeyManager] = None,
+    verifier: Optional[LedgerVerifier] = None,
+) -> Path:
+    """Mandatory application commit adapter: validates provenance admission, verifies owner authority, and commits via descriptor-safe writer."""
+    ws = Path(workspace_dir).resolve()
+    for citation in getattr(record, "provenance", []):
+        admit_source_uri(citation.source_uri, workspace_dir=ws, session_id=session_id)
+    
+    if getattr(record, "trust_tier", None) == "owner_approved":
+        if ledger_entries is None or key_manager is None or verifier is None:
+            raise ValueError("OWNER_AUTHORITY_UNAVAILABLE: ledger_entries, key_manager, and verifier are mandatory to commit owner_approved records")
+        verify_runtime_owner_authority(
+            record,
+            ledger_entries,
+            key_manager,
+            verifier,
+            workspace_id=record.workspace_id,
+            profile_id=record.profile_id,
+            is_commit=True,
+            advance_watermark=False,
+        )
+    
+    body = render_markdown_body(record)
+    target_path = safe_write_note(record.note_path, body, workspace_dir=ws)
+    if getattr(record, "trust_tier", None) == "owner_approved":
+        entry = ledger_entries[record.authority_entry_id]
+        verifier.durable_ledger.advance(verifier.stream_key(entry), entry.seq)
+    return target_path
+
+def admit_and_load_record(
+    note_path: Path | str,
+    *,
+    workspace_dir: Path | str,
+    record: Optional[Any] = None,
+    ledger_entries: Optional[Dict[str, HmacLedgerEntry]] = None,
+    key_manager: Optional[ExternalKeyManager] = None,
+    verifier: Optional[LedgerVerifier] = None,
+) -> str:
+    """Mandatory application load adapter: opens verified source with safe descriptor walking and performs mandatory owner validation."""
+    ws = Path(workspace_dir).resolve()
+    fd = safe_open_source(note_path, workspace_dir=ws, operation="load")
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            raw_text = handle.read()
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+        
+    if record is not None:
+        rec_body_hash = getattr(record, "body_sha256", None)
+        if rec_body_hash is not None:
+            actual_body_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            if actual_body_hash != rec_body_hash:
+                raise ValueError(
+                    f"TAMPER_DETECTED: Note body on disk hash {actual_body_hash} contradicts committed record.body_sha256 {rec_body_hash}"
+                )
+        if getattr(record, "trust_tier", None) == "owner_approved":
+            if ledger_entries is None or key_manager is None or verifier is None:
+                raise ValueError("OWNER_AUTHORITY_UNAVAILABLE: ledger_entries, key_manager, and verifier are mandatory to load owner_approved records")
+            verify_runtime_owner_authority(
+                record,
+                ledger_entries,
+                key_manager,
+                verifier,
+                workspace_id=record.workspace_id,
+                profile_id=record.profile_id,
+                is_commit=False,
+                advance_watermark=False,
+            )
+    return raw_text
+
+# ---------------------------------------------------------------------------
+# Typed Enumerations & Sub-Models
+# ---------------------------------------------------------------------------
+
+StatusType = Literal["active", "superseded", "retracted", "archived"]
+ConfidenceLevel = Literal["high", "medium", "low"]
+SourceClass = Literal[
+    "authoritative_record",      # AR
+    "agent_observation",         # AO
+    "derived_summary",           # DS
+    "model_claim",               # MC
+    "unverified_output",         # UO
+    "owner_preference",          # OP (Disabled in Phase B)
+    "constitutional_rule",       # CR (Disabled in Phase B)
+]
+TrustTier = Literal["untrusted", "verified", "owner_approved"]
+
+class SourceHash(BaseModel):
+    """Bounded, typed hash commitment for source files and commits."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    git_commit: Optional[str] = Field(None, pattern=r"^[0-9a-f]{7,40}$")
+    line_count: Optional[int] = Field(None, ge=1, le=100_000)
+
+class ProvenanceCitation(BaseModel):
+    """Fine-grained cryptographic provenance linking memory to source events."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    source_uri: str = Field(..., max_length=1024)
+    line_start: Optional[int] = Field(None, ge=1, le=1_000_000)
+    line_end: Optional[int] = Field(None, ge=1, le=1_000_000)
+    verbatim_quote: str = Field(..., min_length=1, max_length=4096)
+    source_class: SourceClass = Field(default="agent_observation")
+    session_id: str = Field(..., min_length=1, max_length=128)
+    transcript_hash: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
+    source_hash: Optional[SourceHash] = None
+    
+    @field_validator("source_uri")
+    @classmethod
+    def check_uri(cls, v: str, info: ValidationInfo) -> str:
+        return validate_workspace_containment(v, info)
+    
+    @model_validator(mode="after")
+    def check_line_ordering(self) -> ProvenanceCitation:
+        if self.line_start is not None and self.line_end is not None:
+            if self.line_start > self.line_end:
+                raise ValueError(f"line_start ({self.line_start}) > line_end ({self.line_end})")
+        return self
+
+# ---------------------------------------------------------------------------
+# Discriminated Typed Content Schemas
+# ---------------------------------------------------------------------------
+
+class SemanticContent(BaseModel):
+    """Category 1: Attributable facts, configuration constraints, world knowledge."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    record_type: Literal["semantic"] = "semantic"
+    fact: str = Field(..., min_length=1, max_length=4096)
+    entity: Optional[SafeId] = None
+    attribute: Optional[SafeId] = None
+    value: Optional[str] = Field(None, max_length=2048)
+    confidence: ConfidenceLevel = Field(default="high")
+    valid_from: Optional[datetime.date] = None
+    valid_until: Optional[datetime.date] = None
+    
+    @model_validator(mode="after")
+    def check_validity_dates(self) -> SemanticContent:
+        if self.valid_from and self.valid_until and self.valid_from > self.valid_until:
+            raise ValueError(f"valid_from ({self.valid_from}) > valid_until ({self.valid_until})")
+        return self
+
+class EpisodicContent(BaseModel):
+    """Category 2: Time-ordered actions, observations, outcomes, and actors."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    record_type: Literal["episodic"] = "episodic"
+    event_summary: str = Field(..., min_length=1, max_length=4096)
+    occurred_at: datetime.datetime = Field(...)
+    actors: List[SafeId] = Field(..., min_length=1, max_length=20)
+    action: str = Field(..., min_length=1, max_length=2048)
+    outcome: str = Field(..., min_length=1, max_length=2048)
+    sequence_order: int = Field(default=0, ge=0, le=100_000)
+
+class ProceduralContent(BaseModel):
+    """Category 3: Operational workflows, execution parameters, ordered steps, rollback."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    record_type: Literal["procedural"] = "procedural"
+    task_name: SafeId = Field(...)
+    prerequisites: List[str] = Field(default_factory=list, max_length=50)
+    parameters: Dict[SafeId, str] = Field(default_factory=dict)
+    steps: List[str] = Field(..., min_length=1, max_length=100)
+    verification_command: Optional[str] = Field(None, max_length=1024)
+    rollback_steps: List[str] = Field(default_factory=list, max_length=50)
+    
+    @field_validator("parameters")
+    @classmethod
+    def check_param_limits(cls, v: Dict[SafeId, str]) -> Dict[SafeId, str]:
+        if len(v) > 50:
+            raise ValueError(f"Parameters dict exceeds max keys (50): got {len(v)}")
+        for key, val in v.items():
+            if len(val) > 4096:
+                raise ValueError(f"Parameter {key!r} value exceeds max chars (4096)")
+        return v
+
+class FailureLessonContent(BaseModel):
+    """Category 4: Observed failure symptoms, triggers, root causes, prevention rules."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    record_type: Literal["failure_lesson"] = "failure_lesson"
+    failure_symptom: str = Field(..., min_length=1, max_length=4096)
+    trigger: str = Field(..., min_length=1, max_length=2048)
+    root_cause: str = Field(..., min_length=1, max_length=4096)
+    root_cause_status: Literal["hypothesized", "verified"] = Field(default="hypothesized")
+    verification_receipt_id: Optional[SafeId] = None
+    immediate_remediation: str = Field(..., min_length=1, max_length=4096)
+    prevention_rule: str = Field(..., min_length=1, max_length=4096)
+    
+    @model_validator(mode="after")
+    def check_verified_receipt(self) -> FailureLessonContent:
+        if self.root_cause_status == "verified" and not self.verification_receipt_id:
+            raise ValueError("root_cause_status 'verified' requires a valid verification_receipt_id")
+        return self
+
+TypedContent = Annotated[
+    Union[SemanticContent, EpisodicContent, ProceduralContent, FailureLessonContent],
+    Field(discriminator="record_type"),
+]
+
+# ---------------------------------------------------------------------------
+# Deterministic Markdown Body Renderer
+# ---------------------------------------------------------------------------
+
+MARKDOWN_ESCAPED_CHARS = r"\`#[]()<>!*_~|+-"
+
+def escape_markdown(text: str) -> str:
+    """Strict escaping of Markdown special characters and literal newlines."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\n", r"\n")
+    return "".join((f"\\{c}" if c in MARKDOWN_ESCAPED_CHARS else c) for c in text)
+
+def format_field_val(val: Any) -> str:
+    """Format any field value deterministically, explicitly distinguishing None from empty strings."""
+    if val is None:
+        return "<null>"
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val.isoformat()
+    if isinstance(val, list):
+        return "[" + ", ".join(format_field_val(x) for x in val) + "]"
+    if isinstance(val, dict):
+        items = [f"{escape_markdown(k)}={format_field_val(v)}" for k, v in sorted(val.items())]
+        return "{" + ", ".join(items) + "}"
+    if isinstance(val, str):
+        return f'"{escape_markdown(val)}"'
+    return str(val)
+
+def render_markdown_body(record: Any) -> str:
+    """Deterministically render canonical Markdown body with fixed Identity, Lifecycle, Content, and Provenance sections.
+    
+    Every schema-controlled field is explicitly projected with distinct representation for None vs empty string.
+    """
+    lines: List[str] = [
+        f"# Typed Memory Record: {escape_markdown(str(getattr(record, 'memory_id', '')))}",
+        "",
+        "## Identity",
+        "",
+        f"- memory_id: {format_field_val(getattr(record, 'memory_id', None))}",
+        f"- record_type: {format_field_val(getattr(record, 'record_type', None))}",
+        f"- status: {format_field_val(getattr(record, 'status', 'active'))}",
+        f"- trust_tier: {format_field_val(getattr(record, 'trust_tier', 'verified'))}",
+        f"- revision_seq: {format_field_val(getattr(record, 'revision_seq', 1))}",
+        f"- workspace_id: {format_field_val(getattr(record, 'workspace_id', None))}",
+        f"- profile_id: {format_field_val(getattr(record, 'profile_id', None))}",
+        f"- project_id: {format_field_val(getattr(record, 'project_id', None))}",
+        f"- authority_entry_id: {format_field_val(getattr(record, 'authority_entry_id', None))}",
+        "",
+        "## Lifecycle",
+        "",
+        f"- created_at_utc: {format_field_val(getattr(record, 'created_at_utc', None))}",
+        f"- updated_at_utc: {format_field_val(getattr(record, 'updated_at_utc', None))}",
+        f"- supersedes_id: {format_field_val(getattr(record, 'supersedes_id', None))}",
+        "",
+        "## Content",
+        "",
+    ]
+    
+    content = getattr(record, "typed_content", None)
+    if isinstance(content, SemanticContent):
+        lines.extend([
+            f"- fact: {format_field_val(content.fact)}",
+            f"- entity: {format_field_val(content.entity)}",
+            f"- attribute: {format_field_val(content.attribute)}",
+            f"- value: {format_field_val(content.value)}",
+            f"- confidence: {format_field_val(content.confidence)}",
+            f"- valid_from: {format_field_val(content.valid_from)}",
+            f"- valid_until: {format_field_val(content.valid_until)}",
+        ])
+    elif isinstance(content, EpisodicContent):
+        lines.extend([
+            f"- event_summary: {format_field_val(content.event_summary)}",
+            f"- occurred_at: {format_field_val(content.occurred_at)}",
+            f"- actors: {format_field_val(content.actors)}",
+            f"- action: {format_field_val(content.action)}",
+            f"- outcome: {format_field_val(content.outcome)}",
+            f"- sequence_order: {format_field_val(content.sequence_order)}",
+        ])
+    elif isinstance(content, ProceduralContent):
+        lines.extend([
+            f"- task_name: {format_field_val(content.task_name)}",
+            f"- prerequisites: {format_field_val(content.prerequisites)}",
+            f"- parameters: {format_field_val(content.parameters)}",
+            f"- steps: {format_field_val(content.steps)}",
+            f"- verification_command: {format_field_val(content.verification_command)}",
+            f"- rollback_steps: {format_field_val(content.rollback_steps)}",
+        ])
+    elif isinstance(content, FailureLessonContent):
+        lines.extend([
+            f"- failure_symptom: {format_field_val(content.failure_symptom)}",
+            f"- trigger: {format_field_val(content.trigger)}",
+            f"- root_cause_status: {format_field_val(content.root_cause_status)}",
+            f"- root_cause: {format_field_val(content.root_cause)}",
+            f"- verification_receipt_id: {format_field_val(content.verification_receipt_id)}",
+            f"- immediate_remediation: {format_field_val(content.immediate_remediation)}",
+            f"- prevention_rule: {format_field_val(content.prevention_rule)}",
+        ])
+        
+    lines.extend(["", "## Provenance", ""])
+    for i, p in enumerate(getattr(record, "provenance", []), start=1):
+        lines.extend([
+            f"- citation_{i}_source_class: {format_field_val(p.source_class)}",
+            f"- citation_{i}_source_uri: {format_field_val(p.source_uri)}",
+            f"- citation_{i}_session_id: {format_field_val(p.session_id)}",
+            f"- citation_{i}_verbatim_quote: {format_field_val(p.verbatim_quote)}",
+            f"- citation_{i}_line_start: {format_field_val(p.line_start)}",
+            f"- citation_{i}_line_end: {format_field_val(p.line_end)}",
+            f"- citation_{i}_transcript_hash: {format_field_val(p.transcript_hash)}",
+            f"- citation_{i}_source_sha256: {format_field_val(p.source_hash.sha256 if p.source_hash else None)}",
+            f"- citation_{i}_git_commit: {format_field_val(p.source_hash.git_commit if p.source_hash else None)}",
+            f"- citation_{i}_line_count: {format_field_val(p.source_hash.line_count if p.source_hash else None)}",
+        ])
+    lines.append("")
+    return "\n".join(lines)
+
+def compute_body_sha256(record: Any) -> str:
+    """Compute deterministic SHA-256 hex digest of the rendered Markdown body."""
+    body_text = render_markdown_body(record)
+    return hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+
+# ---------------------------------------------------------------------------
+# Immutable Application-Owned Memory Record
+# ---------------------------------------------------------------------------
+
+class TypedMemoryRecord(BaseModel):
+    """Application-owned, immutable memory record published to durable storage."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    memory_id: SafeId = Field(...)
+    record_type: Literal["semantic", "episodic", "procedural", "failure_lesson"] = Field(...)
+    status: StatusType = Field(default="active")
+    revision_seq: int = Field(default=1, ge=1, le=100_000)
+    workspace_id: str = Field(..., min_length=1, max_length=128)
+    profile_id: Optional[str] = Field(None, max_length=128)
+    project_id: Optional[str] = Field(None, max_length=128, pattern=r"^[a-zA-Z0-9_\-\.]+$")
+    supersedes_id: Optional[SafeId] = None
+    typed_content: TypedContent = Field(...)
+    provenance: List[ProvenanceCitation] = Field(..., min_length=1, max_length=100)
+    trust_tier: TrustTier = Field(default="verified")
+    authority_entry_id: Optional[SafeId] = Field(None, description="External HMAC ledger entry ID binding for owner-authorized records.")
+    
+    # Cryptographic commitments
+    content_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    body_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    record_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    
+    # Metadata
+    note_path: str = Field(..., pattern=r"^memory/typed/(semantic|episodic|procedural|failure_lesson)/[a-zA-Z0-9_\-]+\.md$")
+    created_at_utc: str = Field(...)
+    updated_at_utc: str = Field(...)
+    
+    @model_validator(mode="after")
+    def validate_record_invariants(self) -> TypedMemoryRecord:
+        # 1. Type matching
+        if self.typed_content.record_type != self.record_type:
+            raise ValueError(f"Content record_type ({self.typed_content.record_type}) != record_type ({self.record_type})")
+        
+        # 1b. Q1/Q3 Authority binding
+        if self.trust_tier == "owner_approved":
+            if not self.authority_entry_id:
+                raise ValueError("Records claiming trust_tier='owner_approved' must bind to a valid authority_entry_id in the external HMAC ledger")
+            if not self.profile_id:
+                raise ValueError("Records claiming trust_tier='owner_approved' must have explicit profile_id")
+        if self.authority_entry_id and self.trust_tier != "owner_approved":
+            raise ValueError("authority_entry_id cannot be attached to non-owner records")
+        
+        # 2. Content hash commitment verification
+        expected_content_hash = sha256_canonical(self.typed_content.model_dump(mode="json", exclude_none=False))
+        if self.content_hash != expected_content_hash:
+            raise ValueError(f"content_hash mismatch: expected {expected_content_hash}, got {self.content_hash}")
+        
+        # 3. Deterministic ID binding: mem_<type>_<sha256(canonical_typed_content)[:16]>
+        expected_memory_id = f"mem_{self.record_type}_{expected_content_hash[:16]}"
+        if self.memory_id != expected_memory_id:
+            raise ValueError(f"Deterministic memory_id mismatch: expected {expected_memory_id}, got {self.memory_id}")
+        
+        # 4. Deterministic note_path binding
+        expected_note_path = f"memory/typed/{self.record_type}/{self.memory_id}.md"
+        if self.note_path != expected_note_path:
+            raise ValueError(f"Deterministic note_path mismatch: expected {expected_note_path}, got {self.note_path}")
+        
+        # 5. Stored body hash verification (C3-03 / F-05)
+        expected_body_sha256 = compute_body_sha256(self)
+        if self.body_sha256 != expected_body_sha256:
+            raise ValueError(f"body_sha256 mismatch: expected {expected_body_sha256}, got {self.body_sha256}")
+        
+        # 6. Non-circular record digest verification
+        dumped = self.model_dump(mode="json", exclude_none=False)
+        data_for_digest = {
+            k: v for k, v in dumped.items()
+            if k not in ("record_digest", "_reme_commit")
+        }
+        expected_record_digest = sha256_canonical(data_for_digest)
+        if self.record_digest != expected_record_digest:
+            raise ValueError(f"record_digest mismatch: expected {expected_record_digest}, got {self.record_digest}")
+        
+        # 7. Aggregate envelope size check (<= 64 KB)
+        envelope_bytes = canonical_jcs_bytes(dumped)
+        if len(envelope_bytes) > 65_536:
+            raise ValueError(f"Record envelope exceeds 64 KB limit: {len(envelope_bytes)} bytes")
+            
+        return self
+
+# ---------------------------------------------------------------------------
+# Untrusted Model Proposal Schema
+# ---------------------------------------------------------------------------
+
+class TypedMemoryProposal(BaseModel):
+    """Untrusted memory proposal submitted by an LLM agent for evolution/commit."""
+    model_config = ConfigDict(extra="forbid")
+    
+    record_type: Literal["semantic", "episodic", "procedural", "failure_lesson"] = Field(...)
+    source_class: SourceClass = Field(default="agent_observation")
+    typed_content: TypedContent = Field(...)
+    provenance: List[ProvenanceCitation] = Field(..., min_length=1, max_length=50)
+    session_id: str = Field(..., min_length=1, max_length=128)
+    supersedes_id: Optional[SafeId] = None
+    project_id: Optional[str] = Field(None, max_length=128)
+    
+    @model_validator(mode="after")
+    def validate_proposal(self) -> TypedMemoryProposal:
+        # Phase B Owner Q3 Gate: Creation of OP/CR is strictly forbidden
+        if self.source_class in ("owner_preference", "constitutional_rule"):
+            raise ValueError(
+                f"SourceClass {self.source_class!r} creation is strictly prohibited in Phase B (Owner Gate Q3). "
+                "Only verified agent observations and authoritative transcripts may be committed."
+            )
+        
+        if self.typed_content.record_type != self.record_type:
+            raise ValueError(f"Content record_type ({self.typed_content.record_type}) != proposal record_type ({self.record_type})")
+        
+        return self
+
+# ---------------------------------------------------------------------------
+# Option B Frontmatter Marker and Receipt
+# ---------------------------------------------------------------------------
+
+class OptionBMarker(BaseModel):
+    """Application-owned frontmatter marker embedded in persisted markdown files."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    version: str = Field(default="v2")
+    request_id: SafeId = Field(...)
+    session_id: str = Field(..., min_length=1, max_length=128)
+    memory_id: SafeId = Field(...)
+    record_type: Literal["semantic", "episodic", "procedural", "failure_lesson"] = Field(...)
+    content_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    body_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    record_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    created: bool = Field(default=True)
+    provenance_incomplete: bool = Field(default=False)
+
+class OptionBReceiptCommit(BaseModel):
+    """Individual commit confirmation within an Option B transaction receipt."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    memory_id: SafeId = Field(...)
+    record_type: Literal["semantic", "episodic", "procedural", "failure_lesson"] = Field(...)
+    record_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    body_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    note_path: str = Field(..., pattern=r"^memory/typed/(semantic|episodic|procedural|failure_lesson)/[a-zA-Z0-9_\-]+\.md$")
+    status: StatusType = Field(default="active")
+    revision_seq: int = Field(default=1, ge=1)
+    created: bool = Field(...)
+    
+    @model_validator(mode="after")
+    def validate_commit(self) -> OptionBReceiptCommit:
+        expected_note_path = f"memory/typed/{self.record_type}/{self.memory_id}.md"
+        if self.note_path != expected_note_path:
+            raise ValueError(f"note_path mismatch: expected {expected_note_path}, got {self.note_path}")
+        return self
+
+class TypedOptionBReceipt(BaseModel):
+    """Durable transaction receipt returned upon atomic batch commit."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    outcome: Literal["typed_batch"] = Field(default="typed_batch")
+    batch_id: SafeId = Field(...)
+    request_id: SafeId = Field(...)
+    session_id: str = Field(..., min_length=1, max_length=128)
+    workspace_id: str = Field(..., min_length=1, max_length=128)
+    profile_id: str = Field(..., min_length=1, max_length=128)
+    n_records: int = Field(..., ge=1, le=100)
+    commits: List[OptionBReceiptCommit] = Field(..., min_length=1, max_length=100)
+    index_status: Optional[Literal["ok", "degraded"]] = Field(
+        default=None,
+        description="None permitted ONLY for disabled typed ACK scaffold (Task B.2); 'ok' or 'degraded' permitted after qualified activation (Task B.3+)"
+    )
+    committed_at_utc: str = Field(...)
+    receipt_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    
+    @model_validator(mode="after")
+    def validate_receipt(self) -> TypedOptionBReceipt:
+        # Strict ISO-8601 UTC timestamp check
+        try:
+            dt = datetime.datetime.fromisoformat(self.committed_at_utc.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                raise ValueError("committed_at_utc must include timezone")
+        except Exception as e:
+            raise ValueError(f"Invalid committed_at_utc ISO-8601 timestamp: {self.committed_at_utc!r}") from e
+
+        if self.n_records != len(self.commits):
+            raise ValueError(f"n_records ({self.n_records}) != len(commits) ({len(self.commits)})")
+        
+        # Unique memory ID check
+        commit_ids = [c.memory_id for c in self.commits]
+        if len(set(commit_ids)) != len(commit_ids):
+            raise ValueError("Duplicate memory_id detected in batch commits")
+        
+        # Batch aggregate bounds check (512 KiB)
+        dumped = self.model_dump(mode="json", exclude_none=False)
+        envelope_bytes = canonical_jcs_bytes(dumped)
+        if len(envelope_bytes) > 524_288:
+            raise ValueError(f"Batch receipt exceeds 512 KiB limit: {len(envelope_bytes)} bytes")
+        
+        # Receipt digest verifies entire receipt payload excluding receipt_digest itself
+        data_to_hash = {k: v for k, v in dumped.items() if k != "receipt_digest"}
+        expected = sha256_canonical(data_to_hash)
+        if self.receipt_digest != expected:
+            raise ValueError(f"receipt_digest mismatch: expected {expected}, got {self.receipt_digest}")
+        return self
+
+# ---------------------------------------------------------------------------
+# Q1/Q3 Runtime HMAC Ledger Entry Model & Custody Controls
+# ---------------------------------------------------------------------------
+
+def verify_key_custody_path(key_path: Path | str, workspace_dir: Path | str) -> Path:
+    """Enforce Q1 external key custody outside memory workspace.
+    
+    Key must be an absolute path, regular file, non-symlink (including all parent components),
+    and strictly outside workspace_dir.
+    """
+    if not key_path:
+        raise ValueError("key_path is required")
+    kp = Path(key_path)
+    if not kp.is_absolute():
+        raise ValueError(f"Security violation: HMAC key path must be an absolute path, got {key_path!r}")
+    
+    curr = kp
+    while curr != curr.parent:
+        if curr.is_symlink():
+            raise ValueError(f"Security violation: HMAC key path or parent component is a symlink: {curr}")
+        curr = curr.parent
+
+    ws = Path(workspace_dir).resolve()
+    resolved = kp.resolve()
+    if resolved.is_relative_to(ws):
+        raise ValueError(f"Security violation: HMAC key resides within workspace_dir: {resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"HMAC key file does not exist or is not a regular file: {resolved}")
+    return resolved
+
+class HmacLedgerEntry(BaseModel):
+    """Cryptographic authority record for Owner Decisions (OP) & Constitutional Rules (CR)."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    entry_id: SafeId = Field(...)
+    decision_id: SafeId = Field(...)
+    workspace_id: str = Field(..., min_length=1, max_length=128)
+    profile_id: str = Field(..., min_length=1, max_length=128)
+    authority_tier: Literal["owner_preference", "constitutional_rule"] = Field(...)
+    payload_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    record_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    memory_id: SafeId = Field(...)
+    hmac_signature: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    key_id: SafeId = Field(...)
+    timestamp_utc: str = Field(...)
+    seq: int = Field(..., ge=1, description="Monotonically increasing sequence number for anti-replay/anti-rollback.")
+
+def sign_hmac_entry(entry_dict: Dict[str, Any], key_bytes: bytes) -> str:
+    """Generate SHA-256 HMAC signature over canonical bytes excluding signature."""
+    payload = {k: v for k, v in entry_dict.items() if k != "hmac_signature"}
+    data = b"FHM007-HMAC-v1:" + canonical_jcs_bytes(payload)
+    return hmac.new(key_bytes, data, hashlib.sha256).hexdigest()
+
+def verify_hmac_entry(entry: HmacLedgerEntry, key_bytes: bytes) -> bool:
+    """Verify HMAC signature for an authority ledger entry."""
+    expected = sign_hmac_entry(entry.model_dump(mode="json", exclude_none=False), key_bytes)
+    return hmac.compare_digest(entry.hmac_signature, expected)
+
+class ExternalKeyManager:
+    """External key-id to path resolver enforcing Q1 custody outside memory workspace."""
+
+    def __init__(self, workspace_dir: Path | str, key_paths: Dict[str, Path | str]) -> None:
+        self.workspace = Path(workspace_dir).resolve()
+        self.key_paths = {k: Path(p) for k, p in key_paths.items()}
+
+    def resolve(self, key_id: str) -> bytes:
+        if key_id not in self.key_paths:
+            raise ValueError(f"Unknown external HMAC key_id: {key_id}")
+        verified_path = verify_key_custody_path(self.key_paths[key_id], self.workspace)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(verified_path, flags)
+        try:
+            with open(fd, "rb", closefd=True) as handle:
+                key_bytes = handle.read()
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        if len(key_bytes) != 32:
+            raise ValueError(f"HMAC key must be exactly 32 bytes, got {len(key_bytes)}")
+        return key_bytes
+
+class DurableWatermarkLedger:
+    """Atomic, file-backed durable monotonic sequence tracker for owner authority streams."""
+
+    def __init__(self, watermark_path: Path | str) -> None:
+        self.path = Path(watermark_path).resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.watermarks: Dict[str, int] = {}
+        if self.path.is_file():
+            try:
+                raw = self.path.read_text(encoding="utf-8")
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError(f"Watermark ledger root must be a JSON object, got {type(data).__name__}")
+                for k, v in data.items():
+                    if not isinstance(k, str) or not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                        raise ValueError(f"Invalid watermark entry: {k!r} -> {v!r}")
+                self.watermarks = data
+            except Exception as exc:
+                raise ValueError(f"CORRUPT_WATERMARK_LEDGER: Durable watermark state at {self.path} is invalid or corrupt: {exc}") from exc
+
+    def get(self, stream_key: str) -> int:
+        return self.watermarks.get(stream_key, 0)
+
+    def advance(self, stream_key: str, seq: int) -> None:
+        prior = self.get(stream_key)
+        if seq <= prior:
+            raise ValueError(f"Ledger sequence replay or rollback: seq {seq} <= prior {prior}")
+        self.watermarks[stream_key] = seq
+        tmp_target = self.path.parent / f".watermarks.{os.getpid()}.tmp"
+        with tmp_target.open("w", encoding="utf-8") as handle:
+            json.dump(self.watermarks, handle, sort_keys=True, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_target, self.path)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        dir_fd = os.open(self.path.parent, flags)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+class LedgerVerifier:
+    """Signature verifier backed by durable monotonic watermarks."""
+
+    def __init__(self, key_manager: ExternalKeyManager, watermark_path: Optional[Path | str] = None) -> None:
+        self.key_manager = key_manager
+        wm_path = Path(watermark_path) if watermark_path else (self.key_manager.workspace / ".reme" / "ledger_watermarks.json")
+        self.durable_ledger = DurableWatermarkLedger(wm_path)
+
+    @staticmethod
+    def stream_key(entry: HmacLedgerEntry) -> str:
+        return f"{entry.workspace_id}:{entry.profile_id}:{entry.decision_id}"
+
+    def verify(self, entry: HmacLedgerEntry, *, is_commit: bool = True, advance_watermark: bool = True) -> None:
+        if entry.seq < 1 or not entry.key_id or not entry.memory_id or not entry.record_digest:
+            raise ValueError("Malformed owner ledger entry")
+        if not entry.workspace_id or not entry.profile_id:
+            raise ValueError("Owner ledger scope is incomplete")
+        key_bytes = self.key_manager.resolve(entry.key_id)
+        if not verify_hmac_entry(entry, key_bytes):
+            raise ValueError(f"Invalid HMAC signature for entry {entry.entry_id}")
+        stream = self.stream_key(entry)
+        prior = self.durable_ledger.get(stream)
+        if is_commit:
+            if entry.seq <= prior:
+                raise ValueError(f"Ledger sequence replay or rollback: seq {entry.seq} <= prior {prior}")
+            if advance_watermark:
+                self.durable_ledger.advance(stream, entry.seq)
+        else:
+            if entry.seq > prior:
+                raise ValueError(f"Uncommitted future authority sequence on load: seq {entry.seq} > watermark {prior}")
+
+def verify_runtime_owner_authority(
+    record: Any,
+    ledger_entries: Dict[str, HmacLedgerEntry],
+    key_manager: ExternalKeyManager,
+    verifier: LedgerVerifier,
+    *,
+    workspace_id: str,
+    profile_id: Optional[str] = None,
+    is_commit: bool = True,
+    advance_watermark: bool = True,
+) -> bool:
+    """Verify Q1/Q3 runtime owner authority at commit and load with fail-closed custody, scope binding, and idempotent load verification."""
+    if getattr(record, "trust_tier", None) != "owner_approved":
+        return True
+
+    authority_id = getattr(record, "authority_entry_id", None)
+    if not authority_id:
+        raise ValueError("Record claiming owner_approved lacks authority_entry_id")
+    entry = ledger_entries.get(authority_id)
+    if entry is None:
+        raise ValueError(f"Authority entry {authority_id} not found in external HMAC ledger")
+
+    rec_ws = getattr(record, "workspace_id", None)
+    if not rec_ws or rec_ws != workspace_id or entry.workspace_id != workspace_id:
+        raise ValueError(f"Authority scope mismatch: record workspace {rec_ws} != {workspace_id}")
+
+    rec_prof = getattr(record, "profile_id", None)
+    if not rec_prof:
+        raise ValueError("Owner-approved record must have explicit profile_id")
+    if profile_id and rec_prof != profile_id:
+        raise ValueError(f"Authority profile mismatch with environment: {rec_prof} != {profile_id}")
+    if entry.profile_id != rec_prof:
+        raise ValueError(f"Authority profile mismatch: entry profile {entry.profile_id} != record {rec_prof}")
+
+    if entry.memory_id != getattr(record, "memory_id", None):
+        raise ValueError("Authority memory_id binding mismatch")
+    if entry.payload_sha256 != getattr(record, "content_hash", None):
+        raise ValueError("Authority payload mismatch with content_hash")
+    if entry.record_digest != getattr(record, "record_digest", None):
+        raise ValueError("Authority record digest mismatch")
+
+    # Mandatory signature verification and sequence watermark validation
+    verifier.verify(entry, is_commit=is_commit, advance_watermark=advance_watermark)
+    return True
+
+# ---------------------------------------------------------------------------
+# Q3 Contradiction Abstention & Zero-Sink Transaction Gate
+# ---------------------------------------------------------------------------
+
+class FourSinkTransaction:
+    """Application-owned transaction gate managing the four durable storage sinks:
+    1. Intent journal (.reme/intent_journal.jsonl)
+    2. Typed notes (memory/typed/<type>/<id>.md)
+    3. Option B receipts (.reme/receipts/<batch_id>.json)
+    4. Lexical index directory (.reme/index/ - all files and subdirectories)
+    """
+
+    def __init__(self, workspace_dir: Path | str) -> None:
+        if not workspace_dir:
+            raise ValueError("workspace_dir is mandatory for FourSinkTransaction")
+        self.workspace_dir = Path(workspace_dir).resolve()
+        if not self.workspace_dir.is_dir():
+            raise ValueError(f"workspace_dir does not exist or is not a directory: {self.workspace_dir}")
+        self.journal_path = self.workspace_dir / ".reme" / "intent_journal.jsonl"
+        self.receipts_dir = self.workspace_dir / ".reme" / "receipts"
+        self.index_dir = self.workspace_dir / ".reme" / "index"
+        self.notes_dir = self.workspace_dir / "memory" / "typed"
+
+    def snapshot_sinks(self) -> Dict[str, bytes]:
+        """Byte-level snapshot of all four storage sinks."""
+        sinks: Dict[str, bytes] = {}
+        if self.journal_path.is_file():
+            sinks[self.journal_path.relative_to(self.workspace_dir).as_posix()] = self.journal_path.read_bytes()
+        for root in [self.receipts_dir, self.index_dir, self.notes_dir]:
+            if root.is_dir():
+                for p in sorted(root.rglob("*")):
+                    if p.is_file():
+                        sinks[p.relative_to(self.workspace_dir).as_posix()] = p.read_bytes()
+        return sinks
+
+    def admit_or_refuse(
+        self,
+        proposal: TypedMemoryProposal,
+        approved_owner_context: Optional[Dict[str, Any]] = None,
+        *,
+        ledger_entries: Optional[Dict[str, HmacLedgerEntry]] = None,
+        key_manager: Optional[ExternalKeyManager] = None,
+        verifier: Optional[LedgerVerifier] = None,
+    ) -> None:
+        """Run every admission check before touching any sink. Fails closed with zero mutations."""
+        before_snapshot = self.snapshot_sinks()
+        try:
+            if proposal.source_class in ("owner_preference", "constitutional_rule"):
+                raise ValueError("Phase B strictly prohibits model-created OP/CR proposals")
+            
+            if approved_owner_context is not None:
+                subject = approved_owner_context.get("subject")
+                proposal_subject = (
+                    getattr(proposal.typed_content, "entity", None)
+                    or getattr(proposal.typed_content, "task_name", None)
+                    or getattr(proposal.typed_content, "failure_symptom", None)
+                )
+                if subject and proposal_subject == subject:
+                    if ledger_entries is None or key_manager is None or verifier is None:
+                        raise ValueError("OWNER_CONTEXT_UNAVAILABLE: missing ledger, key manager, or verifier")
+                    entry_id = approved_owner_context.get("entry_id")
+                    if not entry_id or entry_id not in ledger_entries:
+                        raise ValueError(f"OWNER_CONTEXT_UNAVAILABLE: missing ledger entry {entry_id}")
+                    entry = ledger_entries[entry_id]
+                    verifier.verify(entry, is_commit=False, advance_watermark=False)
+                    if "value" in approved_owner_context and hasattr(proposal.typed_content, "value"):
+                        expected_val = approved_owner_context["value"]
+                        prop_val = getattr(proposal.typed_content, "value")
+                        if prop_val != expected_val:
+                            raise ValueError(f"OWNER_DECISION_CONTRADICTION: proposal value {prop_val!r} contradicts owner {expected_val!r}")
+        except Exception:
+            after_snapshot = self.snapshot_sinks()
+            assert after_snapshot == before_snapshot, "Transaction violation: sink mutated during refused proposal"
+            raise
+
+def admit_or_refuse_proposal(
+    proposal: TypedMemoryProposal,
+    approved_owner_context: Optional[Dict[str, Any]] = None,
+    *,
+    workspace_dir: Path | str,
+    ledger_entries: Optional[Dict[str, HmacLedgerEntry]] = None,
+    key_manager: Optional[ExternalKeyManager] = None,
+    verifier: Optional[LedgerVerifier] = None,
+) -> None:
+    """Enforce Q3 contradiction abstention across all 4 sinks.
+    
+    Validates proposal before any write to journal, notes, receipts, or index.
+    Fails closed on any contradiction, missing ledger, or missing key.
+    workspace_dir is mandatory.
+    """
+    tx = FourSinkTransaction(workspace_dir)
+    tx.admit_or_refuse(
+        proposal,
+        approved_owner_context,
+        ledger_entries=ledger_entries,
+        key_manager=key_manager,
+        verifier=verifier,
+    )
+
+# ---------------------------------------------------------------------------
+# Q2 Snapshot Privacy, Redaction & Encrypted Audit Retention
+# ---------------------------------------------------------------------------
+
+class RetentionPolicy(BaseModel):
+    """Owner-approved retention policy for encrypted audit snapshots."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    policy_id: SafeId = Field(...)
+    approved_by_owner: bool = Field(default=False, description="Must be explicitly approved by project owner. Unapproved policies fail closed to zero destructive erasure.")
+    duration_days: Optional[int] = Field(None, ge=1, le=3650, description="Retention duration. No arbitrary 90-day defaults.")
+    legal_holds: List[SafeId] = Field(default_factory=list, description="Active legal or incident holds blocking erasure.")
+    description: str = Field(default="", max_length=512)
+
+class DurableErasureReceipt(BaseModel):
+    """Immutable proof of targeted cryptographic erasure of an audit snapshot DEK."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    receipt_id: SafeId = Field(...)
+    snapshot_id: SafeId = Field(...)
+    dek_id: SafeId = Field(...)
+    policy_id: SafeId = Field(...)
+    erased_at_utc: str = Field(...)
+    fsync_confirmed: bool = Field(default=True)
+    receipt_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+class MemorySnapshotRecord(BaseModel):
+    """Q2 audit snapshot metadata for redacted notes and encrypted audit packages."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    
+    snapshot_id: SafeId = Field(...)
+    memory_id: SafeId = Field(...)
+    original_content_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    redacted_content_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    was_modified: bool = Field(default=False, description="True if text redaction was required and modified content; False for honest unchanged snapshot.")
+    provenance_incomplete: bool = Field(default=False)
+    encrypted_audit_path: Optional[str] = Field(None, max_length=256)
+    created_at_utc: str = Field(...)
+    policy_id: Optional[SafeId] = Field(None, description="Approved retention policy ID. Missing policy fails closed to zero destructive erasure.")
+    retention_policy_approved: bool = Field(default=False, description="True only with explicit owner policy approval.")
+    retention_days: Optional[int] = Field(None, ge=1, le=3650, description="Configurable retention duration; requires explicit owner policy decision.")
+    legal_hold: bool = Field(default=False, description="When true, active legal hold permanently blocks destructive cryptographic erasure.")
+    dek_id: SafeId = Field(..., description="Identifier for per-snapshot Data Encryption Key in key hierarchy.")
+    erased: bool = Field(default=False)
+    erasure_receipt_id: Optional[SafeId] = Field(None)
+    
+    @model_validator(mode="after")
+    def validate_snapshot_invariants(self) -> MemorySnapshotRecord:
+        if self.was_modified and self.original_content_sha256 == self.redacted_content_sha256:
+            raise ValueError(
+                "Invariant violation: original_content_sha256 and redacted_content_sha256 cannot be identical "
+                "when was_modified=True (claimed redaction modification)"
+            )
+        if not self.was_modified and self.original_content_sha256 != self.redacted_content_sha256:
+            raise ValueError(
+                "Invariant violation: original_content_sha256 and redacted_content_sha256 must be identical "
+                "when was_modified=False (honest unchanged snapshot)"
+            )
+        if self.retention_policy_approved:
+            if not self.policy_id:
+                raise ValueError("retention_policy_approved=True requires valid policy_id")
+            if self.retention_days is None or self.retention_days <= 0:
+                raise ValueError("retention_policy_approved=True requires explicit positive retention_days")
+        if self.erased and not self.erasure_receipt_id:
+            raise ValueError("erased=True requires valid erasure_receipt_id")
+        return self
+
+def redact_production_text(text: str, patterns: Optional[List[re.Pattern]] = None) -> Tuple[str, bool]:
+    """Redact credentials and sensitive patterns, returning (redacted_text, was_modified)."""
+    default_patterns = [
+        re.compile(r"(?i)\b(?:sk_live|bearer|token|apikey|password|secret)_[0-9a-zA-Z_\-]{8,}\b"),
+        re.compile(r"(?i)(password\s*[:=]\s*)['\"][^'\"]+['\"]"),
+    ]
+    compiled_patterns = patterns or default_patterns
+    modified = False
+    result = text
+    for pat in compiled_patterns:
+        subbed, count = pat.subn("[REDACTED:secret]", result)
+        if count > 0:
+            modified = True
+            result = subbed
+    return result, modified
+
+def fsync_directory(directory: Path) -> None:
+    """Fsync parent directory ensuring rename and file creation durability."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+SAFE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+def validate_safe_id(identifier: str, name: str = "identifier") -> str:
+    """Validate identifier against SafeId constraints rejecting path traversal components."""
+    if not isinstance(identifier, str) or not SAFE_ID_REGEX.match(identifier):
+        raise ValueError(f"Invalid {name} format: {identifier!r}. Must match ^[a-zA-Z0-9_\\-]+$")
+    return identifier
+
+def load_external_audit_key(key_path: Path | str, workspace_dir: Path | str) -> bytes:
+    """Validate and read external audit master key ensuring custody outside workspace."""
+    if not key_path:
+        raise ValueError("key_path is required")
+    kp = Path(key_path)
+    if not kp.is_absolute():
+        raise ValueError(f"Security violation: Audit key path must be an absolute path, got {key_path!r}")
+    curr = kp
+    while curr != curr.parent:
+        if curr.is_symlink():
+            raise ValueError(f"Security violation: Audit key path or parent component is a symlink: {curr}")
+        curr = curr.parent
+    ws = Path(workspace_dir).resolve()
+    resolved = kp.resolve()
+    if resolved == ws or resolved.is_relative_to(ws):
+        raise ValueError(f"Security violation: Audit key resides within workspace: {resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"Audit key file does not exist or is not a regular file: {resolved}")
+    key_bytes = resolved.read_bytes()
+    if len(key_bytes) != 32:
+        raise ValueError(f"Audit master key must be exactly 32 bytes for AES-256-GCM, got {len(key_bytes)}")
+    return key_bytes
+
+class AuditKeyManager:
+    """External custody manager for audit master wrapping keys outside workspace."""
+
+    def __init__(
+        self,
+        workspace_dir: Path | str,
+        *,
+        key_id: str = "key_audit_v1",
+        key_path: Optional[Path | str] = None,
+    ) -> None:
+        self.workspace = Path(workspace_dir).resolve()
+        self.key_id = validate_safe_id(key_id, "key_id")
+        if key_path is None:
+            raw_path = os.environ.get("FERMES_AUDIT_KEY_PATH")
+            if not raw_path:
+                raise ValueError("FERMES_AUDIT_KEY_PATH environment variable is required when key_path is omitted")
+            configured = Path(raw_path)
+        else:
+            configured = Path(key_path)
+        if not configured.is_absolute():
+            raise ValueError(f"Security violation: Audit key path must be an absolute path, got {str(configured)!r}")
+        self.key_path = configured
+
+    def load(self) -> bytes:
+        return load_external_audit_key(self.key_path, self.workspace)
+
+    def get_key_bytes(self) -> bytes:
+        return self.load()
+
+class SnapshotKeyStore:
+    """External per-snapshot DEK store with an audit-key-wrapped DEK envelope."""
+
+    def __init__(self, root: Path | str, workspace: Path | str) -> None:
+        self.root = Path(root).resolve()
+        self.workspace = Path(workspace).resolve()
+        if self.root == self.workspace or self.root.is_relative_to(self.workspace) or self.workspace in self.root.parents:
+            raise ValueError("DEK store must be strictly external to workspace")
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, dek_id: str) -> Path:
+        validate_safe_id(dek_id, "dek_id")
+        target = (self.root / f"{dek_id}.json").resolve()
+        if not target.is_relative_to(self.root):
+            raise ValueError(f"Path traversal detected in dek_id: {dek_id}")
+        return target
+
+    def create(
+        self,
+        snapshot_id: str,
+        audit_key_manager: AuditKeyManager,
+        wrapping_key_id: Optional[str] = None,
+    ) -> str:
+        validate_safe_id(snapshot_id, "snapshot_id")
+        if not isinstance(audit_key_manager, AuditKeyManager):
+            raise TypeError("audit_key_manager must be an AuditKeyManager enforcing external custody")
+        wrapping_id = audit_key_manager.key_id if wrapping_key_id is None else validate_safe_id(wrapping_key_id, "wrapping_key_id")
+        audit_key_bytes = audit_key_manager.get_key_bytes()
+
+        dek_id = f"dek_{snapshot_id}_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
+        validate_safe_id(dek_id, "dek_id")
+        dek = os.urandom(32)
+        nonce = os.urandom(12)
+        aad = f"FHM007-DEK-v1:{dek_id}:{wrapping_id}".encode("utf-8")
+        wrapped = AESGCM(audit_key_bytes).encrypt(nonce, dek, aad)
+        envelope = {
+            "dek_id": dek_id,
+            "wrapping_key_id": wrapping_id,
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "aad": base64.b64encode(aad).decode("ascii"),
+            "wrapped_dek": base64.b64encode(wrapped).decode("ascii"),
+        }
+        target = self._path(dek_id)
+        tmp_name = f".{target.name}.{os.getpid()}.tmp"
+        tmp_path = target.parent / tmp_name
+        with tmp_path.open("wb") as handle:
+            handle.write(canonical_jcs_bytes(envelope))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+        fsync_directory(self.root)
+        return dek_id
+
+    def load(
+        self,
+        dek_id: str,
+        audit_key_manager: AuditKeyManager,
+        wrapping_key_id: Optional[str] = None,
+    ) -> bytes:
+        validate_safe_id(dek_id, "dek_id")
+        if not isinstance(audit_key_manager, AuditKeyManager):
+            raise TypeError("audit_key_manager must be an AuditKeyManager enforcing external custody")
+        wrapping_id = audit_key_manager.key_id if wrapping_key_id is None else validate_safe_id(wrapping_key_id, "wrapping_key_id")
+        audit_key_bytes = audit_key_manager.get_key_bytes()
+        target = self._path(dek_id)
+        if not target.is_file():
+            raise ValueError(f"Snapshot DEK unavailable: {dek_id}")
+        envelope = json.loads(target.read_bytes())
+        if envelope.get("wrapping_key_id") != wrapping_id:
+            raise ValueError("Snapshot wrapping-key dependency mismatch")
+        return AESGCM(audit_key_bytes).decrypt(
+            base64.b64decode(envelope["nonce"]),
+            base64.b64decode(envelope["wrapped_dek"]),
+            base64.b64decode(envelope["aad"]),
+        )
+
+    def destroy(self, dek_id: str) -> None:
+        validate_safe_id(dek_id, "dek_id")
+        target = self._path(dek_id)
+        if not target.is_file():
+            raise ValueError(f"Cannot destroy non-existent DEK: {dek_id}")
+        target.unlink()
+        fsync_directory(self.root)
+
+def encrypt_audit_snapshot(
+    workspace: Path | str,
+    snapshot_id: str,
+    payload: Dict[str, Any],
+    audit_key_manager: AuditKeyManager,
+    dek_store: SnapshotKeyStore,
+    wrapping_key_id: Optional[str] = None,
+) -> Path:
+    """Encrypt audit snapshot with AES-256-GCM using per-snapshot DEK wrapped under external audit master key."""
+    validate_safe_id(snapshot_id, "snapshot_id")
+    if not isinstance(audit_key_manager, AuditKeyManager):
+        raise TypeError("audit_key_manager must be an AuditKeyManager enforcing external custody")
+    wrapping_id = audit_key_manager.key_id if wrapping_key_id is None else validate_safe_id(wrapping_key_id, "wrapping_key_id")
+    ws = Path(workspace).resolve()
+    target_dir = ws / ".reme" / "audit" / "snapshots"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{snapshot_id}.enc"
+    if not target.resolve().is_relative_to(target_dir):
+        raise ValueError(f"Path traversal detected in snapshot_id: {snapshot_id}")
+    
+    dek_id = dek_store.create(snapshot_id, audit_key_manager, wrapping_id)
+    dek = dek_store.load(dek_id, audit_key_manager, wrapping_id)
+    nonce = os.urandom(12)
+    aad = f"FHM007-AUDIT-v1:{ws.name}:{snapshot_id}:1".encode("utf-8")
+    ciphertext = AESGCM(dek).encrypt(nonce, canonical_jcs_bytes(payload), aad)
+    envelope = {
+        "schema_version": 1,
+        "algorithm": "AES-256-GCM",
+        "snapshot_id": snapshot_id,
+        "dek_id": dek_id,
+        "wrapping_key_id": wrapping_id,
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "aad": base64.b64encode(aad).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+    }
+    tmp_name = f".{target.name}.{os.getpid()}.tmp"
+    tmp_path = target_dir / tmp_name
+    with tmp_path.open("wb") as handle:
+        handle.write(canonical_jcs_bytes(envelope))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, target)
+    fsync_directory(target_dir)
+    return target
+
+def decrypt_audit_snapshot(
+    workspace: Path | str,
+    snapshot_id: str,
+    audit_key_manager: AuditKeyManager,
+    dek_store: SnapshotKeyStore,
+) -> Dict[str, Any]:
+    """Decrypt audit snapshot with authenticated verification using wrapped DEK."""
+    validate_safe_id(snapshot_id, "snapshot_id")
+    if not isinstance(audit_key_manager, AuditKeyManager):
+        raise TypeError("audit_key_manager must be an AuditKeyManager enforcing external custody")
+    ws = Path(workspace).resolve()
+    target_dir = ws / ".reme" / "audit" / "snapshots"
+    target = target_dir / f"{snapshot_id}.enc"
+    if not target.resolve().is_relative_to(target_dir):
+        raise ValueError(f"Path traversal detected in snapshot_id: {snapshot_id}")
+    if not target.is_file():
+        raise ValueError(f"Snapshot ciphertext file missing: {target}")
+    envelope = json.loads(target.read_bytes())
+    if envelope.get("algorithm") != "AES-256-GCM" or envelope.get("snapshot_id") != snapshot_id:
+        raise ValueError("Invalid or mismatched snapshot envelope")
+    ciphertext = base64.b64decode(envelope["ciphertext"])
+    if hashlib.sha256(ciphertext).hexdigest() != envelope.get("ciphertext_sha256"):
+        raise ValueError("Snapshot ciphertext SHA-256 mismatch")
+    wrapping_key_id = envelope.get("wrapping_key_id", audit_key_manager.key_id)
+    dek = dek_store.load(envelope["dek_id"], audit_key_manager, wrapping_key_id)
+    plaintext = AESGCM(dek).decrypt(
+        base64.b64decode(envelope["nonce"]),
+        ciphertext,
+        base64.b64decode(envelope["aad"]),
+    )
+    return json.loads(plaintext.decode("utf-8"))
+
+def evaluate_audit_erasure(
+    policy: Optional[RetentionPolicy],
+    created_at: Optional[datetime.datetime],
+    now: datetime.datetime,
+    snapshot: MemorySnapshotRecord,
+) -> Tuple[bool, str]:
+    """Evaluate whether an audit snapshot DEK may be destroyed under approved policy and mandatory snapshot metadata."""
+    if not isinstance(snapshot, MemorySnapshotRecord):
+        raise TypeError("snapshot: MemorySnapshotRecord is mandatory for audit erasure evaluation")
+    if policy is None:
+        return False, "UNAPPROVED_POLICY: missing policy fails closed to zero erasure"
+    if not policy.approved_by_owner:
+        return False, "UNAPPROVED_POLICY: policy has not been approved by project owner"
+    if snapshot.legal_hold:
+        return False, f"LEGAL_HOLD: active snapshot legal_hold blocks erasure on snapshot {snapshot.snapshot_id}"
+    if policy.legal_holds:
+        return False, f"LEGAL_HOLD: active legal holds block erasure: {policy.legal_holds}"
+    if not policy.duration_days or policy.duration_days <= 0:
+        return False, "INVALID_RETENTION: approved duration_days required"
+    if not snapshot.retention_policy_approved or not snapshot.policy_id:
+        return False, "UNAPPROVED_POLICY: snapshot metadata indicates retention policy is not approved by owner"
+    if snapshot.policy_id != policy.policy_id:
+        return False, f"POLICY_MISMATCH: supplied policy_id {policy.policy_id} contradicts snapshot metadata policy_id {snapshot.policy_id}"
+    if snapshot.retention_days is not None and policy.duration_days != snapshot.retention_days:
+        return False, f"DURATION_MISMATCH: supplied policy duration {policy.duration_days} contradicts snapshot metadata retention_days {snapshot.retention_days}"
+
+    # Authenticate and bind created_at from canonical snapshot metadata
+    snap_created_str = getattr(snapshot, "created_at_utc", None)
+    if not snap_created_str:
+        return False, "INVALID_METADATA: snapshot record missing created_at_utc"
+    snap_dt = datetime.datetime.fromisoformat(snap_created_str)
+    if snap_dt.tzinfo is None:
+        snap_dt = snap_dt.replace(tzinfo=datetime.timezone.utc)
+
+    if created_at is not None:
+        c_dt = created_at if created_at.tzinfo is not None else created_at.replace(tzinfo=datetime.timezone.utc)
+        if abs((snap_dt - c_dt).total_seconds()) > 1.0:
+            return False, f"TIMESTAMP_MISMATCH: caller created_at {created_at} contradicts snapshot metadata {snap_created_str}"
+
+    now_dt = now if now.tzinfo is not None else now.replace(tzinfo=datetime.timezone.utc)
+    expires_at = snap_dt + datetime.timedelta(days=policy.duration_days)
+    if now_dt < expires_at:
+        return False, f"RETENTION_ACTIVE: snapshot unexpired until {expires_at.isoformat()}"
+    return True, "ERASURE_PERMITTED"
+
+def write_durable_erasure_receipt(workspace: Path | str, snapshot_id: str, receipt: DurableErasureReceipt) -> Path:
+    """Atomically write, file-fsync, and directory-fsync an erasure receipt."""
+    validate_safe_id(snapshot_id, "snapshot_id")
+    validate_safe_id(receipt.receipt_id, "receipt_id")
+    receipt_dir = Path(workspace).resolve() / ".reme" / "audit" / "erasure_receipts"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    target = receipt_dir / f"{receipt.receipt_id}.json"
+    if not target.resolve().is_relative_to(receipt_dir):
+        raise ValueError(f"Path traversal detected in receipt_id: {receipt.receipt_id}")
+    temp_path = receipt_dir / f".{receipt.receipt_id}.{os.getpid()}.tmp"
+    data = canonical_jcs_bytes(receipt.model_dump(mode="json", exclude_none=False))
+    with temp_path.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, target)
+    fsync_directory(receipt_dir)
+    return target
+
+def cryptographic_erase_snapshot(
+    workspace: Path | str,
+    snapshot_id: str,
+    dek_store: SnapshotKeyStore,
+    *,
+    policy: RetentionPolicy,
+    created_at: Optional[datetime.datetime] = None,
+    now: datetime.datetime,
+    snapshot: MemorySnapshotRecord,
+) -> DurableErasureReceipt:
+    """Execute targeted cryptographic erasure destroying both ciphertext and DEK with atomic durable receipt and mandatory snapshot validation."""
+    validate_safe_id(snapshot_id, "snapshot_id")
+    if not isinstance(snapshot, MemorySnapshotRecord):
+        raise TypeError("snapshot: MemorySnapshotRecord is mandatory for cryptographic erasure")
+    if snapshot.snapshot_id != snapshot_id:
+        raise ValueError(f"Snapshot record id mismatch: {snapshot.snapshot_id} != {snapshot_id}")
+    if snapshot.legal_hold:
+        raise ValueError(f"Erasure prohibited: LEGAL_HOLD on snapshot {snapshot_id}")
+    
+    allowed, reason = evaluate_audit_erasure(policy, created_at, now, snapshot)
+    if not allowed:
+        raise ValueError(f"Erasure prohibited: {reason}")
+    ws = Path(workspace).resolve()
+    target_dir = ws / ".reme" / "audit" / "snapshots"
+    snapshot_path = target_dir / f"{snapshot_id}.enc"
+    if not snapshot_path.resolve().is_relative_to(target_dir):
+        raise ValueError(f"Path traversal detected in snapshot_id: {snapshot_id}")
+    if not snapshot_path.is_file():
+        raise ValueError(f"Cannot erase non-existent snapshot envelope: {snapshot_path}")
+    envelope = json.loads(snapshot_path.read_bytes())
+    dek_id = envelope.get("dek_id")
+    if not dek_id:
+        raise ValueError("Snapshot envelope missing dek_id")
+    validate_safe_id(dek_id, "dek_id")
+    
+    # Construct and publish durable erasure receipt first to guarantee crash-consistent auditability
+    receipt_id = f"erx_{snapshot_id}"
+    validate_safe_id(receipt_id, "receipt_id")
+    receipt_dict = {
+        "receipt_id": receipt_id,
+        "snapshot_id": snapshot_id,
+        "dek_id": dek_id,
+        "policy_id": policy.policy_id,
+        "erased_at_utc": now.isoformat(),
+        "fsync_confirmed": True,
+    }
+    receipt_digest = sha256_canonical(receipt_dict)
+    receipt_dict["receipt_digest"] = receipt_digest
+    receipt = DurableErasureReceipt(**receipt_dict)
+    write_durable_erasure_receipt(ws, snapshot_id, receipt)
+
+    # With durable receipt safely committed and fsynced, execute cryptographic erasure
+    snapshot_path.unlink()
+    fsync_directory(snapshot_path.parent)
+    dek_store.destroy(dek_id)
+    
+    return receipt
