@@ -1,6 +1,6 @@
 """B.2 typed-batch receipt and Hermes ACK boundary tests."""
 
-# pylint: disable=protected-access,redefined-outer-name
+# pylint: disable=missing-function-docstring,protected-access,redefined-outer-name,wrong-import-position
 
 from __future__ import annotations
 
