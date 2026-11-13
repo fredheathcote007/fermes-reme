@@ -26,6 +26,7 @@ from agentscope.agent import ContextConfig
 from agentscope.message import DataBlock, Msg, TextBlock, UserMsg
 
 from ...components import R
+from ...components.store.typed_journal import IntentJournal
 from ...schema import Response
 from ...utils.async_utils import complete_in_thread
 from ...utils.wikilink_handler import WikilinkHandler
@@ -374,6 +375,60 @@ class AutoMemoryStep(BaseStep):
         super().__init__(**kwargs)
         self.create_tools: list[str] = ["daily_write"]
         self.update_tools: list[str] = ["read", "edit", "frontmatter_update", "write"]
+
+    async def commit_typed_batch(
+        self,
+        records,
+        *,
+        request_id: str | None = None,
+        batch_id: str | None = None,
+        session_id: str | None = None,
+        workspace_id: str | None = None,
+        profile_id: str | None = None,
+        index_status: str | None = "ok",
+        indexer=None,
+    ):
+        """Commit application-owned typed records through the crash-safe journal.
+
+        This seam is deliberately separate from the legacy daily-note agent
+        flow.  A model proposal must be converted and validated as a
+        ``TypedMemoryRecord`` before reaching this method; the journal then
+        owns path admission, locking, publication, receipt persistence, and
+        replay semantics.
+        """
+        if self.file_store is None:
+            raise RuntimeError("typed batch commit requires a configured file store")
+        context = self.context or {}
+        request_id = request_id or context.get("request_id")
+        batch_id = batch_id or context.get("batch_id")
+        session_id = session_id or context.get("session_id")
+        workspace_id = workspace_id or context.get("workspace_id")
+        profile_id = profile_id or context.get("profile_id")
+        if not all(
+            isinstance(value, str) and value for value in (request_id, batch_id, session_id, workspace_id, profile_id)
+        ):
+            raise ValueError(
+                "typed batch commit requires request_id, batch_id, session_id, workspace_id, and profile_id",
+            )
+        receipt = await IntentJournal(self.file_store.workspace_path).commit_batch(
+            request_id,
+            batch_id,
+            session_id,
+            workspace_id,
+            profile_id,
+            records,
+            index_status=index_status,
+            indexer=indexer,
+        )
+        if self.context is not None:
+            self.context.response.success = True
+            self.context.response.answer = "Committed typed memory batch"
+            self.context.response.metadata.update(receipt.model_dump(mode="json"))
+        return receipt
+
+    async def _commit_typed_batch(self, records, **kwargs):
+        """Compatibility alias for internal callers migrating to B.3."""
+        return await self.commit_typed_batch(records, **kwargs)
 
     def _session_dir(self) -> str:
         return normalize_posix_path(str(self.config_value("session_dir")))

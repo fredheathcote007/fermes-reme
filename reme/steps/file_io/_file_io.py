@@ -282,6 +282,35 @@ async def write_file_durable(file_path: Path, content: str | bytes, encoding: st
     await complete_in_thread(publish)
 
 
+async def unlink_file_durable(file_path: Path) -> None:
+    """Unlink a confined file and durably publish the directory change.
+
+    Callers must perform workspace and symlink admission before invoking this
+    helper.  The directory-relative unlink is deliberately separate from
+    :func:`write_file_durable`: rollback must never follow a final-path
+    symlink, and the containing directory must be synced after the unlink.
+    """
+
+    def remove() -> None:
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise OSError("durable local POSIX file commits are unavailable on this platform")
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        absolute_parent = file_path.parent.absolute()
+        parts = absolute_parent.parts
+        parent_fd = os.open(parts[0] or os.sep, parent_flags)
+        try:
+            for part in parts[1:]:
+                next_fd = os.open(part, parent_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            os.unlink(file_path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    await complete_in_thread(remove)
+
+
 # ---------------------------------------------------------------------------
 # Output truncation
 # ---------------------------------------------------------------------------

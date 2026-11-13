@@ -10,12 +10,14 @@ from typing import Any, AsyncGenerator, TypeVar
 
 from . import __version__
 from .components import ApplicationContext, BaseComponent
+from .components.store.typed_journal import reconcile_workspace
 from .components.job import BackgroundJob, BaseJob, CronJob, StreamJob
 from .components.service import BaseService
 from .enumeration import ComponentEnum, ComponentType, component_type_name
 from .plugin import resolve_plugin_runtime
 from .schema import ComponentConfig, Response, StreamChunk
 from .utils import execute_stream_task, print_logo, get_logger
+from .utils.async_utils import complete_in_thread
 
 T = TypeVar("T", bound=BaseComponent)
 _NodeKey = tuple[str, str]
@@ -189,11 +191,20 @@ class Application(BaseComponent):
     async def _start(self) -> None:
         """Start components, then jobs as base > stream > background > cron."""
         async with self._component_mutation_lock:
-            pool_size = self.config.thread_pool_max_workers
-            if pool_size > 0:
-                self.context.thread_pool = ThreadPoolExecutor(max_workers=pool_size)
-                self.logger.info(f"Thread pool created with max_workers={pool_size}")
             try:
+                # Resolve durable typed batches before any component or job can
+                # accept a request.  The scanner is synchronous by design and
+                # runs outside the event loop so fsync/recovery cannot starve
+                # the service loop.
+                cfg = getattr(self, "config", None)
+                workspace_dir = getattr(cfg, "workspace_dir", None) if cfg else None
+                if not isinstance(workspace_dir, str) or not workspace_dir:
+                    raise ValueError("typed journal startup requires configured workspace_dir")
+                await complete_in_thread(reconcile_workspace, Path(workspace_dir).absolute())
+                pool_size = self.config.thread_pool_max_workers
+                if pool_size > 0:
+                    self.context.thread_pool = ThreadPoolExecutor(max_workers=pool_size)
+                    self.logger.info(f"Thread pool created with max_workers={pool_size}")
                 components = self._topological_order()
                 jobs = list(self.context.jobs.values())
                 base_jobs = [j for j in jobs if not isinstance(j, (StreamJob, BackgroundJob))]
@@ -227,12 +238,14 @@ class Application(BaseComponent):
 
     async def _close_started_components(self) -> None:
         """Close resources while the caller serializes component mutations."""
-        for c in reversed(self._started_components):
-            try:
-                await c.close()
-            except Exception as e:
-                self.logger.exception(f"Failed to close {component_type_name(c.component_type)}:{c.name}: {e}")
-        self._started_components.clear()
+        started = getattr(self, "_started_components", None)
+        if started:
+            for c in reversed(list(started)):
+                try:
+                    await c.close()
+                except Exception as e:
+                    self.logger.exception(f"Failed to close component {c.name}: {e}")
+            started.clear()
         if self.context.thread_pool is not None:
             self.context.thread_pool.shutdown(wait=True)
             self.context.thread_pool = None
