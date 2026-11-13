@@ -5,6 +5,8 @@ not required by CI.  The checked-in fixture is the exact 1,566-line Python
 fence from the frozen design and is executed in an isolated module namespace.
 """
 
+# pylint: disable=missing-function-docstring,protected-access,redefined-outer-name
+
 from __future__ import annotations
 
 import hashlib
@@ -295,7 +297,8 @@ def _oversized_record_payload(module: types.ModuleType) -> dict[str, Any]:
         "record_digest": "0" * 64,
         "note_path": f"memory/typed/semantic/{memory_id}.md",
     }
-    payload["record_digest"] = module.sha256_canonical({key: value for key, value in payload.items() if key != "record_digest"})
+    digest_payload = {key: value for key, value in payload.items() if key != "record_digest"}
+    payload["record_digest"] = module.sha256_canonical(digest_payload)
     return payload
 
 

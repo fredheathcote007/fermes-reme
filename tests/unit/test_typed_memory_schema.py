@@ -1,5 +1,7 @@
 """Focused contract tests for FHM007-B.1 typed memory schemas."""
 
+# pylint: disable=missing-function-docstring,protected-access,redefined-outer-name,wrong-import-position,unused-argument
+
 from __future__ import annotations
 
 import datetime as dt
@@ -72,7 +74,8 @@ def _record(workspace: Path, content) -> TypedMemoryRecord:
     draft = TypedMemoryRecord.model_construct(**values)
     values["body_sha256"] = compute_body_sha256(draft)
     draft = TypedMemoryRecord.model_construct(**values)
-    digest_input = {key: value for key, value in draft.model_dump(mode="json", exclude_none=False).items() if key != "record_digest"}
+    dumped = draft.model_dump(mode="json", exclude_none=False)
+    digest_input = {key: value for key, value in dumped.items() if key != "record_digest"}
     values["record_digest"] = sha256_canonical(digest_input)
     return TypedMemoryRecord(**values)
 
@@ -80,7 +83,13 @@ def _record(workspace: Path, content) -> TypedMemoryRecord:
 @pytest.mark.parametrize(
     "content",
     [
-        SemanticContent(fact="The café is open", entity="cafe", attribute="status", value="open", valid_from=dt.date(2026, 1, 1)),
+        SemanticContent(
+            fact="The café is open",
+            entity="cafe",
+            attribute="status",
+            value="open",
+            valid_from=dt.date(2026, 1, 1),
+        ),
         EpisodicContent(
             event_summary="A deployment completed",
             occurred_at=dt.datetime(2026, 11, 13, 1, 2, 3, tzinfo=dt.timezone.utc),
@@ -185,13 +194,16 @@ def test_uri_syntax_is_structural_only() -> None:
         with pytest.raises(ValueError):
             _SCHEMA.validate_workspace_containment(uri)
 
+
 def test_direct_note_adapters_are_not_exported_or_callable() -> None:
     schema_init = Path(__file__).parents[2] / "reme" / "schema" / "__init__.py"
     tree = ast.parse(schema_init.read_text(encoding="utf-8"))
     exported: set[str] = set()
     imported: set[str] = set()
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+        ):
             exported = set(ast.literal_eval(node.value))
         if isinstance(node, ast.ImportFrom) and node.module == "typed_memory":
             imported.update(alias.asname or alias.name for alias in node.names)
@@ -201,11 +213,17 @@ def test_direct_note_adapters_are_not_exported_or_callable() -> None:
         assert not hasattr(_SCHEMA, name)
 
 
-def test_invalid_ranges_receipts_and_statuses_are_rejected(tmp_path: Path) -> None:
+def test_invalid_ranges_receipts_and_statuses_are_rejected() -> None:
     with pytest.raises(ValidationError):
         SemanticContent(fact="x", valid_from=dt.date(2026, 2, 1), valid_until=dt.date(2026, 1, 1))
     with pytest.raises(ValidationError):
-        ProvenanceCitation(source_uri="file:///workspace/a", session_id="s", verbatim_quote="x", line_start=2, line_end=1)
+        ProvenanceCitation(
+            source_uri="file:///workspace/a",
+            session_id="s",
+            verbatim_quote="x",
+            line_start=2,
+            line_end=1,
+        )
     with pytest.raises(ValidationError):
         FailureLessonContent(
             failure_symptom="x",
@@ -255,8 +273,9 @@ def test_record_and_batch_bounds(tmp_path: Path) -> None:
     draft = TypedMemoryRecord.model_construct(**values)
     values["body_sha256"] = compute_body_sha256(draft)
     draft = TypedMemoryRecord.model_construct(**values)
+    dumped = draft.model_dump(mode="json", exclude_none=False)
     values["record_digest"] = sha256_canonical(
-        {key: value for key, value in draft.model_dump(mode="json", exclude_none=False).items() if key != "record_digest"}
+        {key: value for key, value in dumped.items() if key != "record_digest"}
     )
     with pytest.raises(ValidationError, match="Record envelope"):
         TypedMemoryRecord(**values)
@@ -281,8 +300,9 @@ def test_record_and_batch_bounds(tmp_path: Path) -> None:
         "receipt_digest": "0" * 64,
     }
     draft = TypedOptionBReceipt.model_construct(**values)
+    dumped = draft.model_dump(mode="json", exclude_none=False)
     values["receipt_digest"] = sha256_canonical(
-        {key: value for key, value in draft.model_dump(mode="json", exclude_none=False).items() if key != "receipt_digest"}
+        {key: value for key, value in dumped.items() if key != "receipt_digest"}
     )
     assert TypedOptionBReceipt(**values).index_status is None
     with pytest.raises(ValidationError, match="Invalid committed_at_utc"):
@@ -291,10 +311,10 @@ def test_record_and_batch_bounds(tmp_path: Path) -> None:
         TypedOptionBReceipt(**{**values, "committed_at_utc": "2026-11-13T01:02:03"})
     utc_values = {**values, "committed_at_utc": "2026-11-13T01:02:03+00:00"}
     utc_draft = TypedOptionBReceipt.model_construct(**utc_values)
+    utc_dumped = utc_draft.model_dump(mode="json", exclude_none=False)
     utc_values["receipt_digest"] = sha256_canonical(
-        {key: value for key, value in utc_draft.model_dump(mode="json", exclude_none=False).items() if key != "receipt_digest"}
+        {key: value for key, value in utc_dumped.items() if key != "receipt_digest"}
     )
     assert TypedOptionBReceipt(**utc_values).committed_at_utc.endswith("+00:00")
     with pytest.raises(ValidationError):
         TypedOptionBReceipt(**{**values, "index_status": "invalid"})
-

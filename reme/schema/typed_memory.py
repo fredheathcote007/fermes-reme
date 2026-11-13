@@ -387,6 +387,10 @@ def render_markdown_body(record: Any) -> str:
         )
     lines.extend(["", "## Provenance", ""])
     for index, citation in enumerate(getattr(record, "provenance", []), start=1):
+        src_hash = citation.source_hash
+        src_sha = src_hash.sha256 if src_hash else None
+        src_git = src_hash.git_commit if src_hash else None
+        src_lines = src_hash.line_count if src_hash else None
         lines.extend(
             [
                 f"- citation_{index}_source_class: {format_field_val(citation.source_class)}",
@@ -396,10 +400,10 @@ def render_markdown_body(record: Any) -> str:
                 f"- citation_{index}_line_start: {format_field_val(citation.line_start)}",
                 f"- citation_{index}_line_end: {format_field_val(citation.line_end)}",
                 f"- citation_{index}_transcript_hash: {format_field_val(citation.transcript_hash)}",
-                f"- citation_{index}_source_sha256: {format_field_val(citation.source_hash.sha256 if citation.source_hash else None)}",
-                f"- citation_{index}_git_commit: {format_field_val(citation.source_hash.git_commit if citation.source_hash else None)}",
-                f"- citation_{index}_line_count: {format_field_val(citation.source_hash.line_count if citation.source_hash else None)}",
-            ]
+                f"- citation_{index}_source_sha256: {format_field_val(src_sha)}",
+                f"- citation_{index}_git_commit: {format_field_val(src_git)}",
+                f"- citation_{index}_line_count: {format_field_val(src_lines)}",
+            ],
         )
     lines.append("")
     return "\n".join(lines)
@@ -438,7 +442,9 @@ class TypedMemoryRecord(BaseModel):
     @model_validator(mode="after")
     def validate_record_invariants(self) -> "TypedMemoryRecord":
         if self.typed_content.record_type != self.record_type:
-            raise ValueError(f"Content record_type ({self.typed_content.record_type}) != record_type ({self.record_type})")
+            raise ValueError(
+                f"Content record_type ({self.typed_content.record_type}) != record_type ({self.record_type})"
+            )
         if self.trust_tier == "owner_approved":
             if not self.authority_entry_id:
                 raise ValueError("Records claiming trust_tier='owner_approved' must bind to authority_entry_id")
@@ -491,7 +497,9 @@ class TypedMemoryProposal(BaseModel):
                 f"SourceClass {self.source_class!r} creation is strictly prohibited in Phase B (Owner Gate Q3)"
             )
         if self.typed_content.record_type != self.record_type:
-            raise ValueError(f"Content record_type ({self.typed_content.record_type}) != proposal record_type ({self.record_type})")
+            raise ValueError(
+                f"Content record_type ({self.typed_content.record_type}) != proposal record_type ({self.record_type})"
+            )
         return self
 
 
