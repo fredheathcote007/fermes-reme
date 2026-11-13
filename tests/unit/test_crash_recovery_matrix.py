@@ -90,6 +90,8 @@ def _intent(
         "timestamp_utc": "2026-11-13T01:02:03Z",
         "status": "pending",
         "n_records": len(records),
+        "payload_digest": "p" * 64,
+        "receipt_digest": "r" * 64,
         "records": records,
     }
 
@@ -185,25 +187,19 @@ def _record(workspace: Path, *, fact: str = "The café is open"):
     values["body_sha256"] = compute_body_sha256(draft)
     draft = TypedMemoryRecord.model_construct(**values)
     digest_input = {
-        key: value
-        for key, value in draft.model_dump(mode="json", exclude_none=False).items()
-        if key != "record_digest"
+        key: value for key, value in draft.model_dump(mode="json", exclude_none=False).items() if key != "record_digest"
     }
     values["record_digest"] = sha256_canonical(digest_input)
     return TypedMemoryRecord(**values)
 
 
-def _write_journal(
-    workspace: Path, entries: list[dict[str, Any]], trailing: bytes = b""
-) -> Path:
+def _write_journal(workspace: Path, entries: list[dict[str, Any]], trailing: bytes = b"") -> Path:
     path = workspace / ".reme" / "intent_journal.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     for entry in entries:
         encoded = rfc8785.dumps(entry)
-        lines.append(
-            (encoded if isinstance(encoded, bytes) else encoded.encode()) + b"\n"
-        )
+        lines.append((encoded if isinstance(encoded, bytes) else encoded.encode()) + b"\n")
     path.write_bytes(b"".join(lines) + trailing)
     return path
 
@@ -227,10 +223,12 @@ def test_public_journal_exports_are_the_production_contract() -> None:
     assert JournalCorruptionError is journal_module.JournalCorruptionError
 
 
-def test_cw1_trailing_torn_line_is_truncated_without_losing_prior_history(
-    journal, tmp_path: Path
-) -> None:
-    history = {"batch_id": "batch-history", "status": "committed"}
+def test_cw1_trailing_torn_line_is_truncated_without_losing_prior_history(journal, tmp_path: Path) -> None:
+    history = {
+        "batch_id": "batch-history",
+        "status": "committed",
+        "receipt_digest": "r" * 64,
+    }
     path = _write_journal(tmp_path, [history], trailing=b'{"status":"pending"')
     expected = rfc8785.dumps(history)
     expected = expected if isinstance(expected, bytes) else expected.encode()
@@ -238,9 +236,7 @@ def test_cw1_trailing_torn_line_is_truncated_without_losing_prior_history(
     assert path.read_bytes() == expected + b"\n"
 
 
-def test_torn_suffix_also_reconciles_surviving_pending_intent(
-    journal, tmp_path: Path
-) -> None:
+def test_torn_suffix_also_reconciles_surviving_pending_intent(journal, tmp_path: Path) -> None:
     entry = _intent()
     path = _write_journal(tmp_path, [entry], trailing=b'{"interrupted":')
 
@@ -251,27 +247,19 @@ def test_torn_suffix_also_reconciles_surviving_pending_intent(
     assert path.read_bytes().endswith(b"\n")
 
 
-def test_interior_corruption_fails_closed_and_preserves_journal_bytes(
-    journal, tmp_path: Path
-) -> None:
+def test_interior_corruption_fails_closed_and_preserves_journal_bytes(journal, tmp_path: Path) -> None:
     first = _intent(batch_id="batch-1", request_id="request-1")
     second = _intent(batch_id="batch-2", request_id="request-2")
     path = _write_journal(tmp_path, [first], trailing=b"not-json\n")
     encoded = rfc8785.dumps(second)
-    path.write_bytes(
-        path.read_bytes()
-        + (encoded if isinstance(encoded, bytes) else encoded.encode())
-        + b"\n"
-    )
+    path.write_bytes(path.read_bytes() + (encoded if isinstance(encoded, bytes) else encoded.encode()) + b"\n")
     before = path.read_bytes()
     with pytest.raises(JournalCorruptionError):
         _recover(journal)
     assert path.read_bytes() == before
 
 
-def test_complete_malformed_line_fails_closed_without_truncation(
-    journal, tmp_path: Path
-) -> None:
+def test_complete_malformed_line_fails_closed_without_truncation(journal, tmp_path: Path) -> None:
     path = tmp_path / ".reme" / "intent_journal.jsonl"
     path.parent.mkdir(parents=True)
     raw = b'{"ok":true}\nnot-json\n'
@@ -281,10 +269,18 @@ def test_complete_malformed_line_fails_closed_without_truncation(
     assert path.read_bytes() == raw
 
 
-def test_canonical_unknown_status_fails_closed_without_truncation(
-    journal, tmp_path: Path
-) -> None:
+def test_canonical_unknown_status_fails_closed_without_truncation(journal, tmp_path: Path) -> None:
     path = _write_journal(tmp_path, [{"batch_id": "b1", "status": "bogus"}])
+    before = path.read_bytes()
+
+    with pytest.raises(JournalCorruptionError):
+        journal.reconcile_sync()
+
+    assert path.read_bytes() == before
+
+
+def test_committed_record_missing_receipt_digest_fails_closed(journal, tmp_path: Path) -> None:
+    path = _write_journal(tmp_path, [{"batch_id": "b1", "status": "committed"}])
     before = path.read_bytes()
 
     with pytest.raises(JournalCorruptionError):
@@ -304,9 +300,7 @@ def test_receiptless_recovery_removes_only_intended_creates_and_restores_updates
     note.parent.mkdir(parents=True)
     note.write_bytes(old)
     old_digest = hashlib.sha256(old).hexdigest()
-    history = (
-        tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
-    )
+    history = tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
     history.parent.mkdir(parents=True)
     history.write_bytes(old)
     create = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-created.md"
@@ -323,17 +317,13 @@ def test_receiptless_recovery_removes_only_intended_creates_and_restores_updates
     assert unrelated.read_bytes() == b"unrelated pre-existing note"
 
 
-def test_cw2_unlinks_dangling_tmp_files_and_preserves_prior_notes(
-    journal, tmp_path: Path
-) -> None:
+def test_cw2_unlinks_dangling_tmp_files_and_preserves_prior_notes(journal, tmp_path: Path) -> None:
     old = b"prior note"
     note = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-1.md"
     note.parent.mkdir(parents=True)
     note.write_bytes(old)
     old_digest = hashlib.sha256(old).hexdigest()
-    history = (
-        tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
-    )
+    history = tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
     history.parent.mkdir(parents=True)
     history.write_bytes(old)
     dangling = note.with_name(note.name + ".tmp.1234")
@@ -346,17 +336,13 @@ def test_cw2_unlinks_dangling_tmp_files_and_preserves_prior_notes(
     assert not dangling.exists()
 
 
-def test_cw4a_missing_receipt_rolls_back_creates_and_restores_updates(
-    journal, tmp_path: Path
-) -> None:
+def test_cw4a_missing_receipt_rolls_back_creates_and_restores_updates(journal, tmp_path: Path) -> None:
     old = b"old revision"
     note = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-1.md"
     note.parent.mkdir(parents=True)
     note.write_bytes(old)
     old_digest = hashlib.sha256(old).hexdigest()
-    history = (
-        tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
-    )
+    history = tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
     history.parent.mkdir(parents=True)
     history.write_bytes(old)
     create = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-created.md"
@@ -368,8 +354,8 @@ def test_cw4a_missing_receipt_rolls_back_creates_and_restores_updates(
                 records=[
                     _update_record(old),
                     _create_record(b"published without receipt"),
-                ]
-            )
+                ],
+            ),
         ],
     )
 
@@ -379,17 +365,9 @@ def test_cw4a_missing_receipt_rolls_back_creates_and_restores_updates(
     assert not create.exists()
 
 
-def test_rollback_update_accepts_matching_frontmatter_digest_marker(
-    journal, tmp_path: Path
-) -> None:
+def test_rollback_update_accepts_matching_frontmatter_digest_marker(journal, tmp_path: Path) -> None:
     expected_old_digest = "a" * 64
-    restored = (
-        b"---\n"
-        + b"record_digest: "
-        + expected_old_digest.encode("ascii")
-        + b"\n---\n"
-        + b"prior note body\n"
-    )
+    restored = b"---\n" + b"record_digest: " + expected_old_digest.encode("ascii") + b"\n---\n" + b"prior note body\n"
     current = b"published replacement\n"
     assert hashlib.sha256(restored).hexdigest() != expected_old_digest
     note = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-1.md"
@@ -415,25 +393,37 @@ def test_rollback_update_accepts_matching_frontmatter_digest_marker(
 
     assert note.read_bytes() == restored
     statuses = [
-        json.loads(line)["status"]
-        for line in (tmp_path / ".reme" / "intent_journal.jsonl")
-        .read_text()
-        .splitlines()
+        json.loads(line)["status"] for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
     ]
     assert statuses[-1] == "rolled_back"
 
 
-def test_cw3_partial_publication_never_unlinks_update_target(
-    journal, tmp_path: Path
-) -> None:
+def test_rollback_allows_missing_snapshot_if_target_unaltered(journal, tmp_path: Path) -> None:
+    old = b"pre-existing note\n"
+    note = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-1.md"
+    note.parent.mkdir(parents=True)
+    note.write_bytes(old)
+    update = _update_record(old)
+    history = tmp_path / update["prior_history_path"]
+    assert not history.exists()
+    _write_journal(tmp_path, [_intent(records=[update])])
+
+    _recover(journal)
+
+    assert note.read_bytes() == old
+    statuses = [
+        json.loads(line)["status"] for line in (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
+    ]
+    assert statuses[-1] == "rolled_back"
+
+
+def test_cw3_partial_publication_never_unlinks_update_target(journal, tmp_path: Path) -> None:
     old = b"old revision"
     note = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-1.md"
     note.parent.mkdir(parents=True)
     note.write_bytes(old)
     old_digest = hashlib.sha256(old).hexdigest()
-    history = (
-        tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
-    )
+    history = tmp_path / ".reme" / "history" / f"mem-semantic-1.rev1.{old_digest[:8]}.bak"
     history.parent.mkdir(parents=True)
     history.write_bytes(old)
     create = tmp_path / "memory" / "typed" / "semantic" / "mem-semantic-created.md"
@@ -469,16 +459,12 @@ def test_cw4b_reconciles_valid_receipt_to_committed_without_rewriting_notes(
     _recover(journal)
 
     assert note.stat().st_mtime_ns == before
-    journal_lines = (
-        (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
-    )
+    journal_lines = (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
     statuses = [json.loads(line)["status"] for line in journal_lines]
     assert statuses[-1] == "committed"
 
 
-def test_cw5_replay_returns_persisted_receipt_without_a_second_publication(
-    journal, tmp_path: Path
-) -> None:
+def test_cw5_replay_returns_persisted_receipt_without_a_second_publication(journal, tmp_path: Path) -> None:
     record = _record(tmp_path)
     first = journal.commit_batch_sync(
         "request-1",
@@ -504,9 +490,7 @@ def test_cw5_replay_returns_persisted_receipt_without_a_second_publication(
     assert note.read_bytes() == before
 
 
-def test_same_request_replays_valid_immutable_receipt_without_rewriting(
-    journal, tmp_path: Path
-) -> None:
+def test_same_request_replays_valid_immutable_receipt_without_rewriting(journal, tmp_path: Path) -> None:
     record = _record(tmp_path)
     first = journal.commit_batch_sync(
         "request-1",
@@ -602,9 +586,7 @@ def test_cross_scope_replay_is_rejected_without_mutation(
     assert note.read_bytes() == before
 
 
-def test_tampered_valid_receipt_rolls_back_pending_create(
-    journal, tmp_path: Path
-) -> None:
+def test_tampered_valid_receipt_rolls_back_pending_create(journal, tmp_path: Path) -> None:
     body = b"durable note"
     entry = _intent(records=[_create_record(b"different note")])
     note = tmp_path / entry["records"][0]["note_path"]
@@ -620,9 +602,7 @@ def test_tampered_valid_receipt_rolls_back_pending_create(
     _recover(journal)
 
     assert note.read_bytes() == body
-    journal_lines = (
-        (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
-    )
+    journal_lines = (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
     statuses = [json.loads(line)["status"] for line in journal_lines]
     assert statuses[-1] == "rolled_back"
 
@@ -656,17 +636,13 @@ def test_malformed_receipt_fails_closed_without_claiming_commit(
     else:
         with pytest.raises(JournalCorruptionError):
             _recover(journal)
-    journal_lines = (
-        (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
-    )
+    journal_lines = (tmp_path / ".reme" / "intent_journal.jsonl").read_text().splitlines()
     statuses = [json.loads(line)["status"] for line in journal_lines]
     assert statuses[-1] == "rolled_back"
     assert "committed" not in statuses
 
 
-def test_windows_protected_commit_fails_closed(
-    journal, tmp_path: Path, monkeypatch
-) -> None:
+def test_windows_protected_commit_fails_closed(journal, tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(os, "name", "nt")
     with pytest.raises(OSError, match="POSIX"):
         journal.commit_batch_sync(
@@ -680,15 +656,8 @@ def test_windows_protected_commit_fails_closed(
 
 
 def test_shipping_provider_has_no_typed_ack_bypass_knob() -> None:
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "integrations"
-        / "hermes_agent"
-        / "__init__.py"
-    )
+    source = Path(__file__).resolve().parents[2] / "integrations" / "hermes_agent" / "__init__.py"
     text = source.read_text(encoding="utf-8")
     assert "_allow_test_typed_ack" not in text
-    assert (
-        "typed_batch receipts require Task B.3 crash-consistent intent journal" in text
-    )
+    assert "typed_batch receipts require Task B.3 crash-consistent intent journal" in text
     assert "live typed ACK is disabled" in text

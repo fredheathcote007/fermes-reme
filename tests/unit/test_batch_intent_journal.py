@@ -84,9 +84,7 @@ def _canonical(value: Any) -> bytes:
     return encoded if isinstance(encoded, bytes) else encoded.encode("utf-8")
 
 
-def _intent(
-    *, batch_id: str = "batch-1", request_id: str = "request-1", records=None
-) -> dict[str, Any]:
+def _intent(*, batch_id: str = "batch-1", request_id: str = "request-1", records=None) -> dict[str, Any]:
     if records is None:
         records = [
             {
@@ -148,9 +146,7 @@ def _record(workspace: Path, *, fact: str = "The café is open"):
     values["body_sha256"] = compute_body_sha256(draft)
     draft = TypedMemoryRecord.model_construct(**values)
     digest_input = {
-        key: value
-        for key, value in draft.model_dump(mode="json", exclude_none=False).items()
-        if key != "record_digest"
+        key: value for key, value in draft.model_dump(mode="json", exclude_none=False).items() if key != "record_digest"
     }
     values["record_digest"] = sha256_canonical(digest_input)
     return TypedMemoryRecord(**values)
@@ -169,9 +165,7 @@ def direct_durable_file_execution(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(file_io_module, "complete_in_thread", complete_direct)
 
 
-def test_pending_line_is_rfc8785_canonical_and_newline_terminated(
-    journal, tmp_path: Path
-) -> None:
+def test_pending_line_is_rfc8785_canonical_and_newline_terminated(journal, tmp_path: Path) -> None:
     entry = _intent()
     _call_entry(journal, entry)
 
@@ -187,9 +181,7 @@ def test_public_journal_exports_are_the_production_contract() -> None:
     assert JournalCorruptionError is journal_module.JournalCorruptionError
 
 
-def test_application_start_reconciles_configured_workspace_for_partial_mock(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_application_start_reconciles_configured_workspace_for_partial_mock(monkeypatch, tmp_path: Path) -> None:
     configured_workspace = tmp_path / "configured-workspace"
     observed: list[Path] = []
 
@@ -225,9 +217,7 @@ def test_application_start_reconciles_configured_workspace_for_partial_mock(
     assert observed == [configured_workspace.absolute()]
 
 
-def test_journal_fsync_precedes_any_note_write(
-    journal, tmp_path: Path, monkeypatch
-) -> None:
+def test_journal_fsync_precedes_any_note_write(journal, tmp_path: Path, monkeypatch) -> None:
     note_write_seen = False
     real_write = journal_module.write_file_durable
     journal_path = tmp_path / ".reme" / "intent_journal.jsonl"
@@ -236,9 +226,7 @@ def test_journal_fsync_precedes_any_note_write(
         nonlocal note_write_seen
         if str(path).endswith(".md"):
             note_write_seen = True
-            pending = [
-                json.loads(line) for line in journal_path.read_text().splitlines()
-            ]
+            pending = [json.loads(line) for line in journal_path.read_text().splitlines()]
             assert pending[0]["status"] == "pending"
         return await real_write(path, content, encoding)
 
@@ -255,9 +243,7 @@ def test_journal_fsync_precedes_any_note_write(
     assert note_write_seen
 
 
-def test_update_intent_is_durable_before_history_backup_write(
-    journal, tmp_path: Path, monkeypatch
-) -> None:
+def test_update_intent_is_durable_before_history_backup_write(journal, tmp_path: Path, monkeypatch) -> None:
     record = _record(tmp_path)
     note = tmp_path / record.note_path
     note.parent.mkdir(parents=True)
@@ -271,9 +257,7 @@ def test_update_intent_is_durable_before_history_backup_write(
         nonlocal history_write_seen
         if str(path).endswith(".bak"):
             history_write_seen = True
-            pending = [
-                json.loads(line) for line in journal_path.read_text().splitlines()
-            ]
+            pending = [json.loads(line) for line in journal_path.read_text().splitlines()]
             assert any(entry.get("status") == "pending" for entry in pending)
         return await real_write(path, content, encoding)
 
@@ -304,9 +288,7 @@ def _hold_lock(workspace: str, ready, release) -> None:
         release.wait(10)
 
 
-@pytest.mark.skipif(
-    fcntl is None or os.name != "posix", reason="requires POSIX flock/fork"
-)
+@pytest.mark.skipif(fcntl is None or os.name != "posix", reason="requires POSIX flock/fork")
 def test_multiple_writers_are_serialized_by_advisory_lock(tmp_path: Path) -> None:
     journal = IntentJournal(tmp_path)
     context = multiprocessing.get_context("fork")
@@ -328,12 +310,8 @@ def test_multiple_writers_are_serialized_by_advisory_lock(tmp_path: Path) -> Non
         assert process.exitcode == 0
 
 
-def test_failed_durable_primitives_fail_closed(
-    journal, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("fsync failed"))
-    )
+def test_failed_durable_primitives_fail_closed(journal, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("fsync failed")))
     with pytest.raises((OSError, RuntimeError)):
         journal.commit_batch_sync(
             "request-1",
@@ -346,9 +324,7 @@ def test_failed_durable_primitives_fail_closed(
         )
 
 
-def test_missing_authoritative_indexer_fails_before_publication(
-    journal, tmp_path: Path
-) -> None:
+def test_missing_authoritative_indexer_fails_before_publication(journal, tmp_path: Path) -> None:
     record = _record(tmp_path)
     for status in ("ok", "degraded", None):
         with pytest.raises(journal_module.TypedJournalError, match="indexing"):
@@ -363,6 +339,26 @@ def test_missing_authoritative_indexer_fails_before_publication(
             )
         assert not (tmp_path / record.note_path).exists()
         assert not (tmp_path / ".reme/receipts/request-1.json").exists()
+
+
+def test_live_commit_fails_closed_on_unknown_journal_status(journal, tmp_path: Path) -> None:
+    journal_path = tmp_path / ".reme" / "intent_journal.jsonl"
+    journal_path.parent.mkdir(parents=True)
+    journal_path.write_bytes(_canonical({"batch_id": "b-bad", "status": "bogus"}) + b"\n")
+    record = _record(tmp_path)
+
+    with pytest.raises(JournalCorruptionError):
+        journal.commit_batch_sync(
+            "request-1",
+            "batch-1",
+            "session-1",
+            "workspace-1",
+            "profile-1",
+            [record],
+        )
+
+    assert not (tmp_path / record.note_path).exists()
+    assert not (tmp_path / ".reme/receipts/request-1.json").exists()
 
 
 def test_indexer_called_after_note_before_receipt(journal, tmp_path: Path) -> None:
@@ -425,6 +421,11 @@ def test_pending_update_preserves_newer_unowned_note(journal, tmp_path: Path) ->
             "status": "pending",
             "batch_id": "batch-1",
             "request_id": "request-1",
+            "session_id": "session-1",
+            "workspace_id": "workspace-1",
+            "profile_id": "profile-1",
+            "payload_digest": "p" * 64,
+            "receipt_digest": "r" * 64,
             "records": [
                 {
                     "action": "update",

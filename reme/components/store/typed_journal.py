@@ -248,6 +248,26 @@ class IntentJournal:
                 value = json.loads(candidate.decode("utf-8"))
                 if not isinstance(value, dict) or canonical_jcs_bytes(value) != candidate:
                     raise ValueError("line is not RFC 8785 canonical JSON")
+                status = value.get("status")
+                batch_id = value.get("batch_id")
+                if not isinstance(batch_id, str) or not batch_id:
+                    raise JournalCorruptionError("journal entry has no valid batch_id")
+                if not isinstance(status, str) or status not in {"pending", "committed", "rolled_back"}:
+                    raise JournalCorruptionError(f"journal entry has invalid status: {status!r}")
+                if status == "committed" and not isinstance(value.get("receipt_digest"), str):
+                    raise JournalCorruptionError("committed journal entry missing receipt_digest")
+                if status == "pending":
+                    for req_field in (
+                        "request_id",
+                        "session_id",
+                        "workspace_id",
+                        "profile_id",
+                        "records",
+                        "payload_digest",
+                        "receipt_digest",
+                    ):
+                        if req_field not in value:
+                            raise JournalCorruptionError(f"pending journal entry missing {req_field}")
             except (UnicodeError, RecursionError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise JournalCorruptionError(f"interior intent journal corruption at byte {offset}") from exc
             entries.append(value)
@@ -447,13 +467,20 @@ class IntentJournal:
         if not isinstance(history, str):
             raise JournalCorruptionError("pending update has no immutable history snapshot")
         backup = self._history_path(history)
-        if not backup.is_file() or backup.is_symlink():
-            raise JournalCorruptionError(f"history snapshot is missing: {history}")
         target = self._note_path(str(item["note_path"]))
+        expected_old = item.get("expected_old_digest")
+        if not backup.is_file() or backup.is_symlink():
+            if target.is_file() and not target.is_symlink():
+                current = target.read_bytes()
+                if isinstance(expected_old, str) and (
+                    self._digest_matches(target, expected_old)
+                    or self._known_record_digest_matches(str(item["note_path"]), expected_old, current)
+                ):
+                    return
+            raise JournalCorruptionError(f"history snapshot is missing: {history}")
         if not target.is_file() or target.is_symlink():
             raise JournalConflictError("pending update target is missing or unsafe")
         original = backup.read_bytes()
-        expected_old = item.get("expected_old_digest")
         if isinstance(expected_old, str) and not (
             _sha256_bytes(original) == expected_old
             or self._digest_matches(backup, expected_old)
